@@ -53,6 +53,15 @@ PYTHONPATH=src python -m compileall -q src tests scripts
 Runtime dependencies and the Python base image are pinned. The container does not expose a network
 port and starts as UID/GID `10001` with a read-only root filesystem.
 
+After installing the pinned dependencies, local credential initialization is a single interactive
+command:
+
+```shell
+.venv/bin/python scripts/initialize.py
+```
+
+The generated files are mode `0600`, ignored by Git, and must never be printed or shared.
+
 ## License
 
 No license has been selected. All rights are reserved until a license is added.
