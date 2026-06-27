@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS link_events (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS link_events_sender_time_idx ON link_events(sender_key, created_at);
+CREATE TABLE IF NOT EXISTS outbound_events (created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS outbound_events_time_idx ON outbound_events(created_at);
 """
 
 
@@ -240,6 +242,22 @@ class StateStore:
                 (sender_key, timestamp),
             )
 
+    def claim_outbound_slot(self, limit: int, now: int | None = None) -> bool:
+        timestamp = now or int(time.time())
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM outbound_events WHERE created_at < ?", (timestamp - 3600,)
+            )
+            count = self._connection.execute(
+                "SELECT COUNT(*) FROM outbound_events"
+            ).fetchone()[0]
+            if count >= limit:
+                return False
+            self._connection.execute(
+                "INSERT INTO outbound_events(created_at) VALUES (?)", (timestamp,)
+            )
+            return True
+
     def prune(self, retention_days: int, now: int | None = None) -> None:
         timestamp = now or int(time.time())
         cutoff = timestamp - retention_days * 86400
@@ -252,6 +270,9 @@ class StateStore:
             )
             self._connection.execute(
                 "DELETE FROM link_events WHERE created_at < ?", (timestamp - 3600,)
+            )
+            self._connection.execute(
+                "DELETE FROM outbound_events WHERE created_at < ?", (timestamp - 3600,)
             )
 
     def statistics(self) -> dict[str, int | str | None]:
