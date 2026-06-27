@@ -38,6 +38,7 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_CHALLENGE_MAX_ATTEMPTS=2\n"
         "TG_AUDIT_RETENTION_DAYS=30\n"
         "TG_MUTE_DAYS=3650\n"
+        "TG_OUTBOUND_LIMIT_PER_HOUR=10\n"
     ).encode("ascii")
 
 

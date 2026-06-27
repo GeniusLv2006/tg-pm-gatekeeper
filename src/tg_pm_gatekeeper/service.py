@@ -61,6 +61,7 @@ class GatekeeperService:
         *,
         challenge_ttl_seconds: int = 600,
         challenge_max_attempts: int = 2,
+        outbound_limit_per_hour: int = 10,
         denylist: frozenset[str] = frozenset(),
         challenge_factory=new_challenge,
         clock=lambda: int(time.time()),
@@ -69,6 +70,7 @@ class GatekeeperService:
         self.protector = protector
         self.challenge_ttl_seconds = challenge_ttl_seconds
         self.challenge_max_attempts = challenge_max_attempts
+        self.outbound_limit_per_hour = outbound_limit_per_hour
         self.denylist = denylist
         self.challenge_factory = challenge_factory
         self.clock = clock
@@ -130,7 +132,11 @@ class GatekeeperService:
             digest = self.protector.answer_digest(
                 sender_key, challenge.challenge_id, challenge.answer
             )
-            await actions.send_text(challenge.prompt)
+            if not await self._send_if_allowed(
+                sender_key, actions, challenge.prompt, now
+            ):
+                outcome = "outbound_rate_limited"
+                return outcome
             self.store.set_challenge(
                 sender_key, challenge.challenge_id, digest, expires_at, now
             )
@@ -163,7 +169,9 @@ class GatekeeperService:
             self.store.allow(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "allowed", now)
             actions.cancel_timeout(sender_key)
-            await actions.send_text("验证通过，后续消息将直接放行。")
+            await self._send_if_allowed(
+                sender_key, actions, "验证通过，后续消息将直接放行。", now
+            )
             return "allowed"
         attempts = self.store.increment_attempts(sender_key, now)
         self.store.audit(sender_key, "CHALLENGE_INCORRECT", "rejected", now)
@@ -171,10 +179,20 @@ class GatekeeperService:
             return await self._quarantine(
                 sender_key, actions, now, "attempts_exhausted"
             )
-        await actions.send_text(
-            f"答案不正确，还可尝试 {self.challenge_max_attempts - attempts} 次。"
+        await self._send_if_allowed(
+            sender_key,
+            actions,
+            f"答案不正确，还可尝试 {self.challenge_max_attempts - attempts} 次。",
+            now,
         )
         return "challenge_incorrect"
+
+    async def _send_if_allowed(self, sender_key, actions, text: str, now: int) -> bool:
+        if not self.store.claim_outbound_slot(self.outbound_limit_per_hour, now):
+            self.store.audit(sender_key, "OUTBOUND_RATE_LIMIT", "suppressed", now)
+            return False
+        await actions.send_text(text)
+        return True
 
     async def _quarantine(
         self, sender_key: str, actions: MessageActions, now: int, reason: str

@@ -59,6 +59,7 @@ class Settings:
     challenge_max_attempts: int
     audit_retention_days: int
     mute_days: int
+    outbound_limit_per_hour: int
 
     @classmethod
     def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
@@ -90,4 +91,5 @@ class Settings:
             challenge_max_attempts=_positive_int("TG_CHALLENGE_MAX_ATTEMPTS", 2),
             audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
+            outbound_limit_per_hour=_positive_int("TG_OUTBOUND_LIMIT_PER_HOUR", 10),
         )
