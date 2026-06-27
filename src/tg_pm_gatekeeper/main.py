@@ -37,7 +37,7 @@ def main() -> None:
     configure_logging()
     try:
         asyncio.run(async_main())
-    except (ConfigurationError, RuntimeError, OSError, UnicodeError):
+    except ConfigurationError, RuntimeError, OSError, UnicodeError:
         logging.getLogger("gatekeeper.main").critical("startup_failed")
         raise SystemExit(1) from None
 

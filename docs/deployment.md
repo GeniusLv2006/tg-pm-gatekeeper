@@ -7,14 +7,14 @@ every deployment; resource and network observations are not permanent facts.
 
 - Enable Telegram two-step verification.
 - Use a dedicated Telegram test account for the first end-to-end run.
-- Install Python 3.13 on the trusted computer used to create the session.
+- Use Python 3.14 on the trusted computer used to create the session.
 - Obtain an application API ID and API hash from Telegram's developer portal.
 - Do not paste credentials into shell commands, issue comments, CI variables, or chat.
 
 Install the pinned local dependencies in an isolated environment, then create the two secret files:
 
 ```shell
-python3.13 -m venv .venv
+python3 -m venv .venv
 .venv/bin/python -m pip install --require-hashes --no-deps -r requirements-build.txt
 .venv/bin/python -m pip install --require-hashes --no-deps --no-build-isolation -r requirements.txt
 .venv/bin/python scripts/generate_session.py
