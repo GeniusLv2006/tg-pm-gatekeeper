@@ -11,21 +11,18 @@ every deployment; resource and network observations are not permanent facts.
 - Obtain an application API ID and API hash from Telegram's developer portal.
 - Do not paste credentials into shell commands, issue comments, CI variables, or chat.
 
-Install the pinned local dependencies in an isolated environment, then create the two secret files:
+Install the pinned local dependencies in an isolated environment, then create the initialization files:
 
 ```shell
 python3 -m venv .venv
 .venv/bin/python -m pip install --require-hashes --no-deps -r requirements-build.txt
 .venv/bin/python -m pip install --require-hashes --no-deps --no-build-isolation -r requirements.txt
-.venv/bin/python scripts/generate_session.py
-.venv/bin/python scripts/generate_hmac_key.py
+.venv/bin/python scripts/initialize.py
 ```
 
-The scripts create `telegram.session.secret` and `hmac.key` with mode `0600`. Neither file may be
-printed, copied into an environment variable, or committed.
-
-Create `config.env` locally with the real API ID and API hash, using `.env.example` as a field list.
-Create `deny-domains.txt` locally if a domain denylist is needed. Both filenames are ignored by Git.
+The initializer securely prompts for the API ID, API hash, phone number, login code, and 2FA password.
+It creates `telegram.session.secret`, `hmac.key`, `config.env`, and `deny-domains.txt` with mode `0600`.
+None of these files may be printed, copied into an environment variable, or committed.
 
 ## 2. Prepare the host
 
