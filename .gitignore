@@ -2,8 +2,11 @@
 .env
 .env.*
 !.env.example
+config.env
+*.secret
 *.pem
 *.key
+hmac.key
 secrets/
 
 # Telegram authorization data
@@ -11,11 +14,14 @@ secrets/
 *.session-journal
 *.session-shm
 *.session-wal
+*.session.secret
+*.hmac.key
 
 # Runtime data
 data/
 logs/
 backups/
+deny-domains.txt
 *.db
 *.db-*
 *.sqlite
@@ -33,6 +39,9 @@ venv/
 .ruff_cache/
 htmlcov/
 .coverage
+build/
+dist/
+*.egg-info/
 
 # Editors and operating systems
 .DS_Store
