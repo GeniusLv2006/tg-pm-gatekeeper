@@ -1,0 +1,3 @@
+# One normalized domain per line. Subdomains also match.
+# Do not put URLs, usernames, user IDs, or private message data here.
+malicious-domain.invalid

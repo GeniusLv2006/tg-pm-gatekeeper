@@ -17,6 +17,23 @@ The following must never be committed, including in examples, fixtures, logs, sc
 
 If a secret is committed, removing it in a later commit is insufficient. Revoke or rotate it immediately, then remove it from the complete Git history.
 
+## Runtime boundary
+
+- The Telegram StringSession is stored only as a mode `0600` file owned by the service UID.
+- The runtime database contains HMAC-derived sender keys, not raw user IDs or message content.
+- The application must not expose a listening port or mount the Docker socket.
+- Root compromise of the host is considered compromise of the Telegram account. Container isolation
+  does not protect a session from the host administrator.
+- Two-step verification is required, but it does not invalidate an already stolen session.
+
+## Incident response
+
+1. Stop the gatekeeper container.
+2. Terminate the affected session from an official Telegram client.
+3. Delete the server-side session file.
+4. Generate and provision a new session from a trusted computer.
+5. Only then remove leaked material from Git history, logs, or backups.
+
 ## Supported versions
 
 The project is not yet released. Security updates will apply only to the latest commit on the default branch until a versioning policy is established.

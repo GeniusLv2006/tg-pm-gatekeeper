@@ -29,6 +29,9 @@ Transitions must be idempotent and persisted so restarts cannot resend challenge
 5. Send one expiring challenge to an otherwise ordinary unknown sender.
 6. Allow a correct response; quarantine an incorrect or expired challenge.
 
+Observation mode records only HMAC-keyed rule outcomes. It sends no challenges and changes no
+Telegram dialog. Enforcement must be enabled with the local operator CLI after review.
+
 ## Action policy
 
 | Risk | Default action |
@@ -45,3 +48,21 @@ Deletion, blocking, and reporting are intentionally outside the default path. A 
 The persistent store should contain sender state, challenge metadata, rule identifiers, timestamps, and action outcomes. It should avoid storing message bodies. If temporary message content is required for classification, it should have a short, enforced retention period.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
+
+The allowlist and challenge tables use an HMAC-SHA-256 derivation of the Telegram user ID. The HMAC
+key is server-local and is never backed up. Audit records contain only the derived sender key, rule
+code, outcome, and timestamp and expire after 30 days. Message bodies, usernames, phone numbers,
+media, raw URLs, and raw user IDs are not persisted.
+
+The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
+authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.
+
+## Failure behavior
+
+- A message update is claimed before any network action, so duplicate updates cannot repeat actions.
+- Database, parsing, or Telegram RPC failures result in no further action and a redacted error event.
+- Challenge timeout actions are retained only in memory. If the process restarts during a challenge,
+  the next message evaluates the persisted expiry; the service does not persist a raw peer solely to
+  perform a background action after restart.
+- Archiving and muting are the only destructive-adjacent operations in v1. Deletion, blocking, and
+  reporting are not implemented.

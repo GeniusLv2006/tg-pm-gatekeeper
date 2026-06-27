@@ -3,7 +3,8 @@
 A safety-first Telegram private-message gatekeeper for screening unsolicited messages.
 
 > [!IMPORTANT]
-> This project is in the design phase. It is not ready to run against a Telegram account.
+> This software controls a Telegram user session. A stolen session grants account access. Read
+> [SECURITY.md](SECURITY.md) and test with a dedicated account before using a personal account.
 
 ## Intended flow
 
@@ -17,7 +18,17 @@ incoming private message
       -> incorrect or expired: quarantine
 ```
 
-The default policy is reversible quarantine. Permanent deletion and blocking must be explicit, separately configurable actions.
+The default mode is observation-only. Enforcement is a deliberate CLI action, and v1 enforcement is
+limited to archiving and muting. It never deletes, blocks, reports, opens links, or invokes AI.
+
+## Implemented hard rules
+
+- URL, login, or WebView button from an unknown sender
+- forwarded content containing a link or button
+- gambling, crypto-promotion, or VPN/proxy-promotion language combined with a link
+- multiple links or domains in one message
+- repeated link messages within 60 seconds
+- optional locally maintained denied domains
 
 ## Security principles
 
@@ -28,11 +39,19 @@ The default policy is reversible quarantine. Permanent deletion and blocking mus
 - AI-based classification, if added, must not directly trigger irreversible actions.
 - Test authorization and rate-limit handling with a dedicated test account before using a personal account.
 
-See [SECURITY.md](SECURITY.md) before reporting a security issue and [docs/architecture.md](docs/architecture.md) for the current design.
+See [SECURITY.md](SECURITY.md) before reporting a security issue,
+[docs/architecture.md](docs/architecture.md) for the design, and
+[docs/deployment.md](docs/deployment.md) for the hardened deployment procedure.
 
-## Status
+## Local checks
 
-No implementation language or Telegram client library has been selected yet. That decision will be documented before executable code is added.
+```shell
+PYTHONPATH=src python -m unittest discover -v
+PYTHONPATH=src python -m compileall -q src tests scripts
+```
+
+Runtime dependencies and the Python base image are pinned. The container does not expose a network
+port and starts as UID/GID `10001` with a read-only root filesystem.
 
 ## License
 

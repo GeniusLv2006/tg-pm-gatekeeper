@@ -1,0 +1,38 @@
+services:
+  gatekeeper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tg-pm-gatekeeper:local
+    user: "10001:10001"
+    env_file:
+      - /etc/tg-pm-gatekeeper/config.env
+    environment:
+      TG_DB_PATH: /var/lib/tg-pm-gatekeeper/state.sqlite3
+      TG_SESSION_FILE: /run/secrets/telegram_session
+      TG_HMAC_KEY_FILE: /run/secrets/hmac_key
+      TG_DENYLIST_FILE: /run/config/deny-domains.txt
+    volumes:
+      - /var/lib/tg-pm-gatekeeper:/var/lib/tg-pm-gatekeeper:rw
+      - /etc/tg-pm-gatekeeper/telegram.session.secret:/run/secrets/telegram_session:ro
+      - /etc/tg-pm-gatekeeper/hmac.key:/run/secrets/hmac_key:ro
+      - /etc/tg-pm-gatekeeper/deny-domains.txt:/run/config/deny-domains.txt:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.50
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "tg_pm_gatekeeper.cli", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

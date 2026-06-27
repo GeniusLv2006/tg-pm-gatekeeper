@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import os
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when runtime configuration violates the security boundary."""
+
+
+def _required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value or value.startswith("REPLACE_WITH_"):
+        raise ConfigurationError(f"missing required setting: {name}")
+    return value
+
+
+def _positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ConfigurationError(f"{name} must be positive")
+    return value
+
+
+def read_private_file(
+    path: Path, *, minimum_bytes: int = 1, strip: bool = False
+) -> bytes:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise ConfigurationError(f"required private file is missing: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ConfigurationError(f"private file must be a regular non-symlink: {path}")
+    if info.st_mode & 0o077:
+        raise ConfigurationError(f"private file permissions are too broad: {path}")
+    value = path.read_bytes()
+    if strip:
+        value = value.strip()
+    if len(value) < minimum_bytes:
+        raise ConfigurationError(f"private file is empty or too short: {path}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    api_id: int
+    api_hash: str
+    database_path: Path
+    session_file: Path
+    hmac_key_file: Path
+    denylist_file: Path | None
+    challenge_ttl_seconds: int
+    challenge_max_attempts: int
+    audit_retention_days: int
+    mute_days: int
+
+    @classmethod
+    def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
+        if require_telegram:
+            raw_api_id = _required("TG_API_ID")
+            api_hash = _required("TG_API_HASH")
+        else:
+            raw_api_id = os.environ.get("TG_API_ID", "1")
+            api_hash = os.environ.get("TG_API_HASH", "not-used-by-cli")
+        try:
+            api_id = int(raw_api_id)
+        except ValueError as exc:
+            raise ConfigurationError("TG_API_ID must be an integer") from exc
+        denylist = os.environ.get("TG_DENYLIST_FILE", "").strip()
+        return cls(
+            api_id=api_id,
+            api_hash=api_hash,
+            database_path=Path(
+                os.environ.get("TG_DB_PATH", "/var/lib/tg-pm-gatekeeper/state.sqlite3")
+            ),
+            session_file=Path(
+                os.environ.get("TG_SESSION_FILE", "/run/secrets/telegram_session")
+            ),
+            hmac_key_file=Path(
+                os.environ.get("TG_HMAC_KEY_FILE", "/run/secrets/hmac_key")
+            ),
+            denylist_file=Path(denylist) if denylist else None,
+            challenge_ttl_seconds=_positive_int("TG_CHALLENGE_TTL_SECONDS", 600),
+            challenge_max_attempts=_positive_int("TG_CHALLENGE_MAX_ATTEMPTS", 2),
+            audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
+            mute_days=_positive_int("TG_MUTE_DAYS", 3650),
+        )
