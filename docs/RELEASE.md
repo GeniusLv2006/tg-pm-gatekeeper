@@ -69,8 +69,8 @@ identities, messages, credentials, URLs, databases, or logs as test data.
 5. For ordinary changes, enable Squash auto-merge once the scope has been reviewed; GitHub merges
    only after the `test` and `secrets` jobs pass. If auto-merge is unavailable, wait for both jobs
    and merge once. Security-sensitive changes require an explicit human review before merge.
-7. Keep the squash title in the form `<conventional title> (#<PR>)`.
-8. Delete the merged branch and fast-forward local `main`.
+6. Keep the squash title in the form `<conventional title> (#<PR>)`.
+7. Delete the merged branch and fast-forward local `main`.
 
 Do not bypass a failing check. Test count alone is not a reason to remove coverage; execution time,
 signal quality, and maintenance cost are the relevant measures.
@@ -103,7 +103,7 @@ Follow [deployment.md](deployment.md) for host preparation. For every live updat
 4. Fast-forward the server checkout to the reviewed `main` commit.
 5. Rebuild and recreate the container only when the file classification above requires it.
 6. Verify the exact deployed commit, container health, restart count, mode, redacted status, logs,
-   secret permissions, Socket permissions, and absence of unexpected port mappings.
+   secret permissions, socket permissions, and absence of unexpected port mappings.
 7. Remove temporary backups and tunnels after successful verification.
 
 If verification fails, stop further actions. Restore the prior image or commit only after preserving

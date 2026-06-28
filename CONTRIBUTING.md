@@ -37,8 +37,8 @@ docs: clarify session revocation procedure
 Run the same checks used by CI before publishing behavior-affecting changes:
 
 ```shell
-PYTHONPATH=src python -m unittest discover -v
-PYTHONPATH=src python -m compileall -q src tests scripts
+PYTHONPATH=src .venv/bin/python -m unittest discover -v
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
 ```
 
 Dependency versions and GitHub Actions must remain pinned. Do not enable automatic merging for

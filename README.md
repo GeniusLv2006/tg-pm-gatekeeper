@@ -1,30 +1,60 @@
 # tg-pm-gatekeeper
 
-A safety-first Telegram private-message gatekeeper for screening unsolicited messages.
+A self-hosted, observation-first Telegram userbot for screening unsolicited private messages with
+deterministic rules and optional challenge enforcement.
 
 > [!IMPORTANT]
 > This software controls a Telegram user session. A stolen session grants account access. Read
 > [SECURITY.md](SECURITY.md) and test with a dedicated account before using a personal account.
 
-## Intended flow
+## Project status
+
+The project is pre-release and tracks the latest commit on `main`. The implemented runtime:
+
+- starts in `observe` mode and does not change Telegram dialogs automatically;
+- evaluates deterministic, local rules without opening links or sending message content elsewhere;
+- groups review work by sender and serves it through an SSH-forwarded, owner-only Unix socket;
+- can be explicitly switched to `enforce` mode to challenge ordinary unknown senders and archive
+  and mute high-confidence spam; and
+- does not delete, block, report, call an AI service, or expose a public administration port.
+
+## Runtime flow
 
 ```text
 incoming private message
-  -> trusted sender? allow
-  -> high-confidence spam rule? quarantine
-  -> optional risk classification
-  -> challenge unknown sender
-      -> correct answer: add to local allowlist
-      -> incorrect or expired: quarantine
+  -> service account, bot, contact, allowed sender, or trusted prior conversation? allow
+  -> deterministic high-confidence rule matched?
+      observe: enqueue a simulated quarantine for review
+      enforce: archive and mute
+  -> ordinary unknown sender
+      observe: enqueue a simulated challenge for review
+      enforce: send one arithmetic challenge, then archive and mute while pending
+          -> correct answer: restore dialog and allow sender
+          -> two incorrect numeric answers or timeout: remain archived and muted
 ```
 
-The default mode is observation-only. Enforcement is a deliberate CLI action, and v1 enforcement is
-limited to archiving and muting. It never deletes, blocks, reports, opens links, or invokes AI.
+The default mode is observation-only. Enforcement is a deliberate CLI action.
+
+## Review dashboard
 
 Observation mode places simulated challenge and quarantine decisions in a local review queue. The
 review dashboard is served only through an owner-only Unix socket and is reached with an SSH tunnel;
-the container still exposes no TCP port. Opening an item fetches its message and sender directly from
-Telegram at that moment. Message bodies and profile data are not written to the local database.
+the container exposes no TCP port.
+
+The queue is intentionally sender-centric:
+
+- one pending row represents one sender, not one message;
+- `Messages observed` is the number of messages consolidated into that row;
+- the detail page fetches and displays exactly one referenced Telegram message, not conversation
+  history;
+- a newer message normally replaces the retained reference, while an earlier simulated quarantine
+  remains the representative item when a later lower-risk message arrives; and
+- message bodies and profile data are rendered from Telegram only when the detail page opens and are
+  not written to the database or application logs.
+
+Choosing **Legitimate**, **Spam**, or **Dismiss** resolves the sender's pending work and immediately
+erases the reversible Telegram reference. The non-content decision record remains subject to normal
+retention.
 
 From a trusted workstation, open the review tunnel with an explicit SSH target:
 
@@ -32,7 +62,7 @@ From a trusted workstation, open the review tunnel with an explicit SSH target:
 scripts/review-tunnel.sh root@server.example
 ```
 
-The target, local port, remote Socket, and alternate SSH configuration are configurable. Run the
+The target, local port, remote socket, and alternate SSH configuration are configurable. Run the
 helper with `-h` or see [docs/deployment.md](docs/deployment.md) for the complete interface.
 
 ## Implemented hard rules
@@ -56,17 +86,49 @@ helper with `-h` or see [docs/deployment.md](docs/deployment.md) for the complet
 - AI-based classification, if added, must not directly trigger irreversible actions.
 - Test authorization and rate-limit handling with a dedicated test account before using a personal account.
 
+## Operator commands
+
+Run commands inside the deployed container:
+
+```shell
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli resume
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli allow USER_ID
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
+```
+
+`pause` selects `observe`; `resume` selects `enforce`. `allow` and `revoke` derive the stored sender
+key inside the container, but the raw ID supplied on the command line may still enter shell history.
+
 See [SECURITY.md](SECURITY.md) before reporting a security issue,
 [docs/architecture.md](docs/architecture.md) for the design, and
 [docs/deployment.md](docs/deployment.md) for the hardened deployment procedure. Release and
 deployment decisions are defined in [docs/RELEASE.md](docs/RELEASE.md). Contributions must follow
 [CONTRIBUTING.md](CONTRIBUTING.md), including the Conventional Commits requirement.
 
+## Deployment overview
+
+Use Python 3.14 on a trusted workstation to create the Telegram StringSession and server-local HMAC
+key. The initializer refuses to overwrite existing output files:
+
+```shell
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes --no-deps -r requirements-build.txt
+.venv/bin/python -m pip install --require-hashes --no-deps --no-build-isolation -r requirements.txt
+.venv/bin/python scripts/initialize.py
+```
+
+Provision the generated files onto a Docker host, build with `docker compose`, verify `observe`
+mode, and only then open the review tunnel. Follow
+[docs/deployment.md](docs/deployment.md) for exact permissions, transfer commands, boundary checks,
+and emergency session revocation. Do not improvise secret paths or publish the review socket.
+
 ## Local checks
 
 ```shell
-PYTHONPATH=src python -m unittest discover -v
-PYTHONPATH=src python -m compileall -q src tests scripts
+PYTHONPATH=src .venv/bin/python -m unittest discover -v
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
 ```
 
 Runtime dependencies and the Python base image are pinned. The container does not expose a network
