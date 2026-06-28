@@ -77,14 +77,21 @@ ssh bv 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m 
 
 ### Review observation decisions
 
-The dashboard has no TCP listener. Forward a temporary local port directly to its owner-only Unix
-socket, leaving this command running:
+The dashboard has no TCP listener. From the local repository, run the tunnel helper:
 
 ```shell
-ssh -N -L 8765:/var/lib/tg-pm-gatekeeper/review.sock bv
+scripts/review-tunnel.sh
 ```
 
-Then open `http://127.0.0.1:8765/` locally. The queue page contains no message content. Opening an
+It prints `Connected` only after the dashboard responds. Keep that terminal open; `Ctrl+C` closes the
+dedicated tunnel. The helper disables SSH connection sharing so the forwarding process cannot be
+silently handed to a background ControlMaster. Set `TG_REVIEW_PORT` or `TG_REVIEW_HOST` to override
+the default local port `8765` or host `bv`.
+
+Then open `http://127.0.0.1:8765/` locally. The green **Live connection** timestamp comes from each
+server response, and the queue automatically checks again every 10 seconds. If the tunnel closes,
+the browser will show a connection error on the next check instead of leaving a misleading stale
+dashboard. The queue page contains no message content. Opening an
 item fetches the message and sender live from Telegram. Available decisions are:
 
 - **Legitimate**: add the HMAC-keyed sender to the local allowlist.

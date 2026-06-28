@@ -62,8 +62,17 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn(b"transient-canary", response)
+        self.assertIn(b'http-equiv="refresh" content="30"', response)
+        self.assertIn(b"Live connection", response)
         database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
         self.assertNotIn(b"transient-canary", database)
+
+    async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
+        response = self.server._index_page()
+        self.assertIn(b'http-equiv="refresh" content="10"', response)
+        self.assertIn(b"Live connection", response)
+        self.assertIn(b"Response ", response)
+        self.assertIn(b"Connection check repeats every 10 seconds", response)
 
     async def test_admin_server_uses_owner_only_unix_socket(self) -> None:
         await self.server.start()
