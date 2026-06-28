@@ -2,9 +2,98 @@
 
 set -u
 
-host="${TG_REVIEW_HOST:-bv}"
+usage() {
+    cat <<'EOF'
+Usage: review-tunnel.sh [options] [SSH_TARGET]
+
+Open a dedicated local tunnel to the gatekeeper review dashboard.
+
+Arguments:
+  SSH_TARGET             SSH host, alias, or user@host. Required unless
+                         TG_REVIEW_HOST is set.
+
+Options:
+  -p PORT                Local TCP port (default: TG_REVIEW_PORT or 8765)
+  -s REMOTE_SOCKET       Remote Unix socket path
+  -F SSH_CONFIG          Alternate OpenSSH config file
+  -h                     Show this help
+
+Environment:
+  TG_REVIEW_HOST         Default SSH target
+  TG_REVIEW_PORT         Default local port
+  TG_REVIEW_SOCKET       Default remote Unix socket path
+  TG_REVIEW_SSH_CONFIG   Default alternate OpenSSH config file
+EOF
+}
+
 port="${TG_REVIEW_PORT:-8765}"
 remote_socket="${TG_REVIEW_SOCKET:-/var/lib/tg-pm-gatekeeper/review.sock}"
+ssh_config="${TG_REVIEW_SSH_CONFIG:-}"
+
+while getopts "hp:s:F:" option; do
+    case "$option" in
+        h)
+            usage
+            exit 0
+            ;;
+        p) port="$OPTARG" ;;
+        s) remote_socket="$OPTARG" ;;
+        F) ssh_config="$OPTARG" ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -gt 1 ]; then
+    echo "Only one SSH target may be supplied." >&2
+    usage >&2
+    exit 2
+fi
+
+host="${1:-${TG_REVIEW_HOST:-}}"
+if [ -z "$host" ]; then
+    echo "An SSH target is required." >&2
+    echo "Example: scripts/review-tunnel.sh user@server.example" >&2
+    echo "Or set TG_REVIEW_HOST in your shell environment." >&2
+    exit 2
+fi
+case "$host" in
+    -*)
+        echo "SSH target must not begin with '-'." >&2
+        exit 2
+        ;;
+esac
+case "$port" in
+    ''|*[!0-9]*)
+        echo "Local port must be an integer from 1 to 65535." >&2
+        exit 2
+        ;;
+esac
+if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo "Local port must be an integer from 1 to 65535." >&2
+    exit 2
+fi
+case "$remote_socket" in
+    /*) ;;
+    *)
+        echo "Remote socket must be an absolute path." >&2
+        exit 2
+        ;;
+esac
+if [ -n "$ssh_config" ] && [ ! -r "$ssh_config" ]; then
+    echo "SSH config is not readable: ${ssh_config}" >&2
+    exit 2
+fi
+for dependency in ssh curl; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        echo "Required command is missing: ${dependency}" >&2
+        exit 127
+    fi
+done
+
 url="http://127.0.0.1:${port}/"
 tunnel_pid=""
 connected=false
@@ -22,16 +111,25 @@ cleanup() {
 trap 'cleanup; exit 130' INT TERM HUP
 trap cleanup EXIT
 
+open_tunnel() {
+    if [ -n "$ssh_config" ]; then
+        set -- -F "$ssh_config"
+    else
+        set --
+    fi
+    ssh "$@" \
+        -o ControlMaster=no \
+        -o ControlPath=none \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=2 \
+        -N \
+        -L "127.0.0.1:${port}:${remote_socket}" \
+        "$host"
+}
+
 echo "Opening a dedicated review tunnel to ${host}..."
-ssh \
-    -o ControlMaster=no \
-    -o ControlPath=none \
-    -o ExitOnForwardFailure=yes \
-    -o ServerAliveInterval=15 \
-    -o ServerAliveCountMax=2 \
-    -N \
-    -L "127.0.0.1:${port}:${remote_socket}" \
-    "$host" &
+open_tunnel &
 tunnel_pid=$!
 
 attempt=0

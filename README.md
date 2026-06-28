@@ -26,6 +26,15 @@ review dashboard is served only through an owner-only Unix socket and is reached
 the container still exposes no TCP port. Opening an item fetches its message and sender directly from
 Telegram at that moment. Message bodies and profile data are not written to the local database.
 
+From a trusted workstation, open the review tunnel with an explicit SSH target:
+
+```shell
+scripts/review-tunnel.sh root@server.example
+```
+
+The target, local port, remote Socket, and alternate SSH configuration are configurable. Run the
+helper with `-h` or see [docs/deployment.md](docs/deployment.md) for the complete interface.
+
 ## Implemented hard rules
 
 - URL, login, or WebView button from an unknown sender

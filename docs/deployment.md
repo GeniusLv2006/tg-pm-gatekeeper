@@ -1,7 +1,12 @@
 # Hardened deployment
 
-These instructions target the `bv` host selected for the first deployment. Re-check the host before
-every deployment; resource and network observations are not permanent facts.
+These instructions target a dedicated Debian-compatible Linux host. Set the SSH destination once
+for the current shell, and re-check the host before every deployment; resource and network
+observations are not permanent facts.
+
+```shell
+export DEPLOY_HOST=root@server.example
+```
 
 ## 1. Preconditions
 
@@ -26,25 +31,25 @@ None of these files may be printed, copied into an environment variable, or comm
 
 ## 2. Prepare the host
 
-Run the bootstrap script as root on `bv`. It creates a non-login UID/GID `10001` and the three fixed
+Run the bootstrap script as root on the deployment host. It creates a non-login UID/GID `10001` and the three fixed
 directories without creating credentials:
 
 ```shell
-ssh bv 'sh -s' < deploy/bootstrap-bv.sh
+ssh "$DEPLOY_HOST" 'sh -s' < deploy/bootstrap-host.sh
 ```
 
 Clone the public repository anonymously. No GitHub token or deploy key is needed:
 
 ```shell
-ssh bv 'git clone https://github.com/GeniusLv2006/tg-pm-gatekeeper.git /opt/tg-pm-gatekeeper'
+ssh "$DEPLOY_HOST" 'git clone https://github.com/GeniusLv2006/tg-pm-gatekeeper.git /opt/tg-pm-gatekeeper'
 ```
 
 Transfer secrets through SCP to temporary root-only filenames, install them with the service UID,
 then remove the temporary copies:
 
 ```shell
-scp telegram.session.secret hmac.key config.env deny-domains.txt bv:/tmp/
-ssh bv 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/config.env /tmp/deny-domains.txt'
+scp telegram.session.secret hmac.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
+ssh "$DEPLOY_HOST" 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/config.env /tmp/deny-domains.txt'
 ```
 
 Do not add these files to a general server backup job.
@@ -54,25 +59,25 @@ Do not add these files to a general server backup job.
 Record and verify the exact commit before building:
 
 ```shell
-ssh bv 'cd /opt/tg-pm-gatekeeper && git fetch origin && git checkout main && git pull --ff-only && git rev-parse HEAD && docker compose build --pull && docker compose up -d'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && git fetch origin && git checkout main && git pull --ff-only && git rev-parse HEAD && docker compose build --pull && docker compose up -d'
 ```
 
 The database defaults to `observe`. Check health and redacted status:
 
 ```shell
-ssh bv 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
 ```
 
 After seven days of reviewed observation, enable enforcement explicitly:
 
 ```shell
-ssh bv 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli resume'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli resume'
 ```
 
 Pause immediately without stopping update processing:
 
 ```shell
-ssh bv 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause'
 ```
 
 ### Review observation decisions
@@ -80,13 +85,26 @@ ssh bv 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m 
 The dashboard has no TCP listener. From the local repository, run the tunnel helper:
 
 ```shell
-scripts/review-tunnel.sh
+scripts/review-tunnel.sh "$DEPLOY_HOST"
 ```
 
 It prints `Connected` only after the dashboard responds. Keep that terminal open; `Ctrl+C` closes the
 dedicated tunnel. The helper disables SSH connection sharing so the forwarding process cannot be
-silently handed to a background ControlMaster. Set `TG_REVIEW_PORT` or `TG_REVIEW_HOST` to override
-the default local port `8765` or host `bv`.
+silently handed to a background ControlMaster. The target may be an OpenSSH alias or `user@host`,
+and must be able to access the owner-only remote Socket; this guide uses the root maintenance login.
+
+The target can instead come from `TG_REVIEW_HOST`. Local port, remote Socket, and an alternate SSH
+configuration file are configurable through flags or environment variables:
+
+```shell
+TG_REVIEW_HOST=root@gatekeeper.example \
+TG_REVIEW_PORT=18765 \
+TG_REVIEW_SOCKET=/srv/gatekeeper/review.sock \
+TG_REVIEW_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf" \
+scripts/review-tunnel.sh
+```
+
+Run `scripts/review-tunnel.sh -h` for the complete interface.
 
 Then open `http://127.0.0.1:8765/` locally. The green **Live connection** timestamp comes from each
 server response, and the queue automatically checks again every 10 seconds. If the tunnel closes,
@@ -111,10 +129,10 @@ history; use a temporary history-disabled shell when this matters.
 The deployment is acceptable only when all checks pass:
 
 ```shell
-ssh bv 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
-ssh bv 'ss -lnt'
-ssh bv 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /var/lib/tg-pm-gatekeeper'
-ssh bv 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock'
+ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
+ssh "$DEPLOY_HOST" 'ss -lnt'
+ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /var/lib/tg-pm-gatekeeper'
+ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock'
 ```
 
 Expected values are user `10001:10001`, read-only root filesystem, all capabilities dropped, no port
