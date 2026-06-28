@@ -21,6 +21,11 @@ incoming private message
 The default mode is observation-only. Enforcement is a deliberate CLI action, and v1 enforcement is
 limited to archiving and muting. It never deletes, blocks, reports, opens links, or invokes AI.
 
+Observation mode places simulated challenge and quarantine decisions in a local review queue. The
+review dashboard is served only through an owner-only Unix socket and is reached with an SSH tunnel;
+the container still exposes no TCP port. Opening an item fetches its message and sender directly from
+Telegram at that moment. Message bodies and profile data are not written to the local database.
+
 ## Implemented hard rules
 
 - URL, login, or WebView button from an unknown sender
@@ -37,6 +42,8 @@ limited to archiving and muting. It never deletes, blocks, reports, opens links,
 - Keep secrets outside the repository and provide only redacted configuration examples.
 - Treat a user-session file as an account credential.
 - Minimize stored message content and keep an auditable reason for every automated action.
+- Expire encrypted review references after at most seven days and erase them immediately after a
+  review decision.
 - AI-based classification, if added, must not directly trigger irreversible actions.
 - Test authorization and rate-limit handling with a dedicated test account before using a personal account.
 

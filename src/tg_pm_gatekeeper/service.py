@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 import secrets
 import time
@@ -34,6 +35,7 @@ class IncomingMessage:
     is_bot: bool = False
     is_service: bool = False
     has_trusted_history: bool = False
+    review_reference: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +65,7 @@ class GatekeeperService:
         challenge_ttl_seconds: int = 60,
         challenge_max_attempts: int = 2,
         outbound_limit_per_hour: int = 10,
+        review_retention_days: int = 7,
         denylist: frozenset[str] = frozenset(),
         challenge_factory=new_challenge,
         clock=lambda: int(time.time()),
@@ -72,6 +75,7 @@ class GatekeeperService:
         self.challenge_ttl_seconds = challenge_ttl_seconds
         self.challenge_max_attempts = challenge_max_attempts
         self.outbound_limit_per_hour = outbound_limit_per_hour
+        self.review_retention_days = min(review_retention_days, 7)
         self.denylist = denylist
         self.challenge_factory = challenge_factory
         self.clock = clock
@@ -98,6 +102,9 @@ class GatekeeperService:
                 self.store.audit(sender_key, "TRUSTED_HISTORY", "allowed", now)
                 outcome = "allowed"
                 return outcome
+            if state.status == "quarantined":
+                outcome = "already_quarantined"
+                return outcome
 
             recent_links = self.store.recent_link_messages(sender_key, now=now)
             decision = evaluate_hard_rules(
@@ -112,11 +119,16 @@ class GatekeeperService:
                 for rule in decision.rule_codes:
                     self.store.audit(sender_key, rule, "matched", now)
                 outcome = await self._quarantine(sender_key, actions, now, "hard_rule")
+                if outcome == "would_quarantine":
+                    self._enqueue_review(
+                        sender_key,
+                        message,
+                        outcome,
+                        decision.rule_codes,
+                        now,
+                    )
                 return outcome
 
-            if state.status == "quarantined":
-                outcome = "already_quarantined"
-                return outcome
             if state.status == "challenged":
                 outcome = await self._handle_challenge(
                     sender_key, state, message.text, actions, now
@@ -126,6 +138,7 @@ class GatekeeperService:
             if self.store.get_mode() == "observe":
                 self.store.audit(sender_key, "CHALLENGE_REQUIRED", "observed", now)
                 outcome = "would_challenge"
+                self._enqueue_review(sender_key, message, outcome, (), now)
                 return outcome
 
             challenge = self.challenge_factory()
@@ -156,6 +169,38 @@ class GatekeeperService:
             return "fail_safe"
         finally:
             self.store.finish_message(sender_key, message.message_id, outcome)
+
+    def _enqueue_review(
+        self,
+        sender_key: str,
+        message: IncomingMessage,
+        classification: str,
+        rule_codes: tuple[str, ...],
+        now: int,
+    ) -> None:
+        if message.review_reference is None:
+            self.store.audit(sender_key, "REVIEW_REFERENCE", "unavailable", now)
+            return
+        facts = message.facts
+        features = {
+            "domain_count": min(len(set(facts.domains)), 2),
+            "forwarded": facts.is_forwarded,
+            "has_any_button": facts.has_any_button,
+            "has_link": facts.has_link,
+            "has_link_button": facts.has_link_button,
+            "has_quote": bool(facts.quote_text),
+            "url_count": min(len(set(facts.urls)), 2),
+            "via_bot": facts.via_bot,
+        }
+        self.store.enqueue_review(
+            sender_key,
+            message.review_reference,
+            classification,
+            json.dumps(rule_codes, separators=(",", ":")),
+            json.dumps(features, sort_keys=True, separators=(",", ":")),
+            now + self.review_retention_days * 86400,
+            now,
+        )
 
     async def _handle_challenge(
         self, sender_key, state, text, actions, now: int

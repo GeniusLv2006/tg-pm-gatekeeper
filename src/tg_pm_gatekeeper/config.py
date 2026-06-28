@@ -58,6 +58,8 @@ class Settings:
     challenge_ttl_seconds: int
     challenge_max_attempts: int
     audit_retention_days: int
+    review_retention_days: int
+    review_socket_path: Path
     mute_days: int
     outbound_limit_per_hour: int
 
@@ -90,6 +92,15 @@ class Settings:
             challenge_ttl_seconds=_positive_int("TG_CHALLENGE_TTL_SECONDS", 60),
             challenge_max_attempts=_positive_int("TG_CHALLENGE_MAX_ATTEMPTS", 2),
             audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
+            review_retention_days=min(
+                _positive_int("TG_REVIEW_RETENTION_DAYS", 7), 7
+            ),
+            review_socket_path=Path(
+                os.environ.get(
+                    "TG_REVIEW_SOCKET_PATH",
+                    "/var/lib/tg-pm-gatekeeper/review.sock",
+                )
+            ),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
             outbound_limit_per_hour=_positive_int("TG_OUTBOUND_LIMIT_PER_HOUR", 10),
         )

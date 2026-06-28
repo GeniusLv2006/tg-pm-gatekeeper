@@ -35,6 +35,47 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.healthy(now=150))
         self.assertFalse(self.store.healthy(now=221))
 
+    def test_review_decision_erases_reversible_reference(self) -> None:
+        review_id = self.store.enqueue_review(
+            "sender", b"sealed-reference", "would_challenge", "[]", "{}", 700, 100
+        )
+        self.assertEqual(self.store.statistics()["pending_reviews"], 1)
+        self.assertTrue(self.store.decide_review(review_id, "legitimate", 200))
+        item = self.store.review_item(review_id)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.status, "legitimate")
+        self.assertIsNone(item.reference)
+        self.assertEqual(self.store.statistics()["pending_reviews"], 0)
+
+    def test_review_reference_expires_at_its_own_deadline(self) -> None:
+        self.store.enqueue_review(
+            "sender", b"sealed-reference", "would_challenge", "[]", "{}", 200, 100
+        )
+        self.store.prune(30, now=201)
+        self.assertEqual(self.store.review_items(), [])
+
+    def test_pending_reviews_are_consolidated_per_sender(self) -> None:
+        first_id = self.store.enqueue_review(
+            "sender", b"first", "would_challenge", "[]", "{}", 700, 100
+        )
+        second_id = self.store.enqueue_review(
+            "sender",
+            b"second",
+            "would_quarantine",
+            '["HR-01_LINK_BUTTON"]',
+            "{}",
+            800,
+            200,
+        )
+        third_id = self.store.enqueue_review(
+            "sender", b"third", "would_challenge", "[]", "{}", 900, 300
+        )
+        self.assertEqual((first_id, second_id, third_id), (first_id,) * 3)
+        item = self.store.review_item(first_id)
+        self.assertEqual(item.message_count, 3)
+        self.assertEqual(item.classification, "would_quarantine")
+        self.assertEqual(item.reference, b"second")
+
 
 if __name__ == "__main__":
     unittest.main()
