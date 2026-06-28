@@ -41,7 +41,8 @@ limited to archiving and muting. It never deletes, blocks, reports, opens links,
 
 See [SECURITY.md](SECURITY.md) before reporting a security issue,
 [docs/architecture.md](docs/architecture.md) for the design, and
-[docs/deployment.md](docs/deployment.md) for the hardened deployment procedure.
+[docs/deployment.md](docs/deployment.md) for the hardened deployment procedure. Contributions must
+follow [CONTRIBUTING.md](CONTRIBUTING.md), including the Conventional Commits requirement.
 
 ## Local checks
 
