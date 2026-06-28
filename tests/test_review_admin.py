@@ -74,6 +74,23 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Response ", response)
         self.assertIn(b"Connection check repeats every 10 seconds", response)
 
+    async def test_review_page_uses_one_aligned_component_rail(self) -> None:
+        status, _, response = await self.server._dispatch(
+            "GET", f"/review/{self.review_id}", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(
+            b".decision-panel{position:relative;width:calc(100% - 2.5rem);"
+            b"max-width:1080px",
+            response,
+        )
+        self.assertNotIn(b".decision-panel h2{max-width:", response)
+        self.assertIn(
+            b".actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))",
+            response,
+        )
+        self.assertIn(b"button{width:100%;min-height:3.25rem", response)
+
     async def test_admin_server_uses_owner_only_unix_socket(self) -> None:
         await self.server.start()
         try:
