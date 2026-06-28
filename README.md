@@ -58,8 +58,9 @@ helper with `-h` or see [docs/deployment.md](docs/deployment.md) for the complet
 
 See [SECURITY.md](SECURITY.md) before reporting a security issue,
 [docs/architecture.md](docs/architecture.md) for the design, and
-[docs/deployment.md](docs/deployment.md) for the hardened deployment procedure. Contributions must
-follow [CONTRIBUTING.md](CONTRIBUTING.md), including the Conventional Commits requirement.
+[docs/deployment.md](docs/deployment.md) for the hardened deployment procedure. Release and
+deployment decisions are defined in [docs/RELEASE.md](docs/RELEASE.md). Contributions must follow
+[CONTRIBUTING.md](CONTRIBUTING.md), including the Conventional Commits requirement.
 
 ## Local checks
 

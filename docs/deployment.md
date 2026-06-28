@@ -1,5 +1,8 @@
 # Hardened deployment
 
+Use this runbook together with [RELEASE.md](RELEASE.md), which determines whether a change requires
+a PR, a live deployment, or a container rebuild.
+
 These instructions target a dedicated Debian-compatible Linux host. Set the SSH destination once
 for the current shell, and re-check the host before every deployment; resource and network
 observations are not permanent facts.

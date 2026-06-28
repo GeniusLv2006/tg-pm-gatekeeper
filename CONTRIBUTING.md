@@ -8,7 +8,9 @@ convenience. Keep changes small, reviewable, and safe to publish.
 - Do not use real API credentials, session strings, phone numbers, user IDs, usernames, messages,
   URLs, allowlists, databases, or logs in code, tests, issues, or pull requests.
 - Report vulnerabilities through the process in [SECURITY.md](SECURITY.md), not in a public issue.
-- Base work on `main` and submit it through a pull request.
+- Base work on `main` and follow the risk-based publication rules in
+  [docs/RELEASE.md](docs/RELEASE.md). Runtime, security, networking, deployment, dependency, and
+  executable-script changes require a pull request.
 
 ## Commit format
 
@@ -32,7 +34,7 @@ docs: clarify session revocation procedure
 
 ## Validation
 
-Run the same checks used by CI before opening a pull request:
+Run the same checks used by CI before publishing behavior-affecting changes:
 
 ```shell
 PYTHONPATH=src python -m unittest discover -v
@@ -46,4 +48,6 @@ dependency updates.
 
 Explain the behavior change, its security and privacy impact, and the checks performed. Changes to
 Telegram actions, stored data, logging, networking, or deployment boundaries require corresponding
-tests and documentation.
+tests and documentation. Draft PRs are for incomplete work; ready changes should not add a separate
+Draft-to-Ready ceremony. See [docs/RELEASE.md](docs/RELEASE.md) for direct-to-main eligibility,
+merge titles, and deployment requirements.
