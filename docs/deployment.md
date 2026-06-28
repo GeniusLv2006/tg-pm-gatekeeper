@@ -84,7 +84,7 @@ history; use a temporary history-disabled shell when this matters.
 The deployment is acceptable only when all checks pass:
 
 ```shell
-ssh bv 'cd /opt/tg-pm-gatekeeper && docker inspect tg-pm-gatekeeper-gatekeeper-1 --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
+ssh bv 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh bv 'ss -lnt'
 ssh bv 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /var/lib/tg-pm-gatekeeper'
 ```
