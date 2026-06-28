@@ -25,6 +25,7 @@ Transitions must be idempotent and persisted so restarts cannot resend challenge
 1. Accept only incoming private-message events.
 2. Exclude contacts, local allowlist entries, service accounts, bots, and peers with a trusted prior conversation.
 3. Apply deterministic, high-precision spam rules.
+   Quoted text and its entities are inspected in memory, but are never persisted.
 4. Optionally calculate a non-authoritative risk score.
 5. Send one expiring challenge to an otherwise ordinary unknown sender.
 6. Allow a correct response; quarantine an incorrect or expired challenge.

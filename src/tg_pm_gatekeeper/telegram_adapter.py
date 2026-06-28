@@ -51,14 +51,23 @@ def _entity_text(text: str, offset: int, length: int) -> str:
     return encoded[start:end].decode("utf-16-le", errors="ignore")
 
 
-def facts_from_message(message: types.Message) -> MessageFacts:
-    text = message.message or ""
+def _urls_from_text_and_entities(text: str, entities) -> set[str]:
     urls = set(URL_RE.findall(text))
-    for entity in message.entities or []:
+    for entity in entities or []:
         if isinstance(entity, types.MessageEntityTextUrl):
             urls.add(entity.url)
         elif isinstance(entity, types.MessageEntityUrl):
             urls.add(_entity_text(text, entity.offset, entity.length))
+    return urls
+
+
+def facts_from_message(message: types.Message) -> MessageFacts:
+    text = message.message or ""
+    urls = _urls_from_text_and_entities(text, message.entities)
+    reply_header = getattr(message, "reply_to", None)
+    quote_text = getattr(reply_header, "quote_text", None) or ""
+    quote_entities = getattr(reply_header, "quote_entities", None) or ()
+    urls.update(_urls_from_text_and_entities(quote_text, quote_entities))
 
     has_link_button = False
     has_any_button = False
@@ -81,6 +90,7 @@ def facts_from_message(message: types.Message) -> MessageFacts:
     )
     return MessageFacts(
         text=text,
+        quote_text=quote_text,
         urls=tuple(sorted(urls)),
         domains=domains,
         has_link_button=has_link_button,

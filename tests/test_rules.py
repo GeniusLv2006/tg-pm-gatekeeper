@@ -25,6 +25,23 @@ class RuleTests(unittest.TestCase):
         decision = evaluate_hard_rules(MessageFacts(text="你使用什么 VPN？"))
         self.assertFalse(decision.hard_spam)
 
+    def test_quoted_crypto_service_promotion_is_hard_rule(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(
+                text="核心在此",
+                quote_text="0.01TRX 转账 0.01TRX=131K能量+500带宽 @haojia 能量下单地",
+            )
+        )
+        self.assertIn(
+            "HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION", decision.rule_codes
+        )
+
+    def test_quoted_crypto_discussion_is_not_hard_rule(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(quote_text="TRX 转账为什么需要能量？")
+        )
+        self.assertFalse(decision.hard_spam)
+
     def test_promotional_topic_with_link_is_hard_rule(self) -> None:
         decision = evaluate_hard_rules(
             MessageFacts(text="机场推荐 永久套餐", urls=("https://example.invalid",))
