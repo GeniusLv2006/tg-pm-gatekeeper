@@ -75,6 +75,26 @@ Pause immediately without stopping update processing:
 ssh bv 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause'
 ```
 
+### Review observation decisions
+
+The dashboard has no TCP listener. Forward a temporary local port directly to its owner-only Unix
+socket, leaving this command running:
+
+```shell
+ssh -N -L 8765:/var/lib/tg-pm-gatekeeper/review.sock bv
+```
+
+Then open `http://127.0.0.1:8765/` locally. The queue page contains no message content. Opening an
+item fetches the message and sender live from Telegram. Available decisions are:
+
+- **Legitimate**: add the HMAC-keyed sender to the local allowlist.
+- **Spam**: archive and mute the Telegram dialog, then mark the sender quarantined.
+- **Dismiss**: record no classification and perform no Telegram action.
+
+All three decisions erase the encrypted Telegram reference immediately. Pending references expire
+after seven days. Stop the SSH command when review is complete; do not publish the socket through a
+Docker port mapping or reverse proxy.
+
 The `allow USER_ID` and `revoke USER_ID` commands derive the stored HMAC key inside the container and
 never print the raw identifier. Be aware that a user ID typed as a CLI argument can remain in shell
 history; use a temporary history-disabled shell when this matters.
@@ -87,11 +107,13 @@ The deployment is acceptable only when all checks pass:
 ssh bv 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh bv 'ss -lnt'
 ssh bv 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /var/lib/tg-pm-gatekeeper'
+ssh bv 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock'
 ```
 
 Expected values are user `10001:10001`, read-only root filesystem, all capabilities dropped, no port
 bindings, `no-new-privileges`, secret modes `600`, and state-directory mode `700`. The application
-must not add a listening TCP port.
+must not add a listening TCP port. The review socket must be a Unix socket with mode `600` owned by
+UID/GID `10001:10001`.
 
 ## 5. Emergency revocation
 

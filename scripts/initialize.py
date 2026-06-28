@@ -37,6 +37,8 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_CHALLENGE_TTL_SECONDS=60\n"
         "TG_CHALLENGE_MAX_ATTEMPTS=2\n"
         "TG_AUDIT_RETENTION_DAYS=30\n"
+        "TG_REVIEW_RETENTION_DAYS=7\n"
+        "TG_REVIEW_SOCKET_PATH=/var/lib/tg-pm-gatekeeper/review.sock\n"
         "TG_MUTE_DAYS=3650\n"
         "TG_OUTBOUND_LIMIT_PER_HOUR=10\n"
     ).encode("ascii")

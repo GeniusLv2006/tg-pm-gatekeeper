@@ -44,6 +44,23 @@ CREATE TABLE IF NOT EXISTS link_events (
 CREATE INDEX IF NOT EXISTS link_events_sender_time_idx ON link_events(sender_key, created_at);
 CREATE TABLE IF NOT EXISTS outbound_events (created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS outbound_events_time_idx ON outbound_events(created_at);
+CREATE TABLE IF NOT EXISTS review_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_key TEXT NOT NULL,
+    reference BLOB,
+    classification TEXT NOT NULL,
+    rule_codes TEXT NOT NULL,
+    features TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'legitimate', 'spam', 'dismissed')),
+    message_count INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    reviewed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS review_queue_status_created_idx
+    ON review_queue(status, created_at);
 """
 
 
@@ -54,6 +71,22 @@ class SenderState:
     answer_digest: str | None
     challenge_expires_at: int | None
     attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewItem:
+    id: int
+    sender_key: str
+    reference: bytes | None
+    classification: str
+    rule_codes: str
+    features: str
+    status: str
+    message_count: int
+    created_at: int
+    updated_at: int
+    expires_at: int
+    reviewed_at: int | None
 
 
 class StateStore:
@@ -223,6 +256,117 @@ class StateStore:
                 (sender_key, rule_code, outcome, timestamp),
             )
 
+    def enqueue_review(
+        self,
+        sender_key: str,
+        reference: bytes,
+        classification: str,
+        rule_codes: str,
+        features: str,
+        expires_at: int,
+        now: int | None = None,
+    ) -> int:
+        timestamp = now or int(time.time())
+        with self._lock, self._connection:
+            pending = self._connection.execute(
+                "SELECT id, classification FROM review_queue "
+                "WHERE sender_key=? AND status='pending'",
+                (sender_key,),
+            ).fetchone()
+            if pending:
+                if not (
+                    pending["classification"] == "would_quarantine"
+                    and classification != "would_quarantine"
+                ):
+                    self._connection.execute(
+                        "UPDATE review_queue SET reference=?, classification=?, "
+                        "rule_codes=?, features=?, message_count=message_count+1, "
+                        "updated_at=?, expires_at=? WHERE id=?",
+                        (
+                            reference,
+                            classification,
+                            rule_codes,
+                            features,
+                            timestamp,
+                            expires_at,
+                            pending["id"],
+                        ),
+                    )
+                else:
+                    self._connection.execute(
+                        "UPDATE review_queue SET message_count=message_count+1, "
+                        "updated_at=?, expires_at=? WHERE id=?",
+                        (timestamp, expires_at, pending["id"]),
+                    )
+                return int(pending["id"])
+            cursor = self._connection.execute(
+                "INSERT INTO review_queue(sender_key, reference, classification, "
+                "rule_codes, features, created_at, updated_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sender_key,
+                    reference,
+                    classification,
+                    rule_codes,
+                    features,
+                    timestamp,
+                    timestamp,
+                    expires_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def review_items(self, *, limit: int = 100) -> list[ReviewItem]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id, sender_key, reference, classification, rule_codes, "
+                "features, status, message_count, created_at, updated_at, "
+                "expires_at, reviewed_at "
+                "FROM review_queue WHERE status='pending' "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [ReviewItem(**dict(row)) for row in rows]
+
+    def review_item(self, review_id: int) -> ReviewItem | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT id, sender_key, reference, classification, rule_codes, "
+                "features, status, message_count, created_at, updated_at, "
+                "expires_at, reviewed_at "
+                "FROM review_queue WHERE id=?",
+                (review_id,),
+            ).fetchone()
+        return ReviewItem(**dict(row)) if row else None
+
+    def decide_review(
+        self, review_id: int, status: str, now: int | None = None
+    ) -> bool:
+        if status not in {"legitimate", "spam", "dismissed"}:
+            raise ValueError("invalid review decision")
+        timestamp = now or int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE review_queue SET status=?, reviewed_at=?, reference=NULL "
+                "WHERE id=? AND status='pending'",
+                (status, timestamp, review_id),
+            )
+        return cursor.rowcount == 1
+
+    def decide_sender_reviews(
+        self, sender_key: str, status: str, now: int | None = None
+    ) -> int:
+        if status not in {"legitimate", "spam", "dismissed"}:
+            raise ValueError("invalid review decision")
+        timestamp = now or int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE review_queue SET status=?, reviewed_at=?, reference=NULL "
+                "WHERE sender_key=? AND status='pending'",
+                (status, timestamp, sender_key),
+            )
+        return cursor.rowcount
+
     def recent_link_messages(
         self, sender_key: str, *, window_seconds: int = 60, now: int | None = None
     ) -> int:
@@ -274,6 +418,12 @@ class StateStore:
             self._connection.execute(
                 "DELETE FROM outbound_events WHERE created_at < ?", (timestamp - 3600,)
             )
+            self._connection.execute(
+                "DELETE FROM review_queue WHERE "
+                "(status='pending' AND expires_at <= ?) OR "
+                "(status!='pending' AND reviewed_at < ?)",
+                (timestamp, cutoff),
+            )
 
     def statistics(self) -> dict[str, int | str | None]:
         with self._lock:
@@ -289,11 +439,17 @@ class StateStore:
             heartbeat = self._connection.execute(
                 "SELECT value FROM settings WHERE key='heartbeat'"
             ).fetchone()
+            pending_reviews = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM review_queue WHERE status='pending'"
+                ).fetchone()[0]
+            )
         return {
             "mode": self.get_mode(),
             "allowed": states.get("allowed", 0),
             "challenged": states.get("challenged", 0),
             "quarantined": states.get("quarantined", 0),
             "audit_records": audit_count,
+            "pending_reviews": pending_reviews,
             "heartbeat": int(heartbeat["value"]) if heartbeat else None,
         }

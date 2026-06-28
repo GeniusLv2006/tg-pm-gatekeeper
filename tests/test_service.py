@@ -57,10 +57,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     def message(
-        self, message_id: int, text: str = "hello", facts: MessageFacts | None = None
+        self,
+        message_id: int,
+        text: str = "hello",
+        facts: MessageFacts | None = None,
+        *,
+        review_reference: bytes | None = None,
     ) -> IncomingMessage:
         return IncomingMessage(
-            123456789, message_id, text, facts or MessageFacts(text=text)
+            123456789,
+            message_id,
+            text,
+            facts or MessageFacts(text=text),
+            review_reference=review_reference,
         )
 
     async def test_observe_mode_never_sends_or_quarantines(self) -> None:
@@ -76,6 +85,30 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "would_quarantine")
         self.assertEqual(actions.sent, [])
         self.assertEqual(actions.quarantines, 0)
+        database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
+        self.assertNotIn(b"private-message-canary", database)
+
+    async def test_observe_mode_enqueues_review_without_message_content(self) -> None:
+        reference = self.protector.seal_review_reference(123456789, 456, 1)
+        outcome = await self.service.handle(
+            self.message(
+                1,
+                text="private-message-canary",
+                facts=MessageFacts(
+                    text="private-message-canary", has_link_button=True
+                ),
+                review_reference=reference,
+            ),
+            FakeActions(),
+        )
+        self.assertEqual(outcome, "would_quarantine")
+        item = self.store.review_items()[0]
+        self.assertEqual(item.classification, "would_quarantine")
+        self.assertIn("HR-01_LINK_BUTTON", item.rule_codes)
+        self.assertEqual(
+            self.protector.open_review_reference(item.reference or b""),
+            (123456789, 456, 1),
+        )
         database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
         self.assertNotIn(b"private-message-canary", database)
 
@@ -103,6 +136,21 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "quarantined")
         self.assertEqual(actions.quarantines, 1)
         self.assertEqual(actions.sent, [])
+
+    async def test_quarantined_sender_does_not_reenter_review_queue(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.quarantine(sender_key, self.now)
+        reference = self.protector.seal_review_reference(123456789, 456, 1)
+        outcome = await self.service.handle(
+            self.message(
+                1,
+                facts=MessageFacts(has_link_button=True),
+                review_reference=reference,
+            ),
+            FakeActions(),
+        )
+        self.assertEqual(outcome, "already_quarantined")
+        self.assertEqual(self.store.review_items(), [])
 
     async def test_action_failure_is_fail_safe(self) -> None:
         self.store.set_mode("enforce")

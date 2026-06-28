@@ -12,6 +12,7 @@ from telethon.sessions import StringSession
 
 from .config import Settings, read_private_file
 from .rules import MessageFacts, URL_RE, normalized_domain
+from .review_admin import ReviewAdminServer
 from .service import GatekeeperService, IncomingMessage
 from .store import StateStore
 
@@ -189,12 +190,20 @@ class TelegramAdapter:
         )
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._heartbeat_task: asyncio.Task | None = None
+        self._review_admin = ReviewAdminServer(
+            settings.review_socket_path,
+            store,
+            service.protector,
+            self.client,
+            mute_days=settings.mute_days,
+        )
 
     async def run(self) -> None:
         await self.client.connect()
         if not await self.client.is_user_authorized():
             raise RuntimeError("telegram session is not authorized")
         await self.client.get_me()
+        await self._review_admin.start()
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
         )
@@ -207,6 +216,7 @@ class TelegramAdapter:
                 self._heartbeat_task.cancel()
             for task in self._timeout_tasks.values():
                 task.cancel()
+            await self._review_admin.stop()
             await self.client.disconnect()
 
     async def _heartbeat_loop(self) -> None:
@@ -246,12 +256,22 @@ class TelegramAdapter:
                 is_bot=bool(getattr(sender, "bot", False)),
                 is_service=sender_id in SERVICE_USER_IDS,
                 has_trusted_history=trusted_history,
+                review_reference=self._review_reference(sender, event.message.id),
             )
             actions = EventActions(self, event, sender_key)
             outcome = await self.service.handle(incoming, actions)
             LOG.info(f"message_handled:{outcome}")
         except Exception:
             LOG.error("event_handler_failed")
+
+    def _review_reference(self, sender, message_id: int) -> bytes | None:
+        sender_id = getattr(sender, "id", None)
+        access_hash = getattr(sender, "access_hash", None)
+        if not isinstance(sender_id, int) or not isinstance(access_hash, int):
+            return None
+        return self.service.protector.seal_review_reference(
+            sender_id, access_hash, message_id
+        )
 
     async def _has_prior_outgoing(self, event) -> bool:
         async for message in self.client.iter_messages(event.input_chat, limit=50):

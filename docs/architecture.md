@@ -35,8 +35,28 @@ immediately archived and muted while verification is pending. Non-numeric messag
 attempt or extend the deadline. A correct answer restores the dialog and notifications; timeout or
 two incorrect numeric answers leave it archived and muted.
 
-Observation mode records only HMAC-keyed rule outcomes. It sends no challenges and changes no
-Telegram dialog. Enforcement must be enabled with the local operator CLI after review.
+Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
+with a simulated challenge or quarantine. Further messages from that sender update the same item.
+It sends no challenges and changes no Telegram dialog.
+Enforcement must be enabled with the local operator CLI after review.
+
+## Post-event review
+
+The running process serves a small review dashboard on an owner-only Unix socket. The socket is not
+published by Docker and is intended to be reached only through SSH local forwarding. This keeps the
+live Telethon client as the only Telegram connection and avoids exposing an administrative TCP
+service.
+
+The queue stores the simulated decision, rule identifiers, non-content structural features, and an
+authenticated encrypted reference containing the peer access data and message ID. When an operator
+opens an item, the running client decrypts the reference and fetches the current message and sender
+from Telegram. Those values are rendered in the response but are not persisted or logged.
+
+An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
+the local allowlist. Confirmed spam is explicitly archived and muted; observation mode never performs
+that action on its own. A decision immediately removes the encrypted reference. Pending references
+expire after no more than seven days, while non-reversible verdicts may remain for the normal audit
+retention period.
 
 ## Action policy
 
@@ -51,7 +71,9 @@ Deletion, blocking, and reporting are intentionally outside the default path. A 
 
 ## Data boundaries
 
-The persistent store should contain sender state, challenge metadata, rule identifiers, timestamps, and action outcomes. It should avoid storing message bodies. If temporary message content is required for classification, it should have a short, enforced retention period.
+The persistent store should contain sender state, challenge metadata, rule identifiers, timestamps,
+action outcomes, structural review features, and encrypted short-lived Telegram references. It does
+not store message bodies or profile data.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
@@ -59,6 +81,10 @@ The allowlist and challenge tables use an HMAC-SHA-256 derivation of the Telegra
 key is server-local and is never backed up. Audit records contain only the derived sender key, rule
 code, outcome, and timestamp and expire after 30 days. Message bodies, usernames, phone numbers,
 media, raw URLs, and raw user IDs are not persisted.
+
+Review references use AES-256-CTR with independent HMAC-SHA-256 authentication and keys derived for
+those separate purposes from the server-local HMAC secret. The encrypted envelope is useful only
+while that secret and the Telegram authorization remain available; it is not included in backups.
 
 The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
 authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.

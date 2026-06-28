@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import secrets
+
+import pyaes
 
 
 class IdentifierProtector:
@@ -19,6 +23,57 @@ class IdentifierProtector:
 
     def answer_digest(self, sender_key: str, challenge_id: str, answer: str) -> str:
         return self._digest("answer", f"{sender_key}:{challenge_id}:{answer}")
+
+    def seal_review_reference(
+        self, telegram_user_id: int, access_hash: int, message_id: int
+    ) -> bytes:
+        plaintext = json.dumps(
+            [telegram_user_id, access_hash, message_id], separators=(",", ":")
+        ).encode("ascii")
+        nonce = secrets.token_bytes(16)
+        encryption_key = hmac.new(
+            self._key, b"v1:review:encryption", hashlib.sha256
+        ).digest()
+        authentication_key = hmac.new(
+            self._key, b"v1:review:authentication", hashlib.sha256
+        ).digest()
+        counter = pyaes.Counter(int.from_bytes(nonce, "big"))
+        ciphertext = pyaes.AESModeOfOperationCTR(
+            encryption_key, counter=counter
+        ).encrypt(plaintext)
+        envelope = b"\x01" + nonce + ciphertext
+        tag = hmac.new(authentication_key, envelope, hashlib.sha256).digest()
+        return envelope + tag
+
+    def open_review_reference(self, envelope: bytes) -> tuple[int, int, int]:
+        if len(envelope) < 50 or envelope[0] != 1:
+            raise ValueError("invalid review reference")
+        payload, supplied_tag = envelope[:-32], envelope[-32:]
+        authentication_key = hmac.new(
+            self._key, b"v1:review:authentication", hashlib.sha256
+        ).digest()
+        expected_tag = hmac.new(authentication_key, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied_tag, expected_tag):
+            raise ValueError("invalid review reference")
+        nonce, ciphertext = payload[1:17], payload[17:]
+        encryption_key = hmac.new(
+            self._key, b"v1:review:encryption", hashlib.sha256
+        ).digest()
+        counter = pyaes.Counter(int.from_bytes(nonce, "big"))
+        plaintext = pyaes.AESModeOfOperationCTR(
+            encryption_key, counter=counter
+        ).decrypt(ciphertext)
+        try:
+            values = json.loads(plaintext.decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid review reference") from exc
+        if (
+            not isinstance(values, list)
+            or len(values) != 3
+            or not all(isinstance(value, int) for value in values)
+        ):
+            raise ValueError("invalid review reference")
+        return values[0], values[1], values[2]
 
     @staticmethod
     def matches(expected: str, actual: str) -> bool:
