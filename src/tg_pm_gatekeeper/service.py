@@ -19,6 +19,7 @@ INTEGER_RE = re.compile(r"^[+-]?\d{1,6}$")
 class MessageActions(Protocol):
     async def send_text(self, text: str) -> None: ...
     async def archive_and_mute(self) -> bool: ...
+    async def restore_from_pending(self) -> bool: ...
     def schedule_timeout(self, sender_key: str, expires_at: int) -> None: ...
     def cancel_timeout(self, sender_key: str) -> None: ...
 
@@ -49,7 +50,7 @@ def new_challenge() -> Challenge:
     return Challenge(
         challenge_id,
         str(left + right),
-        f"为过滤垃圾私信，请在 10 分钟内只回复算式答案：{left} + {right} = ?",
+        f"To filter spam, please reply within 1 minute with only the answer: {left} + {right} = ?",
     )
 
 
@@ -59,7 +60,7 @@ class GatekeeperService:
         store: StateStore,
         protector: IdentifierProtector,
         *,
-        challenge_ttl_seconds: int = 600,
+        challenge_ttl_seconds: int = 60,
         challenge_max_attempts: int = 2,
         outbound_limit_per_hour: int = 10,
         denylist: frozenset[str] = frozenset(),
@@ -142,6 +143,11 @@ class GatekeeperService:
             )
             self.store.audit(sender_key, "CHALLENGE_SENT", "sent", now)
             actions.schedule_timeout(sender_key, expires_at)
+            if not await actions.archive_and_mute():
+                self.store.audit(sender_key, "PENDING_QUARANTINE", "action_failed", now)
+                outcome = "fail_safe"
+                return outcome
+            self.store.audit(sender_key, "PENDING_QUARANTINE", "archived_muted", now)
             outcome = "challenged"
             return outcome
         except Exception:
@@ -158,6 +164,9 @@ class GatekeeperService:
             return await self._quarantine(sender_key, actions, now, "challenge_expired")
         answer = text.strip()
         valid_shape = bool(INTEGER_RE.fullmatch(answer))
+        if not valid_shape:
+            self.store.audit(sender_key, "CHALLENGE_NON_NUMERIC", "ignored", now)
+            return "challenge_pending"
         actual = self.protector.answer_digest(
             sender_key, state.challenge_id or "", answer
         )
@@ -166,11 +175,17 @@ class GatekeeperService:
             and state.answer_digest
             and self.protector.matches(state.answer_digest, actual)
         ):
+            if not await actions.restore_from_pending():
+                self.store.audit(sender_key, "CHALLENGE_RESTORE", "action_failed", now)
+                return "fail_safe"
             self.store.allow(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "allowed", now)
             actions.cancel_timeout(sender_key)
             await self._send_if_allowed(
-                sender_key, actions, "验证通过，后续消息将直接放行。", now
+                sender_key,
+                actions,
+                "Verification passed. Future messages will be allowed.",
+                now,
             )
             return "allowed"
         attempts = self.store.increment_attempts(sender_key, now)
@@ -182,7 +197,7 @@ class GatekeeperService:
         await self._send_if_allowed(
             sender_key,
             actions,
-            f"答案不正确，还可尝试 {self.challenge_max_attempts - attempts} 次。",
+            f"Incorrect answer. {self.challenge_max_attempts - attempts} attempt remaining.",
             now,
         )
         return "challenge_incorrect"

@@ -27,9 +27,9 @@ LINK_BUTTON_TYPES = (
     types.KeyboardButtonSimpleWebView,
 )
 GATEKEEPER_MESSAGE_PREFIXES = (
-    "为过滤垃圾私信，",
-    "答案不正确，",
-    "验证通过，",
+    "To filter spam,",
+    "Incorrect answer.",
+    "Verification passed.",
 )
 
 
@@ -128,6 +128,28 @@ class EventActions:
             return True
         except Exception:
             LOG.error("quarantine_action_failed")
+            return False
+
+    async def restore_from_pending(self) -> bool:
+        try:
+            peer = self.event.input_chat
+            await self.adapter.client(
+                functions.folders.EditPeerFoldersRequest(
+                    [types.InputFolderPeer(peer=peer, folder_id=0)]
+                )
+            )
+            await self.adapter.client(
+                functions.account.UpdateNotifySettingsRequest(
+                    peer=types.InputNotifyPeer(peer),
+                    settings=types.InputPeerNotifySettings(
+                        silent=False,
+                        mute_until=datetime.now(timezone.utc),
+                    ),
+                )
+            )
+            return True
+        except Exception:
+            LOG.error("restore_action_failed")
             return False
 
     def schedule_timeout(self, sender_key: str, expires_at: int) -> None:

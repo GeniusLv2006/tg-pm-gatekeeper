@@ -34,7 +34,7 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_SESSION_FILE=/run/secrets/telegram_session\n"
         "TG_HMAC_KEY_FILE=/run/secrets/hmac_key\n"
         "TG_DENYLIST_FILE=/run/config/deny-domains.txt\n"
-        "TG_CHALLENGE_TTL_SECONDS=600\n"
+        "TG_CHALLENGE_TTL_SECONDS=60\n"
         "TG_CHALLENGE_MAX_ATTEMPTS=2\n"
         "TG_AUDIT_RETENTION_DAYS=30\n"
         "TG_MUTE_DAYS=3650\n"
