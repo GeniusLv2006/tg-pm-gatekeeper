@@ -29,6 +29,7 @@ limited to archiving and muting. It never deletes, blocks, reports, opens links,
 - multiple links or domains in one message
 - repeated link messages within 60 seconds
 - optional locally maintained denied domains
+- quoted crypto transfer/service promotions with multiple commercial signals
 
 ## Security principles
 

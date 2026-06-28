@@ -47,6 +47,13 @@ PROMOTION_TERMS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+CRYPTO_SERVICE_TERMS = ("转账", "能量", "带宽", "代付", "gas fee")
+COMMERCIAL_TERMS = ("下单", "购买", "出售", "兑换", "客服", "活动", "联系")
+CRYPTO_ASSET_RE = re.compile(r"(?<![a-z])(?:trx|usdt|usdc|ton)(?![a-z])")
+USERNAME_RE = re.compile(
+    r"(?<![a-z0-9_@])@[a-z0-9_]{5,32}(?![a-z0-9_])", re.IGNORECASE
+)
+
 
 def normalize_text(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
@@ -75,6 +82,7 @@ def domain_is_denied(domain: str, denylist: frozenset[str]) -> bool:
 @dataclass(frozen=True, slots=True)
 class MessageFacts:
     text: str = ""
+    quote_text: str = ""
     urls: tuple[str, ...] = ()
     domains: tuple[str, ...] = ()
     has_link_button: bool = False
@@ -100,10 +108,18 @@ def evaluate_hard_rules(
     denylist: frozenset[str] = frozenset(),
 ) -> RuleDecision:
     rules: list[str] = []
-    normalized = normalize_text(facts.text)
+    normalized = normalize_text(" ".join((facts.text, facts.quote_text)))
+    normalized_quote = normalize_text(facts.quote_text)
     promotion = any(
         term in normalized for terms in PROMOTION_TERMS.values() for term in terms
     )
+    quoted_crypto_asset = bool(CRYPTO_ASSET_RE.search(normalized_quote))
+    quoted_service_signals = sum(
+        term in normalized_quote for term in CRYPTO_SERVICE_TERMS
+    )
+    quoted_commercial_signal = any(
+        term in normalized_quote for term in COMMERCIAL_TERMS
+    ) or bool(USERNAME_RE.search(normalized_quote))
 
     if facts.has_link_button:
         rules.append("HR-01_LINK_BUTTON")
@@ -117,4 +133,10 @@ def evaluate_hard_rules(
         rules.append("HR-05_LINK_BURST")
     if denylist and any(domain_is_denied(domain, denylist) for domain in facts.domains):
         rules.append("HR-06_DENIED_DOMAIN")
+    if (
+        quoted_crypto_asset
+        and quoted_service_signals >= 2
+        and quoted_commercial_signal
+    ):
+        rules.append("HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION")
     return RuleDecision(hard_spam=bool(rules), rule_codes=tuple(rules))

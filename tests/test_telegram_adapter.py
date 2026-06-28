@@ -22,6 +22,7 @@ class TelegramAdapterTests(unittest.TestCase):
             "media": None,
             "fwd_from": None,
             "via_bot_id": None,
+            "reply_to": None,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -46,6 +47,23 @@ class TelegramAdapterTests(unittest.TestCase):
         )
         facts = facts_from_message(self.message(reply_markup=markup))
         self.assertTrue(facts.has_link_button)
+        self.assertIn("bad.invalid", facts.domains)
+
+    def test_quoted_text_and_entities_are_extracted(self) -> None:
+        quote = "TRX 服务 click"
+        reply_to = SimpleNamespace(
+            quote_text=quote,
+            quote_entities=[
+                types.MessageEntityTextUrl(
+                    offset=7, length=5, url="https://bad.invalid"
+                )
+            ],
+        )
+        facts = facts_from_message(
+            self.message(message="核心在此", reply_to=reply_to)
+        )
+        self.assertEqual(facts.quote_text, quote)
+        self.assertIn("https://bad.invalid", facts.urls)
         self.assertIn("bad.invalid", facts.domains)
 
     def test_runtime_heartbeat_is_replaced_atomically(self) -> None:
