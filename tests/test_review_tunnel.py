@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -50,6 +53,66 @@ class ReviewTunnelTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("absolute path", result.stderr)
+
+    def test_interrupt_terminates_the_actual_ssh_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_file = root / "ssh.pid"
+            terminated_file = root / "ssh.terminated"
+            fake_ssh = root / "ssh"
+            fake_curl = root / "curl"
+            fake_ssh.write_text(
+                "#!/bin/sh\n"
+                'echo $$ > "$FAKE_SSH_PID"\n'
+                "trap 'echo yes > \"$FAKE_SSH_TERMINATED\"; exit 0' TERM INT\n"
+                "while :; do sleep 0.1; done\n",
+                encoding="utf-8",
+            )
+            fake_curl.write_text(
+                "#!/bin/sh\n"
+                '[ -r "$FAKE_SSH_PID" ] || exit 1\n'
+                'pid="$(cat "$FAKE_SSH_PID")"\n'
+                'kill -0 "$pid" 2>/dev/null\n',
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            fake_curl.chmod(0o700)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{root}:{environment['PATH']}",
+                    "FAKE_SSH_PID": str(pid_file),
+                    "FAKE_SSH_TERMINATED": str(terminated_file),
+                }
+            )
+            process = subprocess.Popen(
+                [str(SCRIPT), "user@server.example"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            deadline = time.monotonic() + 5
+            output_lines: list[str] = []
+            while time.monotonic() < deadline:
+                line = process.stdout.readline()
+                output_lines.append(line)
+                if line.startswith("Connected:"):
+                    break
+            else:
+                process.kill()
+                self.fail("tunnel helper did not report a connection")
+
+            ssh_pid = int(pid_file.read_text(encoding="ascii"))
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+            output = "".join(output_lines) + stdout
+
+            self.assertEqual(process.returncode, 130, stderr)
+            self.assertIn("Tunnel closed.", output)
+            self.assertTrue(terminated_file.exists())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(ssh_pid, 0)
 
 
 if __name__ == "__main__":

@@ -97,15 +97,37 @@ done
 url="http://127.0.0.1:${port}/"
 tunnel_pid=""
 connected=false
+closed_reported=false
+
+dashboard_reachable() {
+    curl --fail --silent --show-error --max-time 1 "$url" >/dev/null 2>&1
+}
+
+report_closed() {
+    if [ "$connected" != true ] || [ "$closed_reported" = true ]; then
+        return 0
+    fi
+    closed_reported=true
+    attempt=0
+    while [ "$attempt" -lt 10 ]; do
+        if ! dashboard_reachable; then
+            echo "Tunnel closed."
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    echo "Tunnel process stopped, but the dashboard is still reachable on ${url}" >&2
+    echo "Another SSH forward or local process is still using port ${port}." >&2
+    return 1
+}
 
 cleanup() {
     if [ -n "$tunnel_pid" ] && kill -0 "$tunnel_pid" 2>/dev/null; then
         kill "$tunnel_pid" 2>/dev/null || true
         wait "$tunnel_pid" 2>/dev/null || true
-        if [ "$connected" = true ]; then
-            echo "Tunnel closed."
-        fi
     fi
+    report_closed || true
 }
 
 trap 'cleanup; exit 130' INT TERM HUP
@@ -117,7 +139,7 @@ open_tunnel() {
     else
         set --
     fi
-    ssh "$@" \
+    exec ssh "$@" \
         -o ControlMaster=no \
         -o ControlPath=none \
         -o ExitOnForwardFailure=yes \
@@ -134,7 +156,7 @@ tunnel_pid=$!
 
 attempt=0
 while [ "$attempt" -lt 30 ]; do
-    if curl --fail --silent --show-error --max-time 1 "$url" >/dev/null 2>&1; then
+    if dashboard_reachable; then
         connected=true
         break
     fi
@@ -158,5 +180,8 @@ echo "Keep this terminal open. Press Ctrl+C to close the tunnel."
 
 wait "$tunnel_pid"
 status=$?
-echo "Tunnel closed."
+tunnel_pid=""
+if ! report_closed; then
+    status=1
+fi
 exit "$status"
