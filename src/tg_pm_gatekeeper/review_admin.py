@@ -236,7 +236,7 @@ class ReviewAdminServer:
           </div>
         </section>
         """
-        return 200, {}, self._page(content, raw=True)
+        return 200, {}, self._page(content, raw=True, refresh_seconds=30)
 
     async def _archive_and_mute(self, peer: types.InputPeerUser) -> bool:
         try:
@@ -277,18 +277,24 @@ class ReviewAdminServer:
             + "<main><section class='queue-intro'><p class='eyebrow'>Private review channel</p>"
             "<h2>Decisions waiting for a human signal.</h2>"
             "<p>Queue rows contain only rules and structural facts. Message content is fetched "
-            "live from Telegram when you open a case.</p></section>"
+            "live from Telegram when you open a case.</p>"
+            "<p class='refresh-note'>Connection check repeats every 10 seconds. If the tunnel "
+            "closes, the next check will replace this page with a connection error.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Simulation</th>"
             "<th>Rules</th><th>Messages</th>"
             f"<th>Last seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
             raw=True,
+            refresh_seconds=10,
         )
 
     @staticmethod
     def _masthead(section: str, status: str) -> str:
+        checked_at = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         return (
             "<header class='masthead'><div><span class='mark'>TG</span>"
             "<span class='product'>PM Gatekeeper</span></div>"
+            "<div class='connection'><span class='live'><i></i>Live connection</span>"
+            f"<small>Response {checked_at}</small></div>"
             f"<div class='section'>{html.escape(section)}<span>{html.escape(status)}</span></div>"
             "</header>"
         )
@@ -314,21 +320,29 @@ class ReviewAdminServer:
         return f"{seconds // 86400}d"
 
     @staticmethod
-    def _page(content: str, *, raw: bool = False) -> bytes:
+    def _page(
+        content: str, *, raw: bool = False, refresh_seconds: int | None = None
+    ) -> bytes:
         body = content if raw else f"<h1>{html.escape(content)}</h1>"
+        refresh = (
+            f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+            if refresh_seconds is not None
+            else ""
+        )
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Gatekeeper review</title><style>
+{refresh}<title>Gatekeeper review</title><style>
 :root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#e2532f;--safe:#1e6b52}}
 *{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}
 .masthead,main,.back,.decision-panel{{position:relative;max-width:1120px;margin-left:auto;margin-right:auto}}
-.masthead{{display:flex;justify-content:space-between;align-items:center;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}}
+.masthead{{display:grid;grid-template-columns:1fr auto auto;gap:2.5rem;align-items:center;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}}
 .mark{{display:inline-grid;place-items:center;width:2.5rem;height:2.5rem;margin-right:.8rem;color:var(--paper);background:var(--ink);font-weight:800;letter-spacing:-.08em}}
 .product{{font:700 1.15rem Georgia,serif;letter-spacing:.03em}}.section{{text-transform:uppercase;font-size:.72rem;letter-spacing:.12em;text-align:right}}
 .section span{{display:block;color:var(--signal);font-weight:800;margin-top:.25rem}}main{{padding:3rem 1.25rem 5rem}}
+.connection{{padding:.5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font-size:.62rem;letter-spacing:.05em}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:900;text-transform:uppercase;letter-spacing:.1em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}
 .queue-intro{{max-width:700px;margin-bottom:2.5rem}}h1,h2{{font-family:Georgia,serif;line-height:1.1}}.queue-intro h2{{font-size:clamp(2.1rem,6vw,4.6rem);font-weight:400;letter-spacing:-.045em;margin:.4rem 0 1.2rem}}
-.queue-intro p:last-child{{max-width:62ch;color:var(--muted)}}.eyebrow{{margin:0;text-transform:uppercase;letter-spacing:.13em;font-size:.7rem;font-weight:800;color:var(--signal)}}
+.queue-intro p{{max-width:62ch;color:var(--muted)}}.refresh-note{{margin-top:1.2rem;padding-left:1rem;border-left:3px solid var(--safe);font-size:.78rem}}.eyebrow{{margin:0;text-transform:uppercase;letter-spacing:.13em;font-size:.7rem;font-weight:800;color:var(--signal)}}
 .table-shell{{overflow-x:auto;border:1px solid var(--line);background:var(--panel);box-shadow:8px 8px 0 var(--ink)}}table{{border-collapse:collapse;width:100%;min-width:720px}}
 th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}}tbody tr:last-child td{{border-bottom:0}}tbody tr:hover{{background:#f8e9d8}}a{{color:var(--ink);text-underline-offset:.22em}}td:first-child a{{font-weight:900;color:var(--signal)}}
 .back{{padding:1.25rem 1.25rem 0}}.review-grid{{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.75fr);gap:1.5rem;padding-bottom:2rem}}
@@ -337,5 +351,5 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere}}pre.message{{min-height:180px;
 .telegram-link{{font-weight:800}}dt{{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}dd{{margin:.2rem 0 1.2rem}}.badge{{display:inline-block;padding:.2rem .45rem;background:#f8e9d8;border:1px solid var(--signal);color:#9d3118;font-weight:800}}
 details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:pointer;font-weight:800}}details pre{{font-size:.75rem;color:var(--muted)}}.decision-panel{{margin-bottom:4rem;border-top:5px solid var(--ink)}}.decision-panel h2{{max-width:680px;font-size:1.7rem}}
 .actions{{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:1.5rem}}button{{padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem ui-monospace,monospace;cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s}}button:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
-@media(max-width:760px){{.masthead{{align-items:flex-start}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:45%}}main{{padding-top:2rem}}}}
+@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")
