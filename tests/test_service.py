@@ -16,6 +16,7 @@ class FakeActions:
         self.quarantines = 0
         self.scheduled: list[tuple[str, int]] = []
         self.cancelled: list[str] = []
+        self.restores = 0
         self.quarantine_success = quarantine_success
 
     async def send_text(self, text: str) -> None:
@@ -23,6 +24,10 @@ class FakeActions:
 
     async def archive_and_mute(self) -> bool:
         self.quarantines += 1
+        return self.quarantine_success
+
+    async def restore_from_pending(self) -> bool:
+        self.restores += 1
         return self.quarantine_success
 
     def schedule_timeout(self, sender_key: str, expires_at: int) -> None:
@@ -41,7 +46,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service = GatekeeperService(
             self.store,
             self.protector,
-            challenge_ttl_seconds=600,
+            challenge_ttl_seconds=60,
             challenge_max_attempts=2,
             challenge_factory=lambda: Challenge("challenge", "12", "6 + 6 = ?"),
             clock=lambda: self.now,
@@ -84,6 +89,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.service.handle(self.message(2, "12"), actions), "allowed"
         )
+        self.assertEqual(actions.restores, 1)
         self.assertEqual(
             self.store.sender(self.protector.sender_key(123456789)).status, "allowed"
         )
@@ -139,6 +145,21 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.handle(message, actions), "challenge_incorrect"
         )
         self.assertEqual(self.store.sender(sender_key).status, "challenged")
+
+    async def test_non_numeric_content_does_not_consume_attempt(self) -> None:
+        self.store.set_mode("enforce")
+        sender_key = self.protector.sender_key(123456789)
+        digest = self.protector.answer_digest(sender_key, "challenge", "12")
+        self.store.set_challenge(
+            sender_key, "challenge", digest, self.now + 60, self.now
+        )
+        actions = FakeActions()
+        self.assertEqual(
+            await self.service.handle(self.message(2, "not an answer"), actions),
+            "challenge_pending",
+        )
+        self.assertEqual(self.store.sender(sender_key).attempts, 0)
+        self.assertEqual(actions.sent, [])
 
 
 if __name__ == "__main__":

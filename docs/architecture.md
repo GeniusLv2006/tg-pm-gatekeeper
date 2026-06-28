@@ -29,6 +29,11 @@ Transitions must be idempotent and persisted so restarts cannot resend challenge
 5. Send one expiring challenge to an otherwise ordinary unknown sender.
 6. Allow a correct response; quarantine an incorrect or expired challenge.
 
+In enforcement mode the challenge is written in English and expires after 60 seconds. The dialog is
+immediately archived and muted while verification is pending. Non-numeric messages do not consume an
+attempt or extend the deadline. A correct answer restores the dialog and notifications; timeout or
+two incorrect numeric answers leave it archived and muted.
+
 Observation mode records only HMAC-keyed rule outcomes. It sends no challenges and changes no
 Telegram dialog. Enforcement must be enabled with the local operator CLI after review.
 

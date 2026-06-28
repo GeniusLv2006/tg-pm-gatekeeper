@@ -87,7 +87,7 @@ class Settings:
                 os.environ.get("TG_HMAC_KEY_FILE", "/run/secrets/hmac_key")
             ),
             denylist_file=Path(denylist) if denylist else None,
-            challenge_ttl_seconds=_positive_int("TG_CHALLENGE_TTL_SECONDS", 600),
+            challenge_ttl_seconds=_positive_int("TG_CHALLENGE_TTL_SECONDS", 60),
             challenge_max_attempts=_positive_int("TG_CHALLENGE_MAX_ATTEMPTS", 2),
             audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
