@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 from telethon import types
 
-from tg_pm_gatekeeper.telegram_adapter import facts_from_message
+from tg_pm_gatekeeper.telegram_adapter import (
+    facts_from_message,
+    write_runtime_heartbeat,
+)
 
 
 class TelegramAdapterTests(unittest.TestCase):
@@ -42,6 +47,14 @@ class TelegramAdapterTests(unittest.TestCase):
         facts = facts_from_message(self.message(reply_markup=markup))
         self.assertTrue(facts.has_link_button)
         self.assertIn("bad.invalid", facts.domains)
+
+    def test_runtime_heartbeat_is_replaced_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heartbeat"
+            write_runtime_heartbeat(path, 100)
+            write_runtime_heartbeat(path, 200)
+            self.assertEqual(path.read_text(encoding="ascii"), "200")
+            self.assertFalse((Path(directory) / ".heartbeat.tmp").exists())
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,8 @@ from .store import StateStore
 
 LOG = logging.getLogger("gatekeeper.telegram")
 SERVICE_USER_IDS = {777000, 42777}
+HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")
+PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
 LINK_BUTTON_TYPES = (
     types.KeyboardButtonUrl,
     types.KeyboardButtonUrlAuth,
@@ -85,6 +88,12 @@ def facts_from_message(message: types.Message) -> MessageFacts:
         is_forwarded=message.fwd_from is not None,
         via_bot=message.via_bot_id is not None,
     )
+
+
+def write_runtime_heartbeat(path: Path, timestamp: int) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(str(timestamp), encoding="ascii")
+    os.replace(temporary, path)
 
 
 class EventActions:
@@ -169,10 +178,15 @@ class TelegramAdapter:
             await self.client.disconnect()
 
     async def _heartbeat_loop(self) -> None:
+        next_prune = 0
         while True:
-            self.store.heartbeat()
-            self.store.prune(self.settings.audit_retention_days)
-            await asyncio.sleep(30)
+            now = int(time.time())
+            self.store.heartbeat(now)
+            write_runtime_heartbeat(HEARTBEAT_PATH, now)
+            if now >= next_prune:
+                self.store.prune(self.settings.audit_retention_days, now)
+                next_prune = now + PRUNE_INTERVAL_SECONDS
+            await asyncio.sleep(60)
 
     async def _on_message(self, event) -> None:
         try:
