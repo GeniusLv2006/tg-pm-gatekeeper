@@ -17,6 +17,8 @@ export DEPLOY_HOST=root@server.example
 - Use a dedicated Telegram test account for the first end-to-end run.
 - Use Python 3.14 on the trusted computer used to create the session.
 - Obtain an application API ID and API hash from Telegram's developer portal.
+- Install Docker Engine with the Compose plugin on the host.
+- Ensure the trusted workstation has `ssh` and `curl`; the tunnel helper requires both.
 - Do not paste credentials into shell commands, issue comments, CI variables, or chat.
 
 Install the pinned local dependencies in an isolated environment, then create the initialization files:
@@ -94,9 +96,9 @@ scripts/review-tunnel.sh "$DEPLOY_HOST"
 It prints `Connected` only after the dashboard responds. Keep that terminal open; `Ctrl+C` closes the
 dedicated tunnel. The helper disables SSH connection sharing so the forwarding process cannot be
 silently handed to a background ControlMaster. The target may be an OpenSSH alias or `user@host`,
-and must be able to access the owner-only remote Socket; this guide uses the root maintenance login.
+and must be able to access the owner-only remote socket; this guide uses the root maintenance login.
 
-The target can instead come from `TG_REVIEW_HOST`. Local port, remote Socket, and an alternate SSH
+The target can instead come from `TG_REVIEW_HOST`. Local port, remote socket, and an alternate SSH
 configuration file are configurable through flags or environment variables:
 
 ```shell
@@ -112,16 +114,23 @@ Run `scripts/review-tunnel.sh -h` for the complete interface.
 Then open `http://127.0.0.1:8765/` locally. The green **Live connection** timestamp comes from each
 server response, and the queue automatically checks again every 10 seconds. If the tunnel closes,
 the browser will show a connection error on the next check instead of leaving a misleading stale
-dashboard. The queue page contains no message content. Opening an
-item fetches the message and sender live from Telegram. Available decisions are:
+dashboard. A page already rendered in the browser is not proof that its tunnel is still connected;
+the response timestamp and the next automatic refresh are the authoritative signals.
+
+The queue page contains no message content. It has one pending row per sender, and `Messages
+observed` is a consolidated count. Opening a row fetches one referenced message and its sender live
+from Telegram; it does not load conversation history. The reference normally points to the newest
+message, except that an earlier simulated quarantine remains representative when later messages are
+lower risk. Available decisions are:
 
 - **Legitimate**: add the HMAC-keyed sender to the local allowlist.
 - **Spam**: archive and mute the Telegram dialog, then mark the sender quarantined.
 - **Dismiss**: record no classification and perform no Telegram action.
 
-All three decisions erase the encrypted Telegram reference immediately. Pending references expire
-after seven days. Stop the SSH command when review is complete; do not publish the socket through a
-Docker port mapping or reverse proxy.
+All three decisions apply to the sender's pending review, erase the encrypted Telegram reference
+immediately, and return to the queue. Pending references expire after the configured retention,
+which has a hard maximum of seven days. Stop the SSH command when review is complete; do not publish
+the socket through a Docker port mapping or reverse proxy.
 
 The `allow USER_ID` and `revoke USER_ID` commands derive the stored HMAC key inside the container and
 never print the raw identifier. Be aware that a user ID typed as a CLI argument can remain in shell
