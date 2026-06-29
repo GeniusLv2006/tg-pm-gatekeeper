@@ -17,12 +17,17 @@ from tg_pm_gatekeeper.store import StateStore
 class FakeTelegramClient:
     def __init__(self) -> None:
         self.requests: list[object] = []
+        self.entity_requests = 0
 
     async def get_messages(self, peer, ids):
         return SimpleNamespace(message="transient-canary", media=None)
 
     async def get_entity(self, peer):
-        return SimpleNamespace(first_name="Test", last_name="Sender", username=None)
+        self.entity_requests += 1
+        sender = SimpleNamespace(
+            first_name="Test", last_name="Sender", username="testsender"
+        )
+        return [sender for _ in peer] if isinstance(peer, list) else sender
 
     async def __call__(self, request):
         self.requests.append(request)
@@ -62,17 +67,31 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn(b"transient-canary", response)
+        self.assertIn(b"Telegram ID", response)
+        self.assertIn(b"123456789", response)
         self.assertIn(b'http-equiv="refresh" content="30"', response)
         self.assertIn(b"Live connection", response)
         database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
         self.assertNotIn(b"transient-canary", database)
+        self.assertNotIn(b"Test Sender", database)
+        self.assertNotIn(b"testsender", database)
+        self.assertNotIn(b"123456789", database)
 
     async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
-        response = self.server._index_page()
+        response = await self.server._index_page()
         self.assertIn(b'http-equiv="refresh" content="10"', response)
         self.assertIn(b"Live connection", response)
         self.assertIn(b"Response ", response)
         self.assertIn(b"Connection check repeats every 10 seconds", response)
+        self.assertIn(b"Test Sender (@testsender)", response)
+        self.assertIn(b"ID 123456789", response)
+
+    async def test_queue_identity_uses_short_lived_memory_cache(self) -> None:
+        first = await self.server._index_page()
+        second = await self.server._index_page()
+        self.assertIn(b"Test Sender", first)
+        self.assertIn(b"Test Sender", second)
+        self.assertEqual(self.client.entity_requests, 1)
 
     async def test_review_page_uses_one_aligned_component_rail(self) -> None:
         status, _, response = await self.server._dispatch(
@@ -113,6 +132,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Location"], "/")
         self.assertEqual(self.store.sender("sender").status, "allowed")
         self.assertIsNone(self.store.review_item(self.review_id).reference)
+        self.assertNotIn("sender", self.server._identity_cache)
 
     async def test_spam_decision_performs_explicit_telegram_actions(self) -> None:
         body = urlencode(

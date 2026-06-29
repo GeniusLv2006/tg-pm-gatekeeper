@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -21,6 +22,17 @@ from .store import ReviewItem, StateStore
 LOG = logging.getLogger("gatekeeper.review")
 MAX_HEADER_BYTES = 16 * 1024
 MAX_BODY_BYTES = 4 * 1024
+IDENTITY_CACHE_SECONDS = 5 * 60
+IDENTITY_FAILURE_CACHE_SECONDS = 30
+IDENTITY_BATCH_SIZE = 100
+IDENTITY_FETCH_TIMEOUT_SECONDS = 5
+
+
+@dataclass(frozen=True, slots=True)
+class LiveIdentity:
+    user_id: int
+    name: str | None
+    username: str | None
 
 
 class ReviewAdminServer:
@@ -40,6 +52,9 @@ class ReviewAdminServer:
         self.mute_days = mute_days
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
+        self._identity_cache: dict[
+            str, tuple[float, str | None, str | None]
+        ] = {}
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -137,7 +152,7 @@ class ReviewAdminServer:
     ) -> tuple[int, dict[str, str], bytes]:
         path = urlsplit(target).path
         if path == "/" and method == "GET":
-            return 200, {}, self._index_page()
+            return 200, {}, await self._index_page()
         if not path.startswith("/review/"):
             return 404, {}, self._page("Not found")
         try:
@@ -171,6 +186,7 @@ class ReviewAdminServer:
             self.store.decide_sender_reviews(item.sender_key, "dismissed")
         else:
             return 400, {}, self._page("Unknown action")
+        self._identity_cache.pop(item.sender_key, None)
         return 303, {"Location": "/"}, b""
 
     def _peer_from_item(self, item: ReviewItem) -> types.InputPeerUser:
@@ -192,15 +208,13 @@ class ReviewAdminServer:
         sender = await self.telegram_client.get_entity(peer)
         if message is None:
             return 404, {}, self._page("The Telegram message is no longer available")
-        name = " ".join(
-            value
-            for value in (
-                getattr(sender, "first_name", None),
-                getattr(sender, "last_name", None),
-            )
-            if value
-        ) or "Unnamed sender"
-        username = getattr(sender, "username", None)
+        name, username = self._sender_name(sender)
+        self._cache_identity(
+            item.sender_key,
+            name,
+            username,
+            IDENTITY_CACHE_SECONDS,
+        )
         identity = name + (f" (@{username})" if username else "")
         text = message.message or f"[Non-text message: {type(message.media).__name__}]"
         rules = ", ".join(json.loads(item.rule_codes)) or "ordinary unknown sender"
@@ -222,6 +236,7 @@ class ReviewAdminServer:
             <p class="eyebrow">Case file</p>
             <dl><dt>Simulated decision</dt><dd><span class="badge">{html.escape(item.classification)}</span></dd>
             <dt>Rules</dt><dd>{html.escape(rules)}</dd>
+            <dt>Telegram ID</dt><dd>{user_id}</dd>
             <dt>Messages observed</dt><dd>{item.message_count}</dd>
             <dt>Last observed</dt><dd>{observed_at}</dd></dl>
             <details><summary>Structural features</summary><pre>{html.escape(features)}</pre></details>
@@ -260,10 +275,12 @@ class ReviewAdminServer:
             LOG.error("review_quarantine_failed")
             return False
 
-    def _index_page(self) -> bytes:
+    async def _index_page(self) -> bytes:
         items = self.store.review_items()
+        identities = await self._live_identities(items)
         rows = "".join(
             f"<tr><td><a href='/review/{item.id}'>#{item.id}</a></td>"
+            f"<td>{self._identity_cell(identities.get(item.id))}</td>"
             f"<td>{html.escape(item.classification)}</td>"
             f"<td>{html.escape(', '.join(json.loads(item.rule_codes)) or '—')}</td>"
             f"<td>{item.message_count}</td>"
@@ -271,20 +288,129 @@ class ReviewAdminServer:
             for item in items
         )
         if not rows:
-            rows = "<tr><td colspan='5'>No pending reviews.</td></tr>"
+            rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
             self._masthead("Observation desk", f"{len(items)} pending")
             + "<main><section class='queue-intro'><p class='eyebrow'>Private review channel</p>"
             "<h2>Decisions waiting for a human signal.</h2>"
-            "<p>Queue rows contain only rules and structural facts. Message content is fetched "
-            "live from Telegram when you open a case.</p>"
+            "<p>Sender identity is resolved live from Telegram and kept only in short-lived "
+            "process memory. Message content is fetched only when you open a case.</p>"
             "<p class='refresh-note'>Connection check repeats every 10 seconds. If the tunnel "
             "closes, the next check will replace this page with a connection error.</p></section>"
-            "<div class='table-shell'><table><thead><tr><th>Case</th><th>Simulation</th>"
+            "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Simulation</th>"
             "<th>Rules</th><th>Messages</th>"
             f"<th>Last seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
             raw=True,
             refresh_seconds=10,
+        )
+
+    async def _live_identities(
+        self, items: list[ReviewItem]
+    ) -> dict[int, LiveIdentity]:
+        identities: dict[int, LiveIdentity] = {}
+        uncached: list[tuple[ReviewItem, types.InputPeerUser, int]] = []
+        now = time.monotonic()
+        self._identity_cache = {
+            sender_key: cached
+            for sender_key, cached in self._identity_cache.items()
+            if cached[0] > now
+        }
+        for item in items:
+            if item.reference is None:
+                continue
+            try:
+                user_id, access_hash, _ = self.protector.open_review_reference(
+                    item.reference
+                )
+            except ValueError:
+                continue
+            cached = self._identity_cache.get(item.sender_key)
+            if cached and cached[0] > now:
+                identities[item.id] = LiveIdentity(user_id, cached[1], cached[2])
+                continue
+            uncached.append(
+                (
+                    item,
+                    types.InputPeerUser(user_id=user_id, access_hash=access_hash),
+                    user_id,
+                )
+            )
+
+        for start in range(0, len(uncached), IDENTITY_BATCH_SIZE):
+            batch = uncached[start : start + IDENTITY_BATCH_SIZE]
+            try:
+                senders = await asyncio.wait_for(
+                    self.telegram_client.get_entity([peer for _, peer, _ in batch]),
+                    timeout=IDENTITY_FETCH_TIMEOUT_SECONDS,
+                )
+                if isinstance(senders, (list, tuple)):
+                    senders = list(senders)
+                else:
+                    senders = [senders]
+            except Exception:
+                senders = []
+            for (item, _, user_id), sender in zip(batch, senders, strict=False):
+                name, username = self._sender_name(sender)
+                identities[item.id] = LiveIdentity(user_id, name, username)
+                self._cache_identity(
+                    item.sender_key,
+                    name,
+                    username,
+                    IDENTITY_CACHE_SECONDS,
+                )
+            for item, _, user_id in batch[len(senders) :]:
+                identities[item.id] = LiveIdentity(user_id, None, None)
+                self._cache_identity(
+                    item.sender_key,
+                    None,
+                    None,
+                    IDENTITY_FAILURE_CACHE_SECONDS,
+                )
+        return identities
+
+    def _cache_identity(
+        self,
+        sender_key: str,
+        name: str | None,
+        username: str | None,
+        ttl_seconds: int,
+    ) -> None:
+        expires_at = time.monotonic() + ttl_seconds
+        self._identity_cache[sender_key] = (expires_at, name, username)
+        asyncio.get_running_loop().call_later(
+            ttl_seconds, self._expire_identity, sender_key, expires_at
+        )
+
+    def _expire_identity(self, sender_key: str, expires_at: float) -> None:
+        cached = self._identity_cache.get(sender_key)
+        if cached and cached[0] == expires_at:
+            self._identity_cache.pop(sender_key, None)
+
+    @staticmethod
+    def _sender_name(sender) -> tuple[str, str | None]:
+        name = " ".join(
+            value
+            for value in (
+                getattr(sender, "first_name", None),
+                getattr(sender, "last_name", None),
+            )
+            if value
+        ) or "Unnamed sender"
+        return name, getattr(sender, "username", None)
+
+    @staticmethod
+    def _identity_cell(identity: LiveIdentity | None) -> str:
+        if identity is None:
+            return "<span class='identity-name'>Identity unavailable</span>"
+        if identity.name is None:
+            label = "Name unavailable"
+        else:
+            label = identity.name + (
+                f" (@{identity.username})" if identity.username else ""
+            )
+        return (
+            f"<span class='identity-name'>{html.escape(label)}</span>"
+            f"<span class='identity-id'>ID {identity.user_id}</span>"
         )
 
     @staticmethod
@@ -343,8 +469,9 @@ body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;b
 .connection{{padding:.5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font-size:.62rem;letter-spacing:.05em}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:900;text-transform:uppercase;letter-spacing:.1em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}
 .queue-intro{{max-width:none;margin-bottom:2.5rem}}h1,h2{{font-family:Georgia,serif;line-height:1.1}}.queue-intro h2{{font-size:clamp(1.85rem,3.6vw,3rem);font-weight:400;letter-spacing:-.03em;margin:.55rem 0 1.3rem}}
 .queue-intro p{{max-width:none;color:var(--muted)}}.refresh-note{{margin-top:1.2rem;padding-left:1rem;border-left:3px solid var(--safe);font-size:.78rem}}.eyebrow{{margin:0;text-transform:uppercase;letter-spacing:.13em;font-size:.7rem;font-weight:800;color:var(--signal)}}
-.table-shell{{overflow-x:auto;border:1px solid var(--line);background:var(--panel);box-shadow:8px 8px 0 var(--ink)}}table{{border-collapse:collapse;width:100%;min-width:720px}}
+.table-shell{{overflow-x:auto;border:1px solid var(--line);background:var(--panel);box-shadow:8px 8px 0 var(--ink)}}table{{border-collapse:collapse;width:100%;min-width:860px}}
 th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}}tbody tr:last-child td{{border-bottom:0}}tbody tr:hover{{background:#f8e9d8}}a{{color:var(--ink);text-underline-offset:.22em}}td:first-child a{{font-weight:900;color:var(--signal)}}
+.identity-name,.identity-id{{display:block}}.identity-name{{font-family:Georgia,serif;font-size:1rem;font-weight:700}}.identity-id{{margin-top:.2rem;color:var(--muted);font-size:.68rem;letter-spacing:.04em}}
 .back{{padding:1.25rem 1.25rem 0}}.review-grid{{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.75fr);gap:1.5rem;padding-bottom:2rem}}
 .message-panel,.case-file,.decision-panel{{min-width:0;border:1px solid var(--line);background:var(--panel);padding:clamp(1.25rem,4vw,2.4rem)}}.message-panel h2{{font-size:2rem;margin:.5rem 0 1.8rem;overflow-wrap:anywhere}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere}}pre.message{{min-height:180px;margin:0 0 1.5rem;padding:1.4rem;background:var(--ink);color:#f7f1df;font:1rem/1.65 Georgia,serif;border-left:5px solid var(--signal)}}

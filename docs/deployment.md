@@ -118,10 +118,13 @@ dashboard. A page already rendered in the browser is not proof that its tunnel i
 the response timestamp and the next automatic refresh are the authoritative signals.
 
 The queue page contains no message content. It has one pending row per sender, and `Messages
-observed` is a consolidated count. Opening a row fetches one referenced message and its sender live
-from Telegram; it does not load conversation history. The reference normally points to the newest
-message, except that an earlier simulated quarantine remains representative when later messages are
-lower risk. Available decisions are:
+observed` is a consolidated count. It displays the sender's Telegram ID from the encrypted pending
+reference and resolves names and usernames live from Telegram in batches. Profile names remain only
+in a five-minute process-memory cache, failed lookups are retried after 30 seconds, and review
+responses are marked `no-store`. Opening a row fetches one referenced message live; it does not load
+conversation history. The reference normally points to the newest message, except that an earlier
+simulated quarantine remains representative when later messages are lower risk. Available decisions
+are:
 
 - **Legitimate**: add the HMAC-keyed sender to the local allowlist.
 - **Spam**: archive and mute the Telegram dialog, then mark the sender quarantined.
