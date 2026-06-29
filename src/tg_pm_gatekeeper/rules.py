@@ -7,6 +7,11 @@ from urllib.parse import urlsplit
 
 
 URL_RE = re.compile(r"(?i)(?:https?://|tg://|www\.)[^\s<>()\[\]{}]+")
+TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？'\"”’》】）"
+ASCII_HOSTNAME_RE = re.compile(
+    r"(?i)^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
 
 PROMOTION_TERMS: dict[str, tuple[str, ...]] = {
     "gambling": (
@@ -60,8 +65,8 @@ def normalize_text(text: str) -> str:
 
 
 def normalized_domain(url: str) -> str | None:
-    candidate = url.strip().rstrip(".,;:!?，。；：！？")
-    if candidate.lower().startswith("www."):
+    candidate = url.strip().rstrip(TRAILING_URL_PUNCTUATION)
+    if "://" not in candidate:
         candidate = "https://" + candidate
     try:
         hostname = urlsplit(candidate).hostname
@@ -70,9 +75,30 @@ def normalized_domain(url: str) -> str | None:
     if not hostname:
         return None
     try:
-        return hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+        normalized = hostname.rstrip(".").encode("idna").decode("ascii").casefold()
     except UnicodeError:
         return None
+    return normalized if ASCII_HOSTNAME_RE.fullmatch(normalized) else None
+
+
+def normalized_url_key(url: str) -> str | None:
+    candidate = url.strip().rstrip(TRAILING_URL_PUNCTUATION)
+    if "://" not in candidate:
+        candidate = "https://" + candidate
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        if not hostname:
+            return None
+        normalized_host = hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+        if not ASCII_HOSTNAME_RE.fullmatch(normalized_host):
+            return None
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except (UnicodeError, ValueError):
+        return None
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{normalized_host}{port}{path}{query}"
 
 
 def domain_is_denied(domain: str, denylist: frozenset[str]) -> bool:
@@ -85,7 +111,10 @@ class MessageFacts:
     quote_text: str = ""
     urls: tuple[str, ...] = ()
     domains: tuple[str, ...] = ()
+    quote_urls: tuple[str, ...] = ()
+    quote_domains: tuple[str, ...] = ()
     has_link_button: bool = False
+    link_button_count: int = 0
     has_any_button: bool = False
     is_forwarded: bool = False
     via_bot: bool = False
@@ -108,7 +137,7 @@ def evaluate_hard_rules(
     denylist: frozenset[str] = frozenset(),
 ) -> RuleDecision:
     rules: list[str] = []
-    normalized = normalize_text(" ".join((facts.text, facts.quote_text)))
+    normalized = normalize_text(facts.text)
     normalized_quote = normalize_text(facts.quote_text)
     promotion = any(
         term in normalized for terms in PROMOTION_TERMS.values() for term in terms
@@ -121,13 +150,19 @@ def evaluate_hard_rules(
         term in normalized_quote for term in COMMERCIAL_TERMS
     ) or bool(USERNAME_RE.search(normalized_quote))
 
-    if facts.has_link_button:
-        rules.append("HR-01_LINK_BUTTON")
-    if facts.is_forwarded and (facts.has_link or facts.has_any_button):
-        rules.append("HR-02_FORWARDED_LINK_OR_BUTTON")
+    link_button_count = max(facts.link_button_count, int(facts.has_link_button))
+    normalized_urls = {
+        key for url in facts.urls if (key := normalized_url_key(url)) is not None
+    }
+    multiple_links = len(normalized_urls) >= 2 or len(set(facts.domains)) >= 2
+
+    if link_button_count >= 2:
+        rules.append("HR-01_MULTIPLE_LINK_BUTTONS")
+    if facts.is_forwarded and facts.has_link_button:
+        rules.append("HR-02_FORWARDED_LINK_BUTTON")
     if promotion and facts.has_link:
         rules.append("HR-03_PROMOTION_WITH_LINK")
-    if len(set(facts.urls)) >= 2 or len(set(facts.domains)) >= 2:
+    if multiple_links and (facts.is_forwarded or promotion):
         rules.append("HR-04_MULTIPLE_LINKS")
     if previous_link_messages >= 1 and facts.has_link:
         rules.append("HR-05_LINK_BURST")

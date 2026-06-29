@@ -78,7 +78,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.message(
                 1,
                 text="private-message-canary",
-                facts=MessageFacts(text="private-message-canary", has_link_button=True),
+                facts=MessageFacts(
+                    text="private-message-canary",
+                    has_link_button=True,
+                    link_button_count=2,
+                ),
             ),
             actions,
         )
@@ -95,7 +99,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 1,
                 text="private-message-canary",
                 facts=MessageFacts(
-                    text="private-message-canary", has_link_button=True
+                    text="private-message-canary",
+                    has_link_button=True,
+                    link_button_count=2,
                 ),
                 review_reference=reference,
             ),
@@ -104,7 +110,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "would_quarantine")
         item = self.store.review_items()[0]
         self.assertEqual(item.classification, "would_quarantine")
-        self.assertIn("HR-01_LINK_BUTTON", item.rule_codes)
+        self.assertIn("HR-01_MULTIPLE_LINK_BUTTONS", item.rule_codes)
         self.assertEqual(
             self.protector.open_review_reference(item.reference or b""),
             (123456789, 456, 1),
@@ -131,7 +137,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.store.set_mode("enforce")
         actions = FakeActions()
         outcome = await self.service.handle(
-            self.message(1, facts=MessageFacts(has_link_button=True)), actions
+            self.message(
+                1,
+                facts=MessageFacts(has_link_button=True, link_button_count=2),
+            ),
+            actions,
         )
         self.assertEqual(outcome, "quarantined")
         self.assertEqual(actions.quarantines, 1)
@@ -144,7 +154,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         outcome = await self.service.handle(
             self.message(
                 1,
-                facts=MessageFacts(has_link_button=True),
+                facts=MessageFacts(has_link_button=True, link_button_count=2),
                 review_reference=reference,
             ),
             FakeActions(),
@@ -156,7 +166,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.store.set_mode("enforce")
         actions = FakeActions(quarantine_success=False)
         outcome = await self.service.handle(
-            self.message(1, facts=MessageFacts(has_link_button=True)), actions
+            self.message(
+                1,
+                facts=MessageFacts(has_link_button=True, link_button_count=2),
+            ),
+            actions,
         )
         self.assertEqual(outcome, "fail_safe")
         self.assertEqual(

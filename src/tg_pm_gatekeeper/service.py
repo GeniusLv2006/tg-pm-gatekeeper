@@ -189,6 +189,8 @@ class GatekeeperService:
             "has_link": facts.has_link,
             "has_link_button": facts.has_link_button,
             "has_quote": bool(facts.quote_text),
+            "link_button_count": min(facts.link_button_count, 3),
+            "quote_url_count": min(len(set(facts.quote_urls)), 2),
             "url_count": min(len(set(facts.urls)), 2),
             "via_bot": facts.via_bot,
         }

@@ -23,8 +23,9 @@ Transitions must be idempotent and persisted so restarts cannot resend challenge
 
 1. Accept only incoming private-message events.
 2. Exclude contacts, local allowlist entries, service accounts, bots, and peers with a trusted prior conversation.
-3. Apply deterministic, high-precision spam rules.
-   Quoted text and its entities are inspected in memory, but are never persisted.
+3. Apply deterministic, high-precision spam rules. Authored text and links are kept separate from
+   quoted text and links so quoted content cannot trigger generic promotion or link-count rules.
+   The dedicated quoted crypto-service rule still inspects quote text in memory.
 4. In observation mode, record the simulated result for operator review and take no Telegram action.
 5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender.
 6. Allow a correct response; quarantine after two incorrect numeric answers or timeout.
@@ -54,6 +55,12 @@ structural features, a consolidated message count, and one authenticated encrypt
 containing peer access data and a message ID. It is not a conversation archive. When an operator
 opens an item, the running client decrypts that single reference and fetches the referenced message
 and sender from Telegram. Those values are rendered in the response but are not persisted or logged.
+
+The queue page decrypts the same pending references to display Telegram IDs and resolves names and
+usernames from Telegram in batches. Profile names are cached only in process memory for five minutes;
+failed lookups are retried after 30 seconds. Review decisions evict the matching cached identity.
+Responses use `Cache-Control: no-store`, although rendered identity remains visible in the owner's
+browser memory and screenshots like any other displayed page.
 
 An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
 the local allowlist. Confirmed spam is explicitly archived and muted; observation mode never performs
@@ -85,7 +92,9 @@ Sender state, processed-message, review, and challenge records use an HMAC-SHA-2
 Telegram user ID. The server-local HMAC key must remain outside general backups. Audit records
 contain only the derived sender key, rule code, outcome, and timestamp and default to 30-day
 retention. Message bodies, usernames, phone numbers, media, raw URLs, and raw user IDs are not
-persisted. Processed Telegram message IDs are retained for idempotency for the same audit-retention
+persisted. Names and usernames may exist briefly in the review process's bounded memory cache, and
+raw user IDs are rendered from authenticated encrypted references without being added to the
+database. Processed Telegram message IDs are retained for idempotency for the same audit-retention
 window.
 
 Review references use AES-256-CTR with independent HMAC-SHA-256 authentication and keys derived for

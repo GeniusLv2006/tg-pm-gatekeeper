@@ -11,15 +11,27 @@ from tg_pm_gatekeeper.rules import (
 
 
 class RuleTests(unittest.TestCase):
-    def test_link_button_is_hard_rule(self) -> None:
+    def test_single_link_button_is_not_a_hard_rule(self) -> None:
         decision = evaluate_hard_rules(MessageFacts(has_link_button=True))
-        self.assertIn("HR-01_LINK_BUTTON", decision.rule_codes)
+        self.assertFalse(decision.hard_spam)
 
-    def test_forwarded_link_is_hard_rule(self) -> None:
+    def test_multiple_link_buttons_are_a_hard_rule(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(has_link_button=True, link_button_count=3)
+        )
+        self.assertIn("HR-01_MULTIPLE_LINK_BUTTONS", decision.rule_codes)
+
+    def test_forwarded_link_button_is_a_hard_rule(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(has_link_button=True, is_forwarded=True)
+        )
+        self.assertIn("HR-02_FORWARDED_LINK_BUTTON", decision.rule_codes)
+
+    def test_forwarded_plain_link_is_not_a_hard_rule(self) -> None:
         decision = evaluate_hard_rules(
             MessageFacts(urls=("https://example.invalid",), is_forwarded=True)
         )
-        self.assertIn("HR-02_FORWARDED_LINK_OR_BUTTON", decision.rule_codes)
+        self.assertFalse(decision.hard_spam)
 
     def test_topic_without_link_is_not_hard_rule(self) -> None:
         decision = evaluate_hard_rules(MessageFacts(text="你使用什么 VPN？"))
@@ -47,6 +59,44 @@ class RuleTests(unittest.TestCase):
             MessageFacts(text="机场推荐 永久套餐", urls=("https://example.invalid",))
         )
         self.assertIn("HR-03_PROMOTION_WITH_LINK", decision.rule_codes)
+
+    def test_quoted_promotion_does_not_pollute_authored_rules(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(
+                text="这个是什么？",
+                quote_text="机场推荐 永久套餐",
+                quote_urls=("https://example.invalid",),
+                quote_domains=("example.invalid",),
+            )
+        )
+        self.assertFalse(decision.hard_spam)
+
+    def test_equivalent_urls_with_punctuation_are_counted_once(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(
+                urls=("https://example.invalid", "https://example.invalid。"),
+                domains=("example.invalid",),
+                is_forwarded=True,
+            )
+        )
+        self.assertFalse(decision.hard_spam)
+
+    def test_multiple_links_require_a_second_risk_signal(self) -> None:
+        ordinary = evaluate_hard_rules(
+            MessageFacts(
+                urls=("https://one.invalid", "https://two.invalid"),
+                domains=("one.invalid", "two.invalid"),
+            )
+        )
+        forwarded = evaluate_hard_rules(
+            MessageFacts(
+                urls=("https://one.invalid", "https://two.invalid"),
+                domains=("one.invalid", "two.invalid"),
+                is_forwarded=True,
+            )
+        )
+        self.assertFalse(ordinary.hard_spam)
+        self.assertIn("HR-04_MULTIPLE_LINKS", forwarded.rule_codes)
 
     def test_second_link_message_is_burst(self) -> None:
         decision = evaluate_hard_rules(

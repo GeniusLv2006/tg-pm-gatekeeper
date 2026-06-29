@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 from telethon import types
 
+from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.telegram_adapter import (
     facts_from_message,
+    load_denylist,
     write_runtime_heartbeat,
 )
 
@@ -47,6 +49,7 @@ class TelegramAdapterTests(unittest.TestCase):
         )
         facts = facts_from_message(self.message(reply_markup=markup))
         self.assertTrue(facts.has_link_button)
+        self.assertEqual(facts.link_button_count, 1)
         self.assertIn("bad.invalid", facts.domains)
 
     def test_quoted_text_and_entities_are_extracted(self) -> None:
@@ -63,8 +66,29 @@ class TelegramAdapterTests(unittest.TestCase):
             self.message(message="核心在此", reply_to=reply_to)
         )
         self.assertEqual(facts.quote_text, quote)
-        self.assertIn("https://bad.invalid", facts.urls)
-        self.assertIn("bad.invalid", facts.domains)
+        self.assertNotIn("https://bad.invalid", facts.urls)
+        self.assertNotIn("bad.invalid", facts.domains)
+        self.assertIn("https://bad.invalid", facts.quote_urls)
+        self.assertIn("bad.invalid", facts.quote_domains)
+
+    def test_unicode_denylist_domain_is_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "denylist.txt"
+            path.write_text("例子.测试\n", encoding="utf-8")
+            self.assertEqual(
+                load_denylist(path), frozenset({"xn--fsqu00a.xn--0zwm56d"})
+            )
+
+    def test_configured_missing_denylist_fails_closed(self) -> None:
+        with self.assertRaises(ConfigurationError):
+            load_denylist(Path("/definitely/missing/denylist.txt"))
+
+    def test_invalid_denylist_domain_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "denylist.txt"
+            path.write_text("not a domain\n", encoding="utf-8")
+            with self.assertRaises(ConfigurationError):
+                load_denylist(path)
 
     def test_runtime_heartbeat_is_replaced_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

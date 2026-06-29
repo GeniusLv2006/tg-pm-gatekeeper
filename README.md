@@ -13,7 +13,8 @@ The project is pre-release and tracks the latest commit on `main`. The implement
 
 - starts in `observe` mode and does not change Telegram dialogs automatically;
 - evaluates deterministic, local rules without opening links or sending message content elsewhere;
-- groups review work by sender and serves it through an SSH-forwarded, owner-only Unix socket;
+- groups review work by sender, resolves identity live without database persistence, and serves the
+  queue through an SSH-forwarded, owner-only Unix socket;
 - can be explicitly switched to `enforce` mode to challenge ordinary unknown senders and archive
   and mute high-confidence spam; and
 - does not delete, block, report, call an AI service, or expose a public administration port.
@@ -49,8 +50,10 @@ The queue is intentionally sender-centric:
   history;
 - a newer message normally replaces the retained reference, while an earlier simulated quarantine
   remains the representative item when a later lower-risk message arrives; and
-- message bodies and profile data are rendered from Telegram only when the detail page opens and are
-  not written to the database or application logs.
+- the queue resolves names, usernames, and Telegram IDs live, keeps profile names only in a
+  short-lived process-memory cache, and never writes them to the database or application logs; and
+- message bodies are rendered from Telegram only when the detail page opens and are not written to
+  the database or application logs.
 
 Choosing **Legitimate**, **Spam**, or **Dismiss** resolves the sender's pending work and immediately
 erases the reversible Telegram reference. The non-content decision record remains subject to normal
@@ -67,13 +70,18 @@ helper with `-h` or see [docs/deployment.md](docs/deployment.md) for the complet
 
 ## Implemented hard rules
 
-- URL, login, or WebView button from an unknown sender
-- forwarded content containing a link or button
+- multiple URL, login, or WebView buttons from an unknown sender
+- forwarded content containing a URL, login, or WebView button
 - gambling, crypto-promotion, or VPN/proxy-promotion language combined with a link
-- multiple links or domains in one message
+- multiple normalized links or domains combined with forwarding or promotional language
 - repeated link messages within 60 seconds
-- optional locally maintained denied domains
+- optional locally maintained denied domains; a configured missing or invalid file stops startup
 - quoted crypto transfer/service promotions with multiple commercial signals
+
+A single ordinary link button, a forwarded plain link, or multiple links without another risk
+signal follows the normal unknown-sender challenge path instead of causing immediate quarantine.
+Quoted URLs and promotional language do not participate in the generic authored-message rules; the
+dedicated quoted crypto-service rule remains intentionally separate.
 
 ## Security principles
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 
-from .config import Settings, read_private_file
+from .config import ConfigurationError, Settings, read_private_file
 from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
 from .service import GatekeeperService, IncomingMessage
@@ -35,13 +35,23 @@ GATEKEEPER_MESSAGE_PREFIXES = (
 
 
 def load_denylist(path: Path | None) -> frozenset[str]:
-    if path is None or not path.exists():
+    if path is None:
         return frozenset()
+    if not path.is_file():
+        raise ConfigurationError("configured denylist file is missing or invalid")
     values: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        value = line.strip().casefold().rstrip(".")
-        if value and not value.startswith("#") and "/" not in value:
-            values.add(value)
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        if "/" in value or ":" in value:
+            raise ConfigurationError(f"invalid denylist entry on line {line_number}")
+        domain = normalized_domain(value)
+        if domain is None:
+            raise ConfigurationError(f"invalid denylist entry on line {line_number}")
+        values.add(domain)
     return frozenset(values)
 
 
@@ -68,9 +78,10 @@ def facts_from_message(message: types.Message) -> MessageFacts:
     reply_header = getattr(message, "reply_to", None)
     quote_text = getattr(reply_header, "quote_text", None) or ""
     quote_entities = getattr(reply_header, "quote_entities", None) or ()
-    urls.update(_urls_from_text_and_entities(quote_text, quote_entities))
+    quote_urls = _urls_from_text_and_entities(quote_text, quote_entities)
 
     has_link_button = False
+    link_button_count = 0
     has_any_button = False
     markup = message.reply_markup
     for row in getattr(markup, "rows", ()) or ():
@@ -78,6 +89,7 @@ def facts_from_message(message: types.Message) -> MessageFacts:
             has_any_button = True
             if isinstance(button, LINK_BUTTON_TYPES):
                 has_link_button = True
+                link_button_count += 1
                 url = getattr(button, "url", None)
                 if url:
                     urls.add(url)
@@ -89,12 +101,20 @@ def facts_from_message(message: types.Message) -> MessageFacts:
     domains = tuple(
         sorted({domain for url in urls if (domain := normalized_domain(url))})
     )
+    quote_domains = tuple(
+        sorted(
+            {domain for url in quote_urls if (domain := normalized_domain(url))}
+        )
+    )
     return MessageFacts(
         text=text,
         quote_text=quote_text,
         urls=tuple(sorted(urls)),
         domains=domains,
+        quote_urls=tuple(sorted(quote_urls)),
+        quote_domains=quote_domains,
         has_link_button=has_link_button,
+        link_button_count=link_button_count,
         has_any_button=has_any_button,
         is_forwarded=message.fwd_from is not None,
         via_bot=message.via_bot_id is not None,
