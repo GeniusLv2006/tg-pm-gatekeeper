@@ -7,7 +7,7 @@ import sys
 
 from .config import ConfigurationError, Settings, read_private_file
 from .crypto import IdentifierProtector
-from .store import StateStore
+from .store import StateStore, StoreMigrationError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -46,6 +46,15 @@ def run(argv: list[str] | None = None) -> int:
         key = read_private_file(settings.hmac_key_file, minimum_bytes=32)
         sender_key = IdentifierProtector(key).sender_key(args.user_id)
         if args.command == "allow":
+            if store.sender(sender_key).status in {
+                "challenge_issuing",
+                "challenge_archiving",
+                "challenged",
+                "quarantined",
+            }:
+                raise ValueError(
+                    "sender requires dashboard review to restore Telegram state"
+                )
             store.allow(sender_key)
             print("sender=allowed")
         else:
@@ -60,7 +69,7 @@ def main() -> None:
     os.umask(0o077)
     try:
         raise SystemExit(run())
-    except (ConfigurationError, OSError, ValueError) as exc:
+    except (ConfigurationError, OSError, StoreMigrationError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
 

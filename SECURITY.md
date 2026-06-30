@@ -20,7 +20,12 @@ If a secret is committed, removing it in a later commit is insufficient. Revoke 
 ## Runtime boundary
 
 - The Telegram StringSession is stored only as a mode `0600` file owned by the service UID.
-- The runtime database contains HMAC-derived sender keys, not raw user IDs or message content.
+- The runtime database contains HMAC-derived sender keys, Telegram message IDs, generated challenge
+  text during incomplete delivery, and authenticated encrypted short-lived action references. It
+  does not contain raw user IDs, private message content, usernames, or profile names.
+- Arithmetic verification is an interaction check, not a CAPTCHA or proof that a sender is human.
+- Challenge delivery, timeout, and review transitions must be serialized per derived sender key;
+  outbound-rate exhaustion must not bypass screening.
 - The application must not expose a listening port or mount the Docker socket.
 - Root compromise of the host is considered compromise of the Telegram account. Container isolation
   does not protect a session from the host administrator.

@@ -73,6 +73,21 @@ The database defaults to `observe`. Check health and redacted status:
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
 ```
 
+### Schema-changing updates
+
+Before deploying an update that changes the state schema, keep the service in `observe`, require
+`challenged`, `challenge_issuing`, and `challenge_archiving` to be zero, and create a temporary
+remote-only SQLite backup with the online backup API:
+
+```shell
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -c '\''import os, sqlite3; source=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3"); backup=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3"); source.backup(backup); backup.close(); source.close(); os.chmod("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3", 0o600)'\'''
+```
+
+After the rebuilt service is healthy, verify `PRAGMA user_version`, redacted state counts, and logs.
+Delete `state.pre-migration.sqlite3` only after all deployment checks pass. If migration fails, keep
+the failed database for diagnosis and restore the temporary backup together with the prior image.
+
 After seven days of reviewed observation, enable enforcement explicitly:
 
 ```shell
@@ -126,9 +141,14 @@ conversation history. The reference normally points to the newest message, excep
 simulated quarantine remains representative when later messages are lower risk. Available decisions
 are:
 
-- **Legitimate**: add the HMAC-keyed sender to the local allowlist.
+- **Legitimate**: restore a Gatekeeper-quarantined dialog when necessary, then add the HMAC-keyed
+  sender to the local allowlist.
 - **Spam**: archive and mute the Telegram dialog, then mark the sender quarantined.
 - **Dismiss**: record no classification and perform no Telegram action.
+
+If challenge delivery is suppressed by the global outbound limit, enforcement archives and mutes
+the dialog and adds it to this queue. Marking it Legitimate restores it; Spam keeps the existing
+quarantine without repeating Telegram actions; Dismiss leaves the quarantine unchanged.
 
 All three decisions apply to the sender's pending review, erase the encrypted Telegram reference
 immediately, and return to the queue. Pending references expire after the configured retention,
@@ -137,7 +157,9 @@ the socket through a Docker port mapping or reverse proxy.
 
 The `allow USER_ID` and `revoke USER_ID` commands derive the stored HMAC key inside the container and
 never print the raw identifier. Be aware that a user ID typed as a CLI argument can remain in shell
-history; use a temporary history-disabled shell when this matters.
+history; use a temporary history-disabled shell when this matters. `allow` refuses active/incomplete
+challenges and Gatekeeper quarantines; use **Legitimate** in the dashboard so the dialog is restored
+before the sender is permanently allowed.
 
 ## 4. Verify the boundary
 

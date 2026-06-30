@@ -11,6 +11,7 @@ from telethon import functions
 
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.review_admin import ReviewAdminServer
+from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.store import StateStore
 
 
@@ -38,20 +39,23 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.store = StateStore(Path(self.temp.name) / "state.sqlite3")
         self.protector = IdentifierProtector(b"k" * 32)
+        self.service = GatekeeperService(self.store, self.protector)
         self.client = FakeTelegramClient()
+        self.cancelled: list[str] = []
         self.server = ReviewAdminServer(
             Path(self.temp.name) / "review.sock",
             self.store,
-            self.protector,
+            self.service,
             self.client,
             mute_days=30,
+            cancel_timeout=self.cancelled.append,
         )
         reference = self.protector.seal_review_reference(123456789, -987654321, 42)
         self.review_id = self.store.enqueue_review(
             "sender",
             reference,
             "would_quarantine",
-            '["HR-01_LINK_BUTTON"]',
+            '["HR-01_MULTIPLE_LINK_BUTTONS"]',
             "{}",
             700,
             100,
@@ -131,6 +135,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 303)
         self.assertEqual(headers["Location"], "/")
         self.assertEqual(self.store.sender("sender").status, "allowed")
+        self.assertEqual(self.cancelled, ["sender"])
         self.assertIsNone(self.store.review_item(self.review_id).reference)
         self.assertNotIn("sender", self.server._identity_cache)
 
@@ -147,6 +152,51 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.client.requests[0], functions.folders.EditPeerFoldersRequest
         )
         self.assertEqual(self.store.sender("sender").status, "quarantined")
+        self.assertEqual(self.cancelled, ["sender"])
+
+    async def test_spam_decision_does_not_repeat_existing_quarantine(self) -> None:
+        self.store.quarantine("sender", 150)
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "spam"}
+        ).encode()
+        status, _, _ = await self.server._dispatch(
+            "POST", f"/review/{self.review_id}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.client.requests, [])
+        self.assertEqual(self.store.sender("sender").status, "quarantined")
+        self.assertEqual(self.cancelled, ["sender"])
+
+    async def test_legitimate_decision_restores_gatekeeper_quarantine(self) -> None:
+        self.store.quarantine("sender", 150)
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "legitimate"}
+        ).encode()
+        status, _, _ = await self.server._dispatch(
+            "POST", f"/review/{self.review_id}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(len(self.client.requests), 2)
+        self.assertIsInstance(
+            self.client.requests[0], functions.folders.EditPeerFoldersRequest
+        )
+        self.assertEqual(
+            self.client.requests[0].folder_peers[0].folder_id, 0
+        )
+        self.assertEqual(self.store.sender("sender").status, "allowed")
+
+    async def test_legitimate_decision_resolves_active_challenge(self) -> None:
+        self.store.set_challenge("sender", "challenge", "digest", 700, 42, 150)
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "legitimate"}
+        ).encode()
+        status, _, _ = await self.server._dispatch(
+            "POST", f"/review/{self.review_id}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(len(self.client.requests), 2)
+        self.assertEqual(self.store.sender("sender").status, "allowed")
+        self.assertEqual(self.cancelled, ["sender"])
 
 
 if __name__ == "__main__":

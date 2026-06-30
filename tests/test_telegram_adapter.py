@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from telethon import types
 
 from tg_pm_gatekeeper.config import ConfigurationError
+from tg_pm_gatekeeper.crypto import IdentifierProtector
+from tg_pm_gatekeeper.service import GatekeeperService
+from tg_pm_gatekeeper.store import StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
+    TelegramAdapter,
     facts_from_message,
     load_denylist,
+    message_timestamp,
+    reply_to_message_id,
     write_runtime_heartbeat,
 )
 
@@ -97,6 +104,80 @@ class TelegramAdapterTests(unittest.TestCase):
             write_runtime_heartbeat(path, 200)
             self.assertEqual(path.read_text(encoding="ascii"), "200")
             self.assertFalse((Path(directory) / ".heartbeat.tmp").exists())
+
+    def test_reply_target_and_message_timestamp_are_extracted(self) -> None:
+        date = datetime(2026, 6, 30, tzinfo=timezone.utc)
+        message = self.message(
+            reply_to=SimpleNamespace(reply_to_msg_id=42), date=date
+        )
+        self.assertEqual(reply_to_message_id(message), 42)
+        self.assertEqual(message_timestamp(message, fallback=1), int(date.timestamp()))
+
+
+class FakeHistoryClient:
+    def __init__(self, messages) -> None:
+        self.messages = messages
+
+    async def iter_messages(self, *args, **kwargs):
+        for message in self.messages:
+            yield message
+
+
+class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_automated_outgoing_message_does_not_create_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                protector = IdentifierProtector(b"k" * 32)
+                service = GatekeeperService(store, protector)
+                sender_key = protector.sender_key(123)
+                store.record_automated_message(sender_key, 10, 100)
+                outgoing = SimpleNamespace(
+                    id=10,
+                    out=True,
+                    message="Verification passed. This conversation has been restored.",
+                    date=datetime.fromtimestamp(101, timezone.utc),
+                )
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.store = store
+                adapter.service = service
+                adapter.client = FakeHistoryClient([outgoing])
+                event = SimpleNamespace(
+                    input_chat="peer", message=SimpleNamespace(id=11)
+                )
+                trusted = await adapter._has_prior_outgoing(
+                    event, sender_key, since=100
+                )
+                self.assertFalse(trusted)
+            finally:
+                store.close()
+
+    async def test_manual_outgoing_message_promotes_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                protector = IdentifierProtector(b"k" * 32)
+                service = GatekeeperService(store, protector)
+                sender_key = protector.sender_key(123)
+                outgoing = SimpleNamespace(
+                    id=12,
+                    out=True,
+                    message="Thanks, I will reply shortly.",
+                    date=datetime.fromtimestamp(100, timezone.utc),
+                )
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.store = store
+                adapter.service = service
+                adapter.client = FakeHistoryClient([outgoing])
+                event = SimpleNamespace(
+                    input_chat="peer", message=SimpleNamespace(id=13)
+                )
+                trusted = await adapter._has_prior_outgoing(
+                    event, sender_key, since=100
+                )
+                self.assertTrue(trusted)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":
