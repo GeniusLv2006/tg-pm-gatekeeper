@@ -11,11 +11,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
 from telethon import functions, types
 
-from .crypto import IdentifierProtector
+from .service import GatekeeperService
 from .store import ReviewItem, StateStore
 
 
@@ -40,16 +41,19 @@ class ReviewAdminServer:
         self,
         socket_path: Path,
         store: StateStore,
-        protector: IdentifierProtector,
+        service: GatekeeperService,
         telegram_client,
         *,
         mute_days: int,
+        cancel_timeout: Callable[[str], None] = lambda _sender_key: None,
     ) -> None:
         self.socket_path = socket_path
         self.store = store
-        self.protector = protector
+        self.service = service
+        self.protector = service.protector
         self.telegram_client = telegram_client
         self.mute_days = mute_days
+        self.cancel_timeout = cancel_timeout
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
         self._identity_cache: dict[
@@ -171,22 +175,38 @@ class ReviewAdminServer:
         action = values.get("action", [""])[0]
         if not secrets.compare_digest(token, self._csrf_token):
             return 400, {}, self._page("Invalid action token")
-        if item.status != "pending" or item.reference is None:
-            return 409, {}, self._page("This item has already been reviewed")
-        if action == "legitimate":
-            self.store.allow(item.sender_key)
-            self.store.decide_sender_reviews(item.sender_key, "legitimate")
-        elif action == "spam":
-            peer = self._peer_from_item(item)
-            if not await self._archive_and_mute(peer):
-                return 500, {}, self._page("Telegram action failed; item was not changed")
-            self.store.quarantine(item.sender_key)
-            self.store.decide_sender_reviews(item.sender_key, "spam")
-        elif action == "dismiss":
-            self.store.decide_sender_reviews(item.sender_key, "dismissed")
-        else:
-            return 400, {}, self._page("Unknown action")
-        self._identity_cache.pop(item.sender_key, None)
+        async with self.service.sender_lock(item.sender_key):
+            item = self.store.review_item(review_id)
+            if item is None or item.status != "pending" or item.reference is None:
+                return 409, {}, self._page("This item has already been reviewed")
+            state = self.store.sender(item.sender_key)
+            if action == "legitimate":
+                if state.status in {"challenged", "quarantined"}:
+                    peer = self._peer_from_item(item)
+                    if not await self._restore(peer):
+                        return 500, {}, self._page(
+                            "Telegram action failed; item was not changed"
+                        )
+                self.store.allow(item.sender_key)
+                self.cancel_timeout(item.sender_key)
+                self.store.decide_sender_reviews(item.sender_key, "legitimate")
+            elif action == "spam":
+                if state.status not in {"challenged", "quarantined"}:
+                    peer = self._peer_from_item(item)
+                    if not await self._archive_and_mute(peer):
+                        return 500, {}, self._page(
+                            "Telegram action failed; item was not changed"
+                        )
+                    self.store.quarantine(item.sender_key)
+                elif state.status == "challenged":
+                    self.store.quarantine(item.sender_key)
+                self.cancel_timeout(item.sender_key)
+                self.store.decide_sender_reviews(item.sender_key, "spam")
+            elif action == "dismiss":
+                self.store.decide_sender_reviews(item.sender_key, "dismissed")
+            else:
+                return 400, {}, self._page("Unknown action")
+            self._identity_cache.pop(item.sender_key, None)
         return 303, {"Location": "/"}, b""
 
     def _peer_from_item(self, item: ReviewItem) -> types.InputPeerUser:
@@ -254,12 +274,14 @@ class ReviewAdminServer:
         return 200, {}, self._page(content, raw=True, refresh_seconds=30)
 
     async def _archive_and_mute(self, peer: types.InputPeerUser) -> bool:
+        archive_applied = False
         try:
             await self.telegram_client(
                 functions.folders.EditPeerFoldersRequest(
                     [types.InputFolderPeer(peer=peer, folder_id=1)]
                 )
             )
+            archive_applied = True
             await self.telegram_client(
                 functions.account.UpdateNotifySettingsRequest(
                     peer=types.InputNotifyPeer(peer),
@@ -272,7 +294,30 @@ class ReviewAdminServer:
             )
             return True
         except Exception:
+            if archive_applied:
+                await self._restore(peer)
             LOG.error("review_quarantine_failed")
+            return False
+
+    async def _restore(self, peer: types.InputPeerUser) -> bool:
+        try:
+            await self.telegram_client(
+                functions.folders.EditPeerFoldersRequest(
+                    [types.InputFolderPeer(peer=peer, folder_id=0)]
+                )
+            )
+            await self.telegram_client(
+                functions.account.UpdateNotifySettingsRequest(
+                    peer=types.InputNotifyPeer(peer),
+                    settings=types.InputPeerNotifySettings(
+                        silent=False,
+                        mute_until=datetime.now(timezone.utc),
+                    ),
+                )
+            )
+            return True
+        except Exception:
+            LOG.error("review_restore_failed")
             return False
 
     async def _index_page(self) -> bytes:

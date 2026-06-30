@@ -29,12 +29,16 @@ incoming private message
       enforce: archive and mute
   -> ordinary unknown sender
       observe: enqueue a simulated challenge for review
-      enforce: send one arithmetic challenge, then archive and mute while pending
-          -> correct answer: restore dialog and allow sender
+      enforce: send one arithmetic interaction check, then archive and mute while pending
+          -> direct Reply with the correct answer: restore dialog and keep screening
+          -> account owner replies later: allow sender permanently
           -> two incorrect numeric answers or timeout: remain archived and muted
+          -> challenge send limit reached: archive, mute, and queue for manual review
 ```
 
-The default mode is observation-only. Enforcement is a deliberate CLI action.
+The arithmetic check is interaction friction, not a CAPTCHA. It filters senders that do not respond
+to instructions, but it does not claim to distinguish a person from automation. The default mode is
+observation-only. Enforcement is a deliberate CLI action.
 
 ## Review dashboard
 
@@ -49,14 +53,15 @@ The queue is intentionally sender-centric:
 - the detail page fetches and displays exactly one referenced Telegram message, not conversation
   history;
 - a newer message normally replaces the retained reference, while an earlier simulated quarantine
-  remains the representative item when a later lower-risk message arrives; and
+  remains the representative item when a later lower-risk message arrives;
 - the queue resolves names, usernames, and Telegram IDs live, keeps profile names only in a
   short-lived process-memory cache, and never writes them to the database or application logs; and
 - message bodies are rendered from Telegram only when the detail page opens and are not written to
   the database or application logs.
 
 Choosing **Legitimate**, **Spam**, or **Dismiss** resolves the sender's pending work and immediately
-erases the reversible Telegram reference. The non-content decision record remains subject to normal
+erases the reversible Telegram reference. Legitimate also restores a dialog previously archived by
+Gatekeeper's challenge-rate fallback. The non-content decision record remains subject to normal
 retention.
 
 From a trusted workstation, open the review tunnel with an explicit SSH target:
@@ -89,6 +94,7 @@ dedicated quoted crypto-service rule remains intentionally separate.
 - Keep secrets outside the repository and provide only redacted configuration examples.
 - Treat a user-session file as an account credential.
 - Minimize stored message content and keep an auditable reason for every automated action.
+- Treat arithmetic verification as a reversible interaction check, not proof that a sender is human.
 - Expire encrypted review references after at most seven days and erase them immediately after a
   review decision.
 - AI-based classification, if added, must not directly trigger irreversible actions.
@@ -108,6 +114,8 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 
 `pause` selects `observe`; `resume` selects `enforce`. `allow` and `revoke` derive the stored sender
 key inside the container, but the raw ID supplied on the command line may still enter shell history.
+`allow` refuses senders with an active/incomplete challenge or a Gatekeeper quarantine because the
+CLI cannot restore Telegram state; resolve those senders as **Legitimate** in the review dashboard.
 
 See [SECURITY.md](SECURITY.md) before reporting a security issue,
 [docs/architecture.md](docs/architecture.md) for the design, and

@@ -10,14 +10,20 @@
 ## Sender states
 
 ```text
-unknown -> challenged -> allowed
-                     -> quarantined
+unknown -> challenge_issuing -> challenge_archiving -> challenged
+                                                     -> provisional -> allowed
+                                                     -> quarantined
 
 unknown -> quarantined (high-confidence rule)
+provisional -> quarantined (high-confidence rule)
 allowed -> unknown (manual revoke)
 ```
 
-Transitions must be idempotent and persisted so restarts cannot resend challenges or repeat destructive actions.
+The issuing and archiving states are internal recovery phases. A sender becomes `challenged` only
+after the prompt is sent and the dialog is confirmed archived and muted. `provisional` means the
+sender passed the interaction check and can message normally while hard rules remain active. Only a
+later manual reply from the account owner, an explicit review, or a safe operator allow action grants
+`allowed`. The CLI refuses challenge and quarantine states because it cannot restore Telegram state.
 
 ## Decision pipeline
 
@@ -27,13 +33,17 @@ Transitions must be idempotent and persisted so restarts cannot resend challenge
    quoted text and links so quoted content cannot trigger generic promotion or link-count rules.
    The dedicated quoted crypto-service rule still inspects quote text in memory.
 4. In observation mode, record the simulated result for operator review and take no Telegram action.
-5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender.
-6. Allow a correct response; quarantine after two incorrect numeric answers or timeout.
+5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender and
+   bind it to the outgoing Telegram message ID.
+6. Accept only a direct Reply to that message. Restore a correct sender as `provisional`; quarantine
+   after two incorrect numeric answers or timeout.
 
 In enforcement mode the challenge is written in English and expires after 60 seconds. The dialog is
-immediately archived and muted while verification is pending. Non-numeric messages do not consume an
-attempt or extend the deadline. A correct answer restores the dialog and notifications; timeout or
-two incorrect numeric answers leave it archived and muted.
+archived and muted before the challenge becomes active. Replies to another message, standalone
+answers, and non-numeric replies do not consume an attempt or extend the deadline. Numeric input is
+NFKC-normalized before comparison. A correct answer restores the dialog and notifications but keeps
+hard-rule screening active; timeout or two incorrect numeric answers leave it archived and muted.
+The arithmetic is interaction friction rather than a CAPTCHA and is not treated as proof of humanity.
 
 Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
 with a simulated challenge or quarantine. Further messages from that sender update the same item and
@@ -63,10 +73,11 @@ Responses use `Cache-Control: no-store`, although rendered identity remains visi
 browser memory and screenshots like any other displayed page.
 
 An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
-the local allowlist. Confirmed spam is explicitly archived and muted; observation mode never performs
-that action on its own. A decision immediately removes the encrypted reference. Pending references
-expire after no more than seven days, while non-reversible verdicts may remain for the normal audit
-retention period.
+the local allowlist and are restored first when Gatekeeper previously archived the dialog. Confirmed
+spam is archived and muted unless the sender is already quarantined. Dismiss performs no new action
+and therefore leaves a rate-limit fallback quarantine in place. A decision immediately removes the
+encrypted reference. Pending references expire after no more than seven days, while non-reversible
+verdicts may remain for the normal audit retention period.
 
 ## Implemented action policy
 
@@ -74,7 +85,9 @@ retention period.
 | --- | --- | --- |
 | Trusted sender | Allow | Allow |
 | Ordinary unknown sender | Queue simulated challenge | Temporary archive/mute and challenge |
+| Provisional sender | Continue hard-rule screening | Continue hard-rule screening |
 | High-confidence rule | Queue simulated quarantine | Archive and mute |
+| Challenge send limit reached | Not applicable | Archive, mute, and queue review |
 | Manual legitimate review | Allow sender | Allow sender |
 | Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
 
@@ -82,9 +95,11 @@ Deletion, blocking, reporting, AI classification, and conversation cleanup are n
 
 ## Data boundaries
 
-The persistent store should contain sender state, challenge metadata, rule identifiers, timestamps,
-action outcomes, structural review features, and encrypted short-lived Telegram references. It does
-not store message bodies or profile data.
+The persistent store contains sender state, challenge metadata, generated challenge prompts while
+delivery is incomplete, rule identifiers, timestamps, action outcomes, structural review features,
+automated outgoing message IDs, and encrypted short-lived Telegram references. It does not store
+private message bodies or profile data. Generated prompts and recovery references are cleared when a
+challenge activates or rolls back.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
@@ -92,7 +107,9 @@ Sender state, processed-message, review, and challenge records use an HMAC-SHA-2
 Telegram user ID. The server-local HMAC key must remain outside general backups. Audit records
 contain only the derived sender key, rule code, outcome, and timestamp and default to 30-day
 retention. Message bodies, usernames, phone numbers, media, raw URLs, and raw user IDs are not
-persisted. Names and usernames may exist briefly in the review process's bounded memory cache, and
+persisted. Telegram message IDs are stored only with derived sender keys for idempotency, direct
+Reply binding, and identification of automated Gatekeeper messages. Names and usernames may exist
+briefly in the review process's bounded memory cache, and
 raw user IDs are rendered from authenticated encrypted references without being added to the
 database. Processed Telegram message IDs are retained for idempotency for the same audit-retention
 window.
@@ -108,10 +125,16 @@ authorization key without persisting Telethon's entity cache of names, usernames
 
 ## Failure behavior
 
-- A message update is claimed before any network action, so duplicate updates cannot repeat actions.
-- Database, parsing, or Telegram RPC failures result in no further action and a redacted error event.
-- Challenge timeout actions are retained only in memory. If the process restarts during a challenge,
-  the next message evaluates the persisted expiry; the service does not persist a raw peer solely to
-  perform a background action after restart.
+- Incoming messages, timeouts, recovery, and review decisions are serialized per derived sender key.
+- Challenge delivery is persisted in issuing and archiving phases. Startup reconciles a sent prompt,
+  retries the reversible archive action, and resets incomplete work when it cannot recover safely.
+- Activated challenges are already archived, so timeout and restart recovery require only an atomic
+  database transition. Normal processing has a five-second grace period; startup allows 30 seconds
+  for queued Telegram updates while still judging timeliness from the message's send timestamp.
+- Sending or archiving failures compensate any confirmed partial Telegram action before rolling an
+  incomplete challenge back to `unknown`. If restoration itself fails, the recoverable archiving
+  phase is preserved for startup reconciliation instead of claiming that the sender is unconfined.
+- Exhausted outbound capacity archives the unknown dialog and creates a manual review item instead
+  of allowing challenge delivery to fail open.
 - Archiving and muting are the only destructive-adjacent operations in v1. Deletion, blocking, and
   reporting are not implemented.
