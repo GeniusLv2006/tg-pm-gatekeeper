@@ -159,6 +159,7 @@ class TelegramActions:
         return int(message.id)
 
     async def archive_and_mute(self) -> bool:
+        archive_applied = False
         try:
             peer = self.peer
             await self.adapter.client(
@@ -166,6 +167,7 @@ class TelegramActions:
                     [types.InputFolderPeer(peer=peer, folder_id=1)]
                 )
             )
+            archive_applied = True
             await self.adapter.client(
                 functions.account.UpdateNotifySettingsRequest(
                     peer=types.InputNotifyPeer(peer),
@@ -178,6 +180,8 @@ class TelegramActions:
             )
             return True
         except Exception:
+            if archive_applied:
+                await self.restore_from_pending()
             LOG.error("quarantine_action_failed")
             return False
 

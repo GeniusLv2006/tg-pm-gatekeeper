@@ -131,8 +131,9 @@ authorization key without persisting Telethon's entity cache of names, usernames
 - Activated challenges are already archived, so timeout and restart recovery require only an atomic
   database transition. Normal processing has a five-second grace period; startup allows 30 seconds
   for queued Telegram updates while still judging timeliness from the message's send timestamp.
-- Sending or archiving failures roll incomplete challenges back to `unknown`; no timeout remains
-  scheduled after a reported fail-safe outcome.
+- Sending or archiving failures compensate any confirmed partial Telegram action before rolling an
+  incomplete challenge back to `unknown`. If restoration itself fails, the recoverable archiving
+  phase is preserved for startup reconciliation instead of claiming that the sender is unconfined.
 - Exhausted outbound capacity archives the unknown dialog and creates a manual review item instead
   of allowing challenge delivery to fail open.
 - Archiving and muting are the only destructive-adjacent operations in v1. Deletion, blocking, and

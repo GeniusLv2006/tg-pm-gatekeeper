@@ -274,12 +274,14 @@ class ReviewAdminServer:
         return 200, {}, self._page(content, raw=True, refresh_seconds=30)
 
     async def _archive_and_mute(self, peer: types.InputPeerUser) -> bool:
+        archive_applied = False
         try:
             await self.telegram_client(
                 functions.folders.EditPeerFoldersRequest(
                     [types.InputFolderPeer(peer=peer, folder_id=1)]
                 )
             )
+            archive_applied = True
             await self.telegram_client(
                 functions.account.UpdateNotifySettingsRequest(
                     peer=types.InputNotifyPeer(peer),
@@ -292,6 +294,8 @@ class ReviewAdminServer:
             )
             return True
         except Exception:
+            if archive_applied:
+                await self._restore(peer)
             LOG.error("review_quarantine_failed")
             return False
 

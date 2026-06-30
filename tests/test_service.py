@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.rules import MessageFacts
@@ -295,6 +296,34 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.status, "unknown")
         self.assertIsNone(state.challenge_message_id)
         self.assertEqual(actions.scheduled, [])
+
+    async def test_activation_error_restores_archive_before_reset(self) -> None:
+        self.store.set_mode("enforce")
+        sender_key = self.protector.sender_key(123456789)
+        actions = FakeActions()
+        with patch.object(
+            self.store, "activate_challenge", side_effect=RuntimeError("database")
+        ):
+            outcome = await self.service.handle(self.message(1), actions)
+        self.assertEqual(outcome, "fail_safe")
+        self.assertEqual(actions.restores, 1)
+        self.assertEqual(self.store.sender(sender_key).status, "unknown")
+
+    async def test_activation_error_keeps_recoverable_state_if_restore_fails(
+        self,
+    ) -> None:
+        self.store.set_mode("enforce")
+        sender_key = self.protector.sender_key(123456789)
+        actions = FakeActions(restore_success=False)
+        with patch.object(
+            self.store, "activate_challenge", side_effect=RuntimeError("database")
+        ):
+            outcome = await self.service.handle(self.message(1), actions)
+        self.assertEqual(outcome, "fail_safe")
+        self.assertEqual(actions.restores, 1)
+        self.assertEqual(
+            self.store.sender(sender_key).status, "challenge_archiving"
+        )
 
     async def test_send_failure_rolls_challenge_back(self) -> None:
         self.store.set_mode("enforce")

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import unittest
 import tempfile
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from telethon import types
+from telethon import functions, types
 
 from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
@@ -14,6 +14,7 @@ from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.store import StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
     TelegramAdapter,
+    TelegramActions,
     facts_from_message,
     load_denylist,
     message_timestamp,
@@ -121,6 +122,42 @@ class FakeHistoryClient:
     async def iter_messages(self, *args, **kwargs):
         for message in self.messages:
             yield message
+
+
+class PartialArchiveClient:
+    def __init__(self) -> None:
+        self.requests: list[object] = []
+        self.failed_mute = False
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        if (
+            isinstance(request, functions.account.UpdateNotifySettingsRequest)
+            and not self.failed_mute
+        ):
+            self.failed_mute = True
+            raise RuntimeError("mute failed")
+
+
+class TelegramActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_archive_failure_is_compensated(self) -> None:
+        client = PartialArchiveClient()
+        adapter = SimpleNamespace(
+            client=client,
+            settings=SimpleNamespace(mute_days=30),
+        )
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
+        actions = TelegramActions(adapter, peer, "sender")
+        self.assertFalse(await actions.archive_and_mute())
+        folder_requests = [
+            request
+            for request in client.requests
+            if isinstance(request, functions.folders.EditPeerFoldersRequest)
+        ]
+        self.assertEqual(
+            [request.folder_peers[0].folder_id for request in folder_requests],
+            [1, 0],
+        )
 
 
 class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):

@@ -242,6 +242,7 @@ class GatekeeperService:
             message.review_reference,
             now,
         )
+        archive_confirmed = False
         try:
             challenge_message_id = await actions.send_text(prompt)
             self.store.record_automated_message(
@@ -258,13 +259,22 @@ class GatekeeperService:
                 actions.cancel_timeout(sender_key)
                 self.store.audit(sender_key, "PENDING_QUARANTINE", "action_failed", now)
                 return "fail_safe"
+            archive_confirmed = True
             if not self.store.activate_challenge(sender_key, self.clock()):
                 self.store.audit(sender_key, "CHALLENGE_ACTIVATE", "state_changed", now)
                 return "fail_safe"
         except Exception:
-            self.store.reset_incomplete_challenge(sender_key, self.clock())
+            restored = False
+            if archive_confirmed:
+                try:
+                    restored = await actions.restore_from_pending()
+                except Exception:
+                    restored = False
+            if not archive_confirmed or restored:
+                self.store.reset_incomplete_challenge(sender_key, self.clock())
             actions.cancel_timeout(sender_key)
-            self.store.audit(sender_key, "CHALLENGE_DELIVERY", "action_failed", now)
+            rollback = "restored" if restored else "action_failed"
+            self.store.audit(sender_key, "CHALLENGE_DELIVERY", rollback, now)
             return "fail_safe"
 
         self.store.audit(sender_key, "CHALLENGE_SENT", "archived_muted", now)

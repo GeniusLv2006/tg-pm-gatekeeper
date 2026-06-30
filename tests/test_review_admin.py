@@ -19,6 +19,7 @@ class FakeTelegramClient:
     def __init__(self) -> None:
         self.requests: list[object] = []
         self.entity_requests = 0
+        self.fail_next_mute = False
 
     async def get_messages(self, peer, ids):
         return SimpleNamespace(message="transient-canary", media=None)
@@ -32,6 +33,12 @@ class FakeTelegramClient:
 
     async def __call__(self, request):
         self.requests.append(request)
+        if (
+            self.fail_next_mute
+            and isinstance(request, functions.account.UpdateNotifySettingsRequest)
+        ):
+            self.fail_next_mute = False
+            raise RuntimeError("mute failed")
 
 
 class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
@@ -166,6 +173,27 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.requests, [])
         self.assertEqual(self.store.sender("sender").status, "quarantined")
         self.assertEqual(self.cancelled, ["sender"])
+
+    async def test_spam_partial_archive_failure_is_compensated(self) -> None:
+        self.client.fail_next_mute = True
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "spam"}
+        ).encode()
+        status, _, _ = await self.server._dispatch(
+            "POST", f"/review/{self.review_id}", body
+        )
+        self.assertEqual(status, 500)
+        folder_requests = [
+            request
+            for request in self.client.requests
+            if isinstance(request, functions.folders.EditPeerFoldersRequest)
+        ]
+        self.assertEqual(
+            [request.folder_peers[0].folder_id for request in folder_requests],
+            [1, 0],
+        )
+        self.assertEqual(self.store.sender("sender").status, "unknown")
+        self.assertEqual(self.store.review_item(self.review_id).status, "pending")
 
     async def test_legitimate_decision_restores_gatekeeper_quarantine(self) -> None:
         self.store.quarantine("sender", 150)

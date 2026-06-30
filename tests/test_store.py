@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
-import sqlite3
 from pathlib import Path
 
 from tg_pm_gatekeeper.store import StateStore, StoreMigrationError
@@ -144,6 +144,13 @@ class StoreMigrationTests(unittest.TestCase):
             }
             self.assertIn("challenge_message_id", columns)
             self.assertIn("challenge_action_reference", columns)
+            tables = {
+                row[0]
+                for row in store._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertIn("automated_messages", tables)
         finally:
             store.close()
 

@@ -166,16 +166,35 @@ class StateStore:
             raise StoreMigrationError(
                 "cannot migrate while legacy challenged senders exist"
             )
-        self._connection.execute("ALTER TABLE sender_state RENAME TO sender_state_v0")
-        self._connection.execute(SENDER_STATE_SCHEMA)
-        self._connection.execute(
-            "INSERT INTO sender_state(sender_key, status, challenge_id, answer_digest, "
-            "challenge_expires_at, attempts, updated_at) "
-            "SELECT sender_key, status, challenge_id, answer_digest, "
-            "challenge_expires_at, attempts, updated_at FROM sender_state_v0"
-        )
-        self._connection.execute("DROP TABLE sender_state_v0")
-        self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                "ALTER TABLE sender_state RENAME TO sender_state_v0"
+            )
+            self._connection.execute(SENDER_STATE_SCHEMA)
+            self._connection.execute(
+                "INSERT INTO sender_state(sender_key, status, challenge_id, "
+                "answer_digest, challenge_expires_at, attempts, updated_at) "
+                "SELECT sender_key, status, challenge_id, answer_digest, "
+                "challenge_expires_at, attempts, updated_at FROM sender_state_v0"
+            )
+            self._connection.execute("DROP TABLE sender_state_v0")
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS automated_messages ("
+                "sender_key TEXT NOT NULL, message_id INTEGER NOT NULL, "
+                "created_at INTEGER NOT NULL, PRIMARY KEY (sender_key, message_id))"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS automated_messages_created_idx "
+                "ON automated_messages(created_at)"
+            )
+            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     def close(self) -> None:
         with self._lock:
