@@ -320,6 +320,22 @@ class StateStore:
     def revoke(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "unknown", now=now)
 
+    def reset_test_sender(
+        self, sender_key: str, expected_updated_at: int, now: int | None = None
+    ) -> bool:
+        timestamp = now or int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET status='unknown', challenge_id=NULL, "
+                "answer_digest=NULL, challenge_expires_at=NULL, "
+                "challenge_message_id=NULL, challenge_prompt=NULL, "
+                "challenge_action_reference=NULL, guidance_sent=0, attempts=0, "
+                "updated_at=? WHERE sender_key=? AND updated_at=? "
+                "AND status IN ('provisional', 'quarantined')",
+                (timestamp, sender_key, expected_updated_at),
+            )
+        return cursor.rowcount == 1
+
     def quarantine(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "quarantined", now=now)
 
@@ -649,6 +665,29 @@ class StateStore:
                 "created_at) VALUES (?, ?, ?)",
                 (sender_key, message_id, timestamp),
             )
+
+    def message_ids_since(self, sender_key: str, since: int) -> list[int]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT message_id FROM processed_messages "
+                "WHERE sender_key=? AND processed_at>=? UNION "
+                "SELECT message_id FROM automated_messages "
+                "WHERE sender_key=? AND created_at>=? ORDER BY message_id",
+                (sender_key, since, sender_key, since),
+            ).fetchall()
+        return [int(row["message_id"]) for row in rows]
+
+    def latest_challenge_started_at(
+        self, sender_key: str, before: int
+    ) -> int | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT MAX(processed_at) AS started_at FROM processed_messages "
+                "WHERE sender_key=? AND outcome='challenged' AND processed_at<=?",
+                (sender_key, before),
+            ).fetchone()
+        value = row["started_at"] if row else None
+        return int(value) if value is not None else None
 
     def is_automated_message(self, sender_key: str, message_id: int) -> bool:
         with self._lock:

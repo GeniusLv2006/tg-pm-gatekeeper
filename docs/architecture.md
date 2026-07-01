@@ -47,6 +47,14 @@ The arithmetic is interaction friction rather than a CAPTCHA and is not treated 
 Each challenge independently selects addition, non-negative subtraction, or basic multiplication;
 operands are bounded so answers remain suitable for quick mental arithmetic.
 
+An optional single-account test path is enabled only when `TG_TEST_SENDER_ID` is configured. It
+bypasses contact, prior-history, hard-rule, observation-mode, and outbound-quota shortcuts so
+repeated tests exercise the actual arithmetic flow. Successful and terminal-failure states are
+conditionally reset to `unknown` after 60 seconds; the conditional update prevents an older timer
+from resetting a newer challenge. A terminal failure first sends a failure notice, then deletes only
+message IDs recorded during that challenge after 10 seconds. Delayed deletion and reset are
+reconstructed after restart.
+
 Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
 with a simulated challenge or quarantine. Further messages from that sender update the same item and
 increment its message counter. The retained reference normally follows the newest message. If a row
@@ -93,7 +101,9 @@ verdicts may remain for the normal audit retention period.
 | Manual legitimate review | Allow sender | Allow sender |
 | Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
 
-Deletion, blocking, reporting, AI classification, and conversation cleanup are not implemented.
+Deletion, blocking, reporting, AI classification, and general conversation cleanup are not
+implemented. The only deletion path is the explicitly configured dedicated test account described
+above, scoped to message IDs recorded during its failed challenge.
 
 ## Data boundaries
 

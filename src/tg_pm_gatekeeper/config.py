@@ -28,6 +28,19 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _optional_positive_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ConfigurationError(f"{name} must be positive")
+    return value
+
+
 def read_private_file(
     path: Path, *, minimum_bytes: int = 1, strip: bool = False
 ) -> bytes:
@@ -62,6 +75,7 @@ class Settings:
     review_socket_path: Path
     mute_days: int
     outbound_limit_per_hour: int
+    test_sender_id: int | None
 
     @classmethod
     def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
@@ -103,4 +117,5 @@ class Settings:
             ),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
             outbound_limit_per_hour=_positive_int("TG_OUTBOUND_LIMIT_PER_HOUR", 10),
+            test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
         )

@@ -161,6 +161,16 @@ history; use a temporary history-disabled shell when this matters. `allow` refus
 challenges and Gatekeeper quarantines; use **Legitimate** in the dashboard so the dialog is restored
 before the sender is permanently allowed.
 
+For a temporary dedicated arithmetic test account, add its positive numeric ID to the private
+`/etc/tg-pm-gatekeeper/config.env` file and recreate the container:
+
+```shell
+TG_TEST_SENDER_ID=REPLACE_WITH_DEDICATED_TEST_ACCOUNT_ID
+```
+
+This setting intentionally takes Telegram actions even while the global mode is `observe`. Do not
+set it to a real correspondent. Remove the line or leave it empty when testing is complete.
+
 ## 4. Verify the boundary
 
 The deployment is acceptable only when all checks pass:

@@ -26,6 +26,7 @@ async def async_main() -> None:
         outbound_limit_per_hour=settings.outbound_limit_per_hour,
         review_retention_days=settings.review_retention_days,
         denylist=load_denylist(settings.denylist_file),
+        test_sender_id=settings.test_sender_id,
     )
     adapter = TelegramAdapter(settings, store, service)
     try:

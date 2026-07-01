@@ -41,6 +41,7 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_REVIEW_SOCKET_PATH=/var/lib/tg-pm-gatekeeper/review.sock\n"
         "TG_MUTE_DAYS=3650\n"
         "TG_OUTBOUND_LIMIT_PER_HOUR=10\n"
+        "TG_TEST_SENDER_ID=\n"
     ).encode("ascii")
 
 
