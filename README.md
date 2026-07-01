@@ -29,7 +29,8 @@ incoming private message
       enforce: archive and mute
   -> ordinary unknown sender
       observe: enqueue a simulated challenge for review
-      enforce: send one arithmetic interaction check, then archive and mute while pending
+      enforce: send one randomized addition, subtraction, or multiplication check
+          -> archive and mute while pending
           -> direct Reply with the correct answer: restore dialog and keep screening
           -> account owner replies later: allow sender permanently
           -> two incorrect numeric answers or timeout: remain archived and muted

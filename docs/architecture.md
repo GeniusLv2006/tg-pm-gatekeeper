@@ -44,6 +44,8 @@ answers, and non-numeric replies do not consume an attempt or extend the deadlin
 NFKC-normalized before comparison. A correct answer restores the dialog and notifications but keeps
 hard-rule screening active; timeout or two incorrect numeric answers leave it archived and muted.
 The arithmetic is interaction friction rather than a CAPTCHA and is not treated as proof of humanity.
+Each challenge independently selects addition, non-negative subtraction, or basic multiplication;
+operands are bounded so answers remain suitable for quick mental arithmetic.
 
 Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
 with a simulated challenge or quarantine. Further messages from that sender update the same item and
