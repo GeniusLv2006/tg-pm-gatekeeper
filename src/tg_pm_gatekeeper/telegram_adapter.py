@@ -136,6 +136,14 @@ def reply_to_message_id(message: types.Message) -> int | None:
     return value if isinstance(value, int) else None
 
 
+def input_peer_from_sender(sender) -> types.InputPeerUser | None:
+    sender_id = getattr(sender, "id", None)
+    access_hash = getattr(sender, "access_hash", None)
+    if not isinstance(sender_id, int) or not isinstance(access_hash, int):
+        return None
+    return types.InputPeerUser(user_id=sender_id, access_hash=access_hash)
+
+
 def message_timestamp(message: types.Message, *, fallback: int) -> int:
     date = getattr(message, "date", None)
     return int(date.timestamp()) if date is not None else fallback
@@ -156,12 +164,16 @@ class TelegramActions:
     async def send_text(
         self, text: str, *, reply_to_message_id: int | None = None
     ) -> int:
-        message = await self.adapter.client.send_message(
-            self.peer,
-            text,
-            reply_to=reply_to_message_id,
-            link_preview=False,
-        )
+        try:
+            message = await self.adapter.client.send_message(
+                self.peer,
+                text,
+                reply_to=reply_to_message_id,
+                link_preview=False,
+            )
+        except Exception as error:
+            LOG.error(f"send_message_failed:{type(error).__name__}")
+            raise
         return int(message.id)
 
     async def archive_and_mute(self) -> bool:
@@ -344,7 +356,10 @@ class TelegramAdapter:
                 has_trusted_history=trusted_history,
                 review_reference=self._review_reference(sender, event.message.id),
             )
-            actions = TelegramActions(self, event.input_chat, sender_key)
+            peer = input_peer_from_sender(sender)
+            if peer is None:
+                peer = event.input_chat
+            actions = TelegramActions(self, peer, sender_key)
             outcome = await self.service.handle(incoming, actions)
             LOG.info(f"message_handled:{outcome}")
         except Exception:

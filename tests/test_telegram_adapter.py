@@ -16,6 +16,7 @@ from tg_pm_gatekeeper.telegram_adapter import (
     TelegramAdapter,
     TelegramActions,
     facts_from_message,
+    input_peer_from_sender,
     load_denylist,
     message_timestamp,
     reply_to_message_id,
@@ -113,6 +114,12 @@ class TelegramAdapterTests(unittest.TestCase):
         )
         self.assertEqual(reply_to_message_id(message), 42)
         self.assertEqual(message_timestamp(message, fallback=1), int(date.timestamp()))
+
+    def test_input_peer_is_rebuilt_from_resolved_sender(self) -> None:
+        peer = input_peer_from_sender(SimpleNamespace(id=123, access_hash=456))
+        self.assertIsInstance(peer, types.InputPeerUser)
+        self.assertEqual((peer.user_id, peer.access_hash), (123, 456))
+        self.assertIsNone(input_peer_from_sender(SimpleNamespace(id=123)))
 
 
 class FakeHistoryClient:
