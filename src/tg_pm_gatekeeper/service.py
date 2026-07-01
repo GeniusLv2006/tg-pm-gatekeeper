@@ -8,6 +8,7 @@ import secrets
 import time
 import unicodedata
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -63,8 +64,27 @@ class Challenge:
     expression: str
 
 
-def new_challenge() -> Challenge:
-    return Challenge(secrets.token_hex(16), "12", "6 + 6 = ?")
+def new_challenge(
+    randbelow: Callable[[int], int] = secrets.randbelow,
+    token_hex: Callable[[int], str] = secrets.token_hex,
+) -> Challenge:
+    operation = randbelow(3)
+    if operation == 0:
+        left = randbelow(24) + 2
+        right = randbelow(24) + 2
+        answer = left + right
+        expression = f"{left} + {right} = ?"
+    elif operation == 1:
+        answer = randbelow(25) + 1
+        right = randbelow(20) + 1
+        left = answer + right
+        expression = f"{left} - {right} = ?"
+    else:
+        left = randbelow(9) + 2
+        right = randbelow(9) + 2
+        answer = left * right
+        expression = f"{left} × {right} = ?"
+    return Challenge(token_hex(16), str(answer), expression)
 
 
 def challenge_prompt(challenge: Challenge, ttl_seconds: int) -> str:

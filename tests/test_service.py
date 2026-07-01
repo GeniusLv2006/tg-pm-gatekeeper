@@ -15,6 +15,7 @@ from tg_pm_gatekeeper.service import (
     GatekeeperService,
     IncomingMessage,
     challenge_prompt,
+    new_challenge,
 )
 from tg_pm_gatekeeper.store import StateStore
 
@@ -111,7 +112,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             challenge_ttl_seconds=60,
             challenge_max_attempts=2,
             outbound_limit_per_hour=outbound_limit,
-            challenge_factory=lambda: Challenge("challenge", "12", "6 + 6 = ?"),
+            challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
             clock=lambda: self.now,
         )
 
@@ -151,11 +152,35 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         return sender_key
 
     def test_nondefault_ttl_is_rendered_in_prompt(self) -> None:
-        prompt = challenge_prompt(Challenge("id", "12", "6 + 6 = ?"), 90)
+        prompt = challenge_prompt(Challenge("id", "56", "8 × 7 = ?"), 90)
         self.assertIn("within 90 seconds", prompt)
         self.assertNotIn("within 1 minute", prompt)
-        one_second = challenge_prompt(Challenge("id", "12", "6 + 6 = ?"), 1)
+        one_second = challenge_prompt(Challenge("id", "56", "8 × 7 = ?"), 1)
         self.assertIn("within 1 second", one_second)
+
+    def test_challenge_generator_covers_bounded_operation_families(self) -> None:
+        cases = (
+            ([0, 0, 23], "2 + 25 = ?", "27"),
+            ([1, 24, 19], "45 - 20 = ?", "25"),
+            ([2, 8, 0], "10 × 2 = ?", "20"),
+        )
+        for values, expression, answer in cases:
+            with self.subTest(expression=expression):
+                sequence = iter(values)
+
+                def deterministic_randbelow(upper: int) -> int:
+                    value = next(sequence)
+                    self.assertGreaterEqual(value, 0)
+                    self.assertLess(value, upper)
+                    return value
+
+                challenge = new_challenge(
+                    randbelow=deterministic_randbelow,
+                    token_hex=lambda length: "a" * (length * 2),
+                )
+                self.assertEqual(challenge.challenge_id, "a" * 32)
+                self.assertEqual(challenge.expression, expression)
+                self.assertEqual(challenge.answer, answer)
 
     async def test_observe_mode_never_sends_or_quarantines(self) -> None:
         actions = FakeActions()
@@ -186,7 +211,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Verification required", prompt)
         self.assertIn("within 1 minute", prompt)
         self.assertIn("Telegram's Reply action", prompt)
-        self.assertIn("Send only the answer: 6 + 6 = ?", prompt)
+        self.assertIn("Send only the answer: 7 + 5 = ?", prompt)
         self.assertIn("A separate message will not be accepted.", prompt)
         self.assertEqual(
             await self.service.handle(
