@@ -20,6 +20,7 @@ class InitializeTests(unittest.TestCase):
         config = render_config(1, "TEST_API_HASH_DO_NOT_USE").decode("ascii")
         self.assertIn("TG_API_ID=1", config)
         self.assertIn("TG_SESSION_FILE=/run/secrets/telegram_session", config)
+        self.assertIn("TG_TEST_SENDER_ID=\n", config)
         self.assertNotIn("REPLACE_WITH_", config)
 
 

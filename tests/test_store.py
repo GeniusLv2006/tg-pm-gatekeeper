@@ -26,6 +26,20 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.claim_message("sender", 1, 100))
         self.assertFalse(self.store.claim_message("sender", 1, 100))
 
+    def test_test_cleanup_is_scoped_and_cannot_reset_newer_state(self) -> None:
+        self.store.claim_message("sender", 1, 100)
+        self.store.finish_message("sender", 1, "challenged")
+        self.store.record_automated_message("sender", 2, 101)
+        self.store.claim_message("sender", 3, 102)
+        self.assertEqual(self.store.message_ids_since("sender", 101), [2, 3])
+        self.assertEqual(self.store.latest_challenge_started_at("sender", 200), 100)
+
+        self.store.mark_provisional("sender", 200)
+        self.assertFalse(self.store.reset_test_sender("sender", 199, 260))
+        self.assertEqual(self.store.sender("sender").status, "provisional")
+        self.assertTrue(self.store.reset_test_sender("sender", 200, 260))
+        self.assertEqual(self.store.sender("sender").status, "unknown")
+
     def test_state_does_not_require_raw_identity(self) -> None:
         self.store.allow("hmac-value", 100)
         self.assertEqual(self.store.sender("hmac-value").status, "allowed")

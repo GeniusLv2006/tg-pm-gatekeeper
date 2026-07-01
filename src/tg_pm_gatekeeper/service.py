@@ -28,6 +28,11 @@ DIGITS_REQUIRED_TEXT = "Reply with digits only. This did not use an attempt."
 VERIFICATION_PASSED_TEXT = (
     "Verification passed. This conversation has been restored."
 )
+VERIFICATION_FAILED_TEXT = (
+    "Verification failed. This conversation has been archived and muted."
+)
+TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
+TEST_STATE_RESET_DELAY_SECONDS = 60
 
 
 class MessageActions(Protocol):
@@ -40,6 +45,12 @@ class MessageActions(Protocol):
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
     ) -> None: ...
     def cancel_timeout(self, sender_key: str) -> None: ...
+    def schedule_test_message_deletion(
+        self, sender_key: str, since: int, delete_at: int
+    ) -> None: ...
+    def schedule_test_state_reset(
+        self, sender_key: str, expected_updated_at: int, reset_at: int
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +145,7 @@ class GatekeeperService:
         outbound_limit_per_hour: int = 10,
         review_retention_days: int = 7,
         denylist: frozenset[str] = frozenset(),
+        test_sender_id: int | None = None,
         challenge_factory=new_challenge,
         clock=lambda: int(time.time()),
     ) -> None:
@@ -144,6 +156,10 @@ class GatekeeperService:
         self.outbound_limit_per_hour = outbound_limit_per_hour
         self.review_retention_days = min(review_retention_days, 7)
         self.denylist = denylist
+        self.test_sender_id = test_sender_id
+        self.test_sender_key = (
+            protector.sender_key(test_sender_id) if test_sender_id is not None else None
+        )
         self.challenge_factory = challenge_factory
         self.clock = clock
         self.sender_locks = SenderLockPool()
@@ -160,13 +176,26 @@ class GatekeeperService:
         self, sender_key: str, message: IncomingMessage, actions: MessageActions
     ) -> str:
         now = self.clock()
+        is_test_sender = sender_key == self.test_sender_key
         if not self.store.claim_message(sender_key, message.message_id, now):
             return "duplicate"
 
         outcome = "fail_safe"
         try:
             state = self.store.sender(sender_key)
-            if message.is_service or message.is_bot or message.is_contact:
+            if is_test_sender and state.status == "allowed":
+                self.store.revoke(sender_key, now)
+                state = self.store.sender(sender_key)
+            elif (
+                is_test_sender
+                and state.status in {"provisional", "quarantined"}
+                and state.updated_at + TEST_STATE_RESET_DELAY_SECONDS <= now
+            ):
+                self.store.reset_test_sender(sender_key, state.updated_at, now)
+                state = self.store.sender(sender_key)
+            if not is_test_sender and (
+                message.is_service or message.is_bot or message.is_contact
+            ):
                 self.store.allow(sender_key, now)
                 self.store.audit(sender_key, "TRUSTED_SENDER", "allowed", now)
                 outcome = "allowed"
@@ -174,7 +203,11 @@ class GatekeeperService:
             if state.status == "allowed":
                 outcome = "allowed"
                 return outcome
-            if state.status in {"unknown", "provisional"} and message.has_trusted_history:
+            if (
+                not is_test_sender
+                and state.status in {"unknown", "provisional"}
+                and message.has_trusted_history
+            ):
                 self.store.allow(sender_key, now)
                 self.store.audit(sender_key, "TRUSTED_HISTORY", "allowed", now)
                 outcome = "allowed"
@@ -195,7 +228,7 @@ class GatekeeperService:
             if message.facts.has_link:
                 self.store.record_link_message(sender_key, now)
 
-            if decision.hard_spam:
+            if decision.hard_spam and not is_test_sender:
                 for rule in decision.rule_codes:
                     self.store.audit(sender_key, rule, "matched", now)
                 if state.status == "challenged":
@@ -222,7 +255,7 @@ class GatekeeperService:
                 )
                 return outcome
 
-            if self.store.get_mode() == "observe":
+            if self.store.get_mode() == "observe" and not is_test_sender:
                 self.store.audit(sender_key, "CHALLENGE_REQUIRED", "observed", now)
                 outcome = "would_challenge"
                 self._enqueue_review(sender_key, message, outcome, (), now)
@@ -244,7 +277,7 @@ class GatekeeperService:
         actions: MessageActions,
         now: int,
     ) -> str:
-        if not self.store.claim_outbound_slot(self.outbound_limit_per_hour, now):
+        if not self._claim_outbound_slot(sender_key, now):
             return await self._rate_limit_fallback(sender_key, message, actions, now)
 
         challenge = self.challenge_factory()
@@ -378,6 +411,7 @@ class GatekeeperService:
             self.store.quarantine(sender_key, now)
             self.store.audit(sender_key, "challenge_expired", "already_archived", now)
             actions.cancel_timeout(sender_key)
+            await self._finalize_test_failure(sender_key, state, actions, now)
             return "quarantined"
 
         if message.reply_to_message_id != state.challenge_message_id:
@@ -416,6 +450,10 @@ class GatekeeperService:
                 now,
                 reply_to_message_id=message.message_id,
             )
+            if sender_key == self.test_sender_key:
+                actions.schedule_test_state_reset(
+                    sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
+                )
             return "provisional"
 
         attempts = self.store.increment_attempts(sender_key, now)
@@ -424,6 +462,7 @@ class GatekeeperService:
             self.store.quarantine(sender_key, now)
             self.store.audit(sender_key, "attempts_exhausted", "already_archived", now)
             actions.cancel_timeout(sender_key)
+            await self._finalize_test_failure(sender_key, state, actions, now)
             return "quarantined"
         remaining = self.challenge_max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
@@ -464,7 +503,7 @@ class GatekeeperService:
         *,
         reply_to_message_id: int | None = None,
     ) -> bool:
-        if not self.store.claim_outbound_slot(self.outbound_limit_per_hour, now):
+        if not self._claim_outbound_slot(sender_key, now):
             self.store.audit(sender_key, "OUTBOUND_RATE_LIMIT", "suppressed", now)
             return False
         try:
@@ -477,17 +516,70 @@ class GatekeeperService:
             self.store.audit(sender_key, "OUTBOUND_NOTICE", "action_failed", now)
             return False
 
+    def _claim_outbound_slot(self, sender_key: str, now: int) -> bool:
+        return sender_key == self.test_sender_key or self.store.claim_outbound_slot(
+            self.outbound_limit_per_hour, now
+        )
+
+    async def _finalize_test_failure(
+        self,
+        sender_key: str,
+        challenge_state: SenderState,
+        actions: MessageActions,
+        now: int,
+    ) -> None:
+        if sender_key != self.test_sender_key:
+            return
+        await self._send_notice(sender_key, actions, VERIFICATION_FAILED_TEXT, now)
+        challenge_started_at = (
+            challenge_state.challenge_expires_at - self.challenge_ttl_seconds
+            if challenge_state.challenge_expires_at is not None
+            else challenge_state.updated_at
+        )
+        actions.schedule_test_message_deletion(
+            sender_key,
+            challenge_started_at,
+            now + TEST_MESSAGE_DELETE_DELAY_SECONDS,
+        )
+        actions.schedule_test_state_reset(
+            sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
+        )
+
     async def expire_challenge(
-        self, sender_key: str, expires_at: int, *, now: int | None = None
+        self,
+        sender_key: str,
+        expires_at: int,
+        *,
+        now: int | None = None,
+        actions: MessageActions | None = None,
     ) -> bool:
         async with self.sender_lock(sender_key):
             timestamp = self.clock() if now is None else now
+            state = self.store.sender(sender_key)
             expired = self.store.expire_challenge(sender_key, expires_at, timestamp)
             if expired:
                 self.store.audit(
                     sender_key, "CHALLENGE_TIMEOUT", "already_archived", timestamp
                 )
+                if actions is not None:
+                    await self._finalize_test_failure(
+                        sender_key, state, actions, timestamp
+                    )
             return expired
+
+    async def reset_test_sender(
+        self, sender_key: str, expected_updated_at: int, *, now: int | None = None
+    ) -> bool:
+        if sender_key != self.test_sender_key:
+            return False
+        async with self.sender_lock(sender_key):
+            timestamp = self.clock() if now is None else now
+            reset = self.store.reset_test_sender(
+                sender_key, expected_updated_at, timestamp
+            )
+            if reset:
+                self.store.audit(sender_key, "TEST_STATE_RESET", "unknown", timestamp)
+            return reset
 
     async def recover_incomplete_challenge(
         self,

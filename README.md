@@ -118,6 +118,14 @@ key inside the container, but the raw ID supplied on the command line may still 
 `allow` refuses senders with an active/incomplete challenge or a Gatekeeper quarantine because the
 CLI cannot restore Telegram state; resolve those senders as **Legitimate** in the review dashboard.
 
+For repeated arithmetic-flow testing, `TG_TEST_SENDER_ID` may name one dedicated Telegram account.
+That account always follows the real challenge path, even in observation mode or when it is a
+contact with prior outgoing history, and its test notices do not consume the global outbound quota.
+After a pass, its sender state resets to unknown after 60 seconds. After final failure or timeout,
+Gatekeeper sends a failure notice, keeps the dialog archived and muted, deletes only the messages
+recorded for that challenge after 10 seconds, and resets the sender state after 60 seconds. Leave the
+setting empty in normal deployments.
+
 See [SECURITY.md](SECURITY.md) before reporting a security issue,
 [docs/architecture.md](docs/architecture.md) for the design, and
 [docs/deployment.md](docs/deployment.md) for the hardened deployment procedure. Release and

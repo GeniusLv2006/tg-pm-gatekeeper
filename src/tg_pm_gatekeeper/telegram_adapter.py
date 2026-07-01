@@ -13,7 +13,12 @@ from telethon.sessions import StringSession
 from .config import ConfigurationError, Settings, read_private_file
 from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
-from .service import GatekeeperService, IncomingMessage
+from .service import (
+    TEST_MESSAGE_DELETE_DELAY_SECONDS,
+    TEST_STATE_RESET_DELAY_SECONDS,
+    GatekeeperService,
+    IncomingMessage,
+)
 from .store import StateStore
 
 
@@ -34,6 +39,7 @@ GATEKEEPER_MESSAGE_PREFIXES = (
     "Reply with digits only.",
     "Incorrect answer.",
     "Verification passed.",
+    "Verification failed.",
 )
 
 
@@ -210,10 +216,29 @@ class TelegramActions:
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
     ) -> None:
-        self.adapter.schedule_timeout(sender_key, expires_at, grace_seconds=grace_seconds)
+        self.adapter.schedule_timeout(
+            sender_key,
+            expires_at,
+            grace_seconds=grace_seconds,
+            peer=self.peer,
+        )
 
     def cancel_timeout(self, sender_key: str) -> None:
         self.adapter.cancel_timeout(sender_key)
+
+    def schedule_test_message_deletion(
+        self, sender_key: str, since: int, delete_at: int
+    ) -> None:
+        self.adapter.schedule_test_message_deletion(
+            self.peer, sender_key, since, delete_at
+        )
+
+    def schedule_test_state_reset(
+        self, sender_key: str, expected_updated_at: int, reset_at: int
+    ) -> None:
+        self.adapter.schedule_test_state_reset(
+            sender_key, expected_updated_at, reset_at
+        )
 
 
 class TelegramAdapter:
@@ -235,6 +260,7 @@ class TelegramAdapter:
             receive_updates=True,
         )
         self._timeout_tasks: dict[str, asyncio.Task] = {}
+        self._maintenance_tasks: set[asyncio.Task] = set()
         self._heartbeat_task: asyncio.Task | None = None
         self._review_admin = ReviewAdminServer(
             settings.review_socket_path,
@@ -251,6 +277,7 @@ class TelegramAdapter:
             raise RuntimeError("telegram session is not authorized")
         await self.client.get_me()
         await self._recover_challenges()
+        await self._recover_test_sender_cleanup()
         await self._review_admin.start()
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
@@ -263,6 +290,8 @@ class TelegramAdapter:
             if self._heartbeat_task:
                 self._heartbeat_task.cancel()
             for task in self._timeout_tasks.values():
+                task.cancel()
+            for task in self._maintenance_tasks:
                 task.cancel()
             await self._review_admin.stop()
             await self.client.disconnect()
@@ -290,7 +319,8 @@ class TelegramAdapter:
             state = self.store.sender(sender_key)
             trusted_history = False
             if (
-                state.status in {"unknown", "provisional"}
+                sender_id != self.settings.test_sender_id
+                and state.status in {"unknown", "provisional"}
                 and not getattr(sender, "bot", False)
                 and not getattr(sender, "contact", False)
                 and sender_id not in SERVICE_USER_IDS
@@ -352,11 +382,23 @@ class TelegramAdapter:
         for sender_key, state in self.store.challenge_states():
             if state.status == "challenged":
                 if state.challenge_expires_at is not None:
+                    peer = None
+                    if (
+                        self.settings.test_sender_id is not None
+                        and sender_key == self.service.test_sender_key
+                    ):
+                        try:
+                            peer = await self.client.get_input_entity(
+                                self.settings.test_sender_id
+                            )
+                        except Exception:
+                            LOG.error("test_sender_resolution_failed")
                     self.schedule_timeout(
                         sender_key,
                         state.challenge_expires_at,
                         grace_seconds=30,
-                        minimum_delay_seconds=30,
+                        minimum_delay_seconds=0 if peer is not None else 30,
+                        peer=peer,
                     )
                 continue
             reference = state.challenge_action_reference
@@ -395,6 +437,39 @@ class TelegramAdapter:
                 recovered_message_id=recovered_message_id,
             )
 
+    async def _recover_test_sender_cleanup(self) -> None:
+        sender_id = self.settings.test_sender_id
+        sender_key = self.service.test_sender_key
+        if sender_id is None or sender_key is None:
+            return
+        state = self.store.sender(sender_key)
+        if state.status not in {"provisional", "quarantined"}:
+            return
+        if state.status == "quarantined":
+            try:
+                peer = await self.client.get_input_entity(sender_id)
+            except Exception:
+                LOG.error("test_sender_resolution_failed")
+            else:
+                challenge_started_at = self.store.latest_challenge_started_at(
+                    sender_key, state.updated_at
+                )
+                if challenge_started_at is None:
+                    challenge_started_at = (
+                        state.updated_at - self.settings.challenge_ttl_seconds
+                    )
+                self.schedule_test_message_deletion(
+                    peer,
+                    sender_key,
+                    challenge_started_at,
+                    state.updated_at + TEST_MESSAGE_DELETE_DELAY_SECONDS,
+                )
+        self.schedule_test_state_reset(
+            sender_key,
+            state.updated_at,
+            state.updated_at + TEST_STATE_RESET_DELAY_SECONDS,
+        )
+
     def schedule_timeout(
         self,
         sender_key: str,
@@ -402,6 +477,7 @@ class TelegramAdapter:
         *,
         grace_seconds: int = 5,
         minimum_delay_seconds: int = 0,
+        peer=None,
     ) -> None:
         self.cancel_timeout(sender_key)
         self._timeout_tasks[sender_key] = asyncio.create_task(
@@ -410,6 +486,7 @@ class TelegramAdapter:
                 expires_at,
                 grace_seconds,
                 minimum_delay_seconds,
+                peer,
             )
         )
 
@@ -424,6 +501,7 @@ class TelegramAdapter:
         expires_at: int,
         grace_seconds: int,
         minimum_delay_seconds: int,
+        peer,
     ) -> None:
         try:
             await asyncio.sleep(
@@ -432,7 +510,12 @@ class TelegramAdapter:
                     expires_at + grace_seconds - int(time.time()),
                 )
             )
-            await self.service.expire_challenge(sender_key, expires_at)
+            actions = (
+                TelegramActions(self, peer, sender_key) if peer is not None else None
+            )
+            await self.service.expire_challenge(
+                sender_key, expires_at, actions=actions
+            )
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -440,3 +523,48 @@ class TelegramAdapter:
         finally:
             if self._timeout_tasks.get(sender_key) is asyncio.current_task():
                 self._timeout_tasks.pop(sender_key, None)
+
+    def _track_maintenance_task(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._maintenance_tasks.add(task)
+        task.add_done_callback(self._maintenance_tasks.discard)
+
+    def schedule_test_message_deletion(
+        self, peer, sender_key: str, since: int, delete_at: int
+    ) -> None:
+        self._track_maintenance_task(
+            self._test_message_deletion_worker(peer, sender_key, since, delete_at)
+        )
+
+    async def _test_message_deletion_worker(
+        self, peer, sender_key: str, since: int, delete_at: int
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, delete_at - int(time.time())))
+            message_ids = self.store.message_ids_since(sender_key, since)
+            if message_ids:
+                await self.client.delete_messages(peer, message_ids, revoke=True)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOG.error("test_message_deletion_failed")
+
+    def schedule_test_state_reset(
+        self, sender_key: str, expected_updated_at: int, reset_at: int
+    ) -> None:
+        self._track_maintenance_task(
+            self._test_state_reset_worker(
+                sender_key, expected_updated_at, reset_at
+            )
+        )
+
+    async def _test_state_reset_worker(
+        self, sender_key: str, expected_updated_at: int, reset_at: int
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, reset_at - int(time.time())))
+            await self.service.reset_test_sender(sender_key, expected_updated_at)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOG.error("test_state_reset_failed")
