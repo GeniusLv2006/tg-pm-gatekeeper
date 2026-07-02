@@ -15,7 +15,9 @@ from tg_pm_gatekeeper.service import (
     Challenge,
     GatekeeperService,
     IncomingMessage,
+    TextStyleSpan,
     challenge_prompt,
+    challenge_prompt_formatting,
     new_challenge,
 )
 from tg_pm_gatekeeper.store import StateStore
@@ -33,10 +35,12 @@ class FakeActions:
         send_success: bool = True,
     ) -> None:
         self.sent: list[tuple[str, int | None]] = []
+        self.formattings: list[tuple[TextStyleSpan, ...]] = []
         self.quarantines = 0
         self.scheduled: list[tuple[str, int, int]] = []
         self.cancelled: list[str] = []
         self.deletions: list[tuple[str, int, int]] = []
+        self.deleted_messages: list[int] = []
         self.resets: list[tuple[str, int, int]] = []
         self.restores = 0
         self.archive_success = archive_success
@@ -45,9 +49,14 @@ class FakeActions:
         self.next_message_id = 100
         self.send_started: asyncio.Event | None = None
         self.release_send: asyncio.Event | None = None
+        self.after_send = None
 
     async def send_text(
-        self, text: str, *, reply_to_message_id: int | None = None
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        formatting: tuple[TextStyleSpan, ...] = (),
     ) -> int:
         if self.send_started is not None:
             self.send_started.set()
@@ -56,6 +65,9 @@ class FakeActions:
         if not self.send_success:
             raise RuntimeError("send failed")
         self.sent.append((text, reply_to_message_id))
+        self.formattings.append(formatting)
+        if self.after_send is not None:
+            self.after_send()
         message_id = self.next_message_id
         self.next_message_id += 1
         return message_id
@@ -67,6 +79,10 @@ class FakeActions:
     async def restore_from_pending(self) -> bool:
         self.restores += 1
         return self.restore_success
+
+    async def delete_message(self, message_id: int) -> bool:
+        self.deleted_messages.append(message_id)
+        return True
 
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
@@ -106,10 +122,18 @@ class BarrierActions(FakeActions):
         self.barrier = barrier
 
     async def send_text(
-        self, text: str, *, reply_to_message_id: int | None = None
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        formatting: tuple[TextStyleSpan, ...] = (),
     ) -> int:
         await self.barrier.wait()
-        return await super().send_text(text, reply_to_message_id=reply_to_message_id)
+        return await super().send_text(
+            text,
+            reply_to_message_id=reply_to_message_id,
+            formatting=formatting,
+        )
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -179,6 +203,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         one_second = challenge_prompt(Challenge("id", "56", "8 × 7 = ?"), 1)
         self.assertIn("within 1 second", one_second)
 
+    def test_legacy_recovery_prompt_keeps_safe_title_formatting(self) -> None:
+        legacy = (
+            "Verification required\n\nPlease reply directly to this message within "
+            "1 minute using Telegram's Reply action.\nSend only the answer: "
+            "8 × 7 = ?\nA separate message will not be accepted."
+        )
+        spans = challenge_prompt_formatting(legacy)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(
+            legacy[spans[0].offset : spans[0].offset + spans[0].length],
+            "Verification required",
+        )
+
     def test_challenge_generator_covers_bounded_operation_families(self) -> None:
         cases = (
             ([0, 0, 23], "2 + 25 = ?", "27"),
@@ -222,6 +259,29 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions.quarantines, 0)
         self.assertNotIn(b"private-message-canary", self.database_path.read_bytes())
 
+    async def test_promotional_webpage_preview_is_quarantined_in_enforce_mode(
+        self,
+    ) -> None:
+        self.store.set_mode("enforce")
+        actions = FakeActions()
+        outcome = await self.service.handle(
+            self.message(
+                1,
+                text="T.me/+invite",
+                facts=MessageFacts(
+                    text="T.me/+invite",
+                    preview_text="汇盈社区 高返70% 合约跟单 免费跟单，交易所返佣",
+                    urls=("https://t.me/+invite",),
+                    domains=("t.me",),
+                ),
+            ),
+            actions,
+        )
+        self.assertEqual(outcome, "quarantined")
+        self.assertEqual(actions.quarantines, 1)
+        sender_key = self.protector.sender_key(123456789)
+        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+
     async def test_challenge_prompt_requires_reply_and_passes_to_provisional(self) -> None:
         self.store.set_mode("enforce")
         actions = FakeActions()
@@ -229,11 +289,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.handle(self.message(1), actions), "challenged"
         )
         prompt = actions.sent[0][0]
-        self.assertIn("Verification required", prompt)
+        self.assertIn("⚠️ Verification Required", prompt)
         self.assertIn("within 1 minute", prompt)
-        self.assertIn("Telegram's Reply action", prompt)
-        self.assertIn("Send only the answer: 7 + 5 = ?", prompt)
-        self.assertIn("A separate message will not be accepted.", prompt)
+        self.assertIn("Answer: 7 + 5 = ?", prompt)
+        self.assertIn("Attempts allowed: 2", prompt)
+        self.assertIn("Long-press this message, choose Reply", prompt)
+        formatted_fragments = {
+            prompt[span.offset : span.offset + span.length]
+            for span in actions.formattings[0]
+        }
+        self.assertEqual(
+            formatted_fragments,
+            {"⚠️ Verification Required", "1 minute", "7 + 5 = ?", "2"},
+        )
         self.assertEqual(
             await self.service.handle(
                 self.message(2, "12", reply_to_message_id=100), actions
@@ -244,6 +312,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "provisional")
         self.assertEqual(actions.restores, 1)
         self.assertIn("conversation has been restored", actions.sent[-1][0])
+
+    async def test_challenge_ttl_starts_after_prompt_delivery(self) -> None:
+        self.store.set_mode("enforce")
+        actions = FakeActions()
+        actions.after_send = lambda: setattr(self, "now", 1_010)
+        self.assertEqual(
+            await self.service.handle(self.message(1), actions), "challenged"
+        )
+        sender_key = self.protector.sender_key(123456789)
+        self.assertEqual(self.store.sender(sender_key).challenge_expires_at, 1_070)
+        self.assertEqual(actions.scheduled[0][1:], (1_070, 30))
 
     async def test_dedicated_test_sender_always_challenges_and_resets_after_pass(
         self,
@@ -361,7 +440,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(outcome, "challenge_pending")
         self.assertEqual(self.store.sender(sender_key).attempts, 0)
-        self.assertEqual([text for text, _ in actions.sent], [DIGITS_REQUIRED_TEXT] * 2)
+        self.assertEqual([text for text, _ in actions.sent], [DIGITS_REQUIRED_TEXT])
         self.assertNotIn("12", DIGITS_REQUIRED_TEXT)
 
     async def test_fullwidth_digits_and_leading_zero_are_canonicalized(self) -> None:
@@ -434,6 +513,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.status, "unknown")
         self.assertIsNone(state.challenge_message_id)
         self.assertEqual(actions.scheduled, [])
+        self.assertEqual(actions.deleted_messages, [100])
 
     async def test_activation_error_restores_archive_before_reset(self) -> None:
         self.store.set_mode("enforce")
@@ -458,7 +538,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await self.service.handle(self.message(1), actions)
         self.assertEqual(outcome, "fail_safe")
-        self.assertEqual(actions.restores, 1)
+        self.assertEqual(actions.restores, 3)
         self.assertEqual(
             self.store.sender(sender_key).status, "challenge_archiving"
         )
@@ -535,7 +615,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         second = asyncio.create_task(self.service.handle(self.message(2), actions))
         actions.release_send.set()
         outcomes = await asyncio.gather(first, second)
-        prompts = [text for text, _ in actions.sent if text.startswith("Verification required")]
+        prompts = [
+            text
+            for text, _ in actions.sent
+            if text.startswith("⚠️ Verification Required")
+        ]
         self.assertEqual(len(prompts), 1)
         self.assertEqual(outcomes[0], "challenged")
         self.assertEqual(outcomes[1], "challenge_pending")
@@ -639,14 +723,62 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recovered)
         self.assertEqual(self.store.sender(sender_key).status, "unknown")
 
+    async def test_expired_recovery_deletes_stale_prompt(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        digest = self.protector.answer_digest(sender_key, "challenge", "12")
+        self.store.begin_challenge_issue(
+            sender_key,
+            "challenge",
+            digest,
+            self.now - 1,
+            "⚠️ Verification Required",
+            None,
+            self.now - 60,
+        )
+        actions = FakeActions()
+        self.assertFalse(
+            await self.service.recover_incomplete_challenge(
+                sender_key, actions, recovered_message_id=88
+            )
+        )
+        self.assertEqual(actions.deleted_messages, [88])
+        self.assertEqual(self.store.sender(sender_key).status, "unknown")
+
     async def test_restore_failure_keeps_active_challenge(self) -> None:
         sender_key = self.set_active_challenge()
+        reference = self.protector.seal_review_reference(123456789, 456, 2)
+        actions = FakeActions(restore_success=False)
         outcome = await self.service.handle(
-            self.message(2, "12", reply_to_message_id=100),
-            FakeActions(restore_success=False),
+            self.message(
+                2,
+                "12",
+                reply_to_message_id=100,
+                review_reference=reference,
+            ),
+            actions,
         )
         self.assertEqual(outcome, "fail_safe")
         self.assertEqual(self.store.sender(sender_key).status, "challenged")
+        self.assertEqual(
+            self.store.review_items()[0].classification, "restore_failed"
+        )
+        self.assertEqual(actions.restores, 3)
+
+    async def test_failed_reply_guidance_can_retry(self) -> None:
+        sender_key = self.set_active_challenge()
+        actions = FakeActions(send_success=False)
+        self.assertEqual(
+            await self.service.handle(self.message(2, "12"), actions),
+            "challenge_pending",
+        )
+        self.assertFalse(self.store.sender(sender_key).guidance_sent)
+        actions.send_success = True
+        self.assertEqual(
+            await self.service.handle(self.message(3, "12"), actions),
+            "challenge_pending",
+        )
+        self.assertTrue(self.store.sender(sender_key).guidance_sent)
+        self.assertEqual([text for text, _ in actions.sent], [REPLY_REQUIRED_TEXT])
 
     async def test_duplicate_message_has_no_second_action(self) -> None:
         self.store.set_mode("enforce")

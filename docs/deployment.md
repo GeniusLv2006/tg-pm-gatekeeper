@@ -150,6 +150,11 @@ If challenge delivery is suppressed by the global outbound limit, enforcement ar
 the dialog and adds it to this queue. Marking it Legitimate restores it; Spam keeps the existing
 quarantine without repeating Telegram actions; Dismiss leaves the quarantine unchanged.
 
+Challenge configuration is bounded at startup: TTL must be 30–600 seconds, attempts 1–5, and the
+global outbound limit 1–100 messages per hour. `status` reports privacy-safe seven-day challenge
+funnel counters alongside sender-state totals. These counters never include raw sender identifiers or
+message content.
+
 All three decisions apply to the sender's pending review, erase the encrypted Telegram reference
 immediately, and return to the queue. Pending references expire after the configured retention,
 which has a hard maximum of seven days. Stop the SSH command when review is complete; do not publish

@@ -10,7 +10,7 @@ import unicodedata
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from .crypto import IdentifierProtector
 from .rules import MessageFacts, evaluate_hard_rules
@@ -19,17 +19,20 @@ from .store import SenderState, StateStore
 
 LOG = logging.getLogger("gatekeeper.service")
 DIGITS_RE = re.compile(r"^[0-9]+$")
-CHALLENGE_PROCESSING_GRACE_SECONDS = 5
+CHALLENGE_PROCESSING_GRACE_SECONDS = 30
+RESTORE_RETRY_DELAYS_SECONDS = (0.0, 0.1, 0.5)
 REPLY_REQUIRED_TEXT = (
-    "Please use Telegram's Reply action on the verification message, then send "
-    "only the answer. This did not use an attempt."
+    "Reply required\n\nLong-press the verification message, choose Reply, and "
+    "send only the answer. No attempt was used."
 )
-DIGITS_REQUIRED_TEXT = "Reply with digits only. This did not use an attempt."
+DIGITS_REQUIRED_TEXT = (
+    "Digits only\n\nReply with digits only. No attempt was used."
+)
 VERIFICATION_PASSED_TEXT = (
-    "Verification passed. This conversation has been restored."
+    "Verification passed\n\nThis conversation has been restored."
 )
 VERIFICATION_FAILED_TEXT = (
-    "Verification failed. This conversation has been archived and muted."
+    "Verification failed\n\nThis conversation remains archived and muted."
 )
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
@@ -37,10 +40,15 @@ TEST_STATE_RESET_DELAY_SECONDS = 60
 
 class MessageActions(Protocol):
     async def send_text(
-        self, text: str, *, reply_to_message_id: int | None = None
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        formatting: tuple["TextStyleSpan", ...] = (),
     ) -> int: ...
     async def archive_and_mute(self) -> bool: ...
     async def restore_from_pending(self) -> bool: ...
+    async def delete_message(self, message_id: int) -> bool: ...
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
     ) -> None: ...
@@ -75,6 +83,23 @@ class Challenge:
     expression: str
 
 
+@dataclass(frozen=True, slots=True)
+class TextStyleSpan:
+    offset: int
+    length: int
+    style: Literal["bold", "italic", "code"] = "bold"
+
+
+def emphasized(text: str, *fragments: str) -> tuple[TextStyleSpan, ...]:
+    spans: list[TextStyleSpan] = []
+    search_from = 0
+    for fragment in fragments:
+        offset = text.index(fragment, search_from)
+        spans.append(TextStyleSpan(offset, len(fragment)))
+        search_from = offset + len(fragment)
+    return tuple(spans)
+
+
 def new_challenge(
     randbelow: Callable[[int], int] = secrets.randbelow,
     token_hex: Callable[[int], str] = secrets.token_hex,
@@ -98,19 +123,50 @@ def new_challenge(
     return Challenge(token_hex(16), str(answer), expression)
 
 
-def challenge_prompt(challenge: Challenge, ttl_seconds: int) -> str:
+def challenge_prompt(
+    challenge: Challenge, ttl_seconds: int, max_attempts: int = 2
+) -> str:
     if ttl_seconds == 60:
         duration = "1 minute"
     else:
         unit = "second" if ttl_seconds == 1 else "seconds"
         duration = f"{ttl_seconds} {unit}"
+    attempts = str(max_attempts)
     return (
-        "Verification required\n\n"
-        f"Please reply directly to this message within {duration} using Telegram's "
-        "Reply action.\n"
-        f"Send only the answer: {challenge.expression}\n"
-        "A separate message will not be accepted."
+        "⚠️ Verification Required\n\n"
+        f"Reply to this message within {duration}.\n\n"
+        f"Answer: {challenge.expression}\n"
+        f"Attempts allowed: {attempts}\n\n"
+        "Long-press this message, choose Reply, and send digits only."
     )
+
+
+def challenge_prompt_formatting(prompt: str) -> tuple[TextStyleSpan, ...]:
+    lines = prompt.splitlines()
+    if (
+        len(lines) < 6
+        or not lines[2].startswith("Reply to this message within ")
+        or not lines[4].startswith("Answer: ")
+        or not lines[5].startswith("Attempts allowed: ")
+    ):
+        return emphasized(prompt, lines[0]) if lines else ()
+    duration = (
+        lines[2].removeprefix("Reply to this message within ").removesuffix(".")
+    )
+    expression = lines[4].removeprefix("Answer: ")
+    attempts = lines[5].removeprefix("Attempts allowed: ")
+    return emphasized(
+        prompt,
+        "⚠️ Verification Required",
+        duration,
+        expression,
+        attempts,
+    )
+
+
+def notice_formatting(text: str) -> tuple[TextStyleSpan, ...]:
+    title = text.partition("\n")[0]
+    return emphasized(text, title)
 
 
 def canonical_answer(text: str) -> str | None:
@@ -281,7 +337,9 @@ class GatekeeperService:
             return await self._rate_limit_fallback(sender_key, message, actions, now)
 
         challenge = self.challenge_factory()
-        prompt = challenge_prompt(challenge, self.challenge_ttl_seconds)
+        prompt = challenge_prompt(
+            challenge, self.challenge_ttl_seconds, self.challenge_max_attempts
+        )
         expires_at = now + self.challenge_ttl_seconds
         digest = self.protector.answer_digest(
             sender_key, challenge.challenge_id, challenge.answer
@@ -296,34 +354,52 @@ class GatekeeperService:
             now,
         )
         archive_confirmed = False
+        challenge_message_id: int | None = None
         try:
-            challenge_message_id = await actions.send_text(prompt)
+            challenge_message_id = await actions.send_text(
+                prompt,
+                formatting=challenge_prompt_formatting(prompt),
+            )
             self.store.record_automated_message(
                 sender_key, challenge_message_id, self.clock()
             )
+            sent_at = self.clock()
+            expires_at = sent_at + self.challenge_ttl_seconds
+            if not self.store.refresh_challenge_expiry(
+                sender_key, expires_at, sent_at
+            ):
+                await actions.delete_message(challenge_message_id)
+                self.store.reset_incomplete_challenge(sender_key, self.clock())
+                self.store.audit(sender_key, "CHALLENGE_EXPIRY", "state_changed", now)
+                return "fail_safe"
             if not self.store.bind_challenge_message(
                 sender_key, challenge_message_id, self.clock()
             ):
+                await actions.delete_message(challenge_message_id)
                 self.store.reset_incomplete_challenge(sender_key, self.clock())
                 self.store.audit(sender_key, "CHALLENGE_BIND", "state_changed", now)
                 return "fail_safe"
             if not await actions.archive_and_mute():
+                await actions.delete_message(challenge_message_id)
                 self.store.reset_incomplete_challenge(sender_key, self.clock())
                 actions.cancel_timeout(sender_key)
                 self.store.audit(sender_key, "PENDING_QUARANTINE", "action_failed", now)
                 return "fail_safe"
             archive_confirmed = True
             if not self.store.activate_challenge(sender_key, self.clock()):
+                restored = await self._restore_with_retry(actions)
+                if restored:
+                    await actions.delete_message(challenge_message_id)
+                    self.store.reset_incomplete_challenge(sender_key, self.clock())
                 self.store.audit(sender_key, "CHALLENGE_ACTIVATE", "state_changed", now)
                 return "fail_safe"
         except Exception:
             restored = False
             if archive_confirmed:
-                try:
-                    restored = await actions.restore_from_pending()
-                except Exception:
-                    restored = False
+                restored = await self._restore_with_retry(actions)
             if not archive_confirmed or restored:
+                if challenge_message_id is not None:
+                    await actions.delete_message(challenge_message_id)
                 self.store.reset_incomplete_challenge(sender_key, self.clock())
             actions.cancel_timeout(sender_key)
             rollback = "restored" if restored else "action_failed"
@@ -416,19 +492,25 @@ class GatekeeperService:
 
         if message.reply_to_message_id != state.challenge_message_id:
             await self._send_guidance_once(
-                sender_key, state, actions, REPLY_REQUIRED_TEXT, now
+                sender_key,
+                state,
+                actions,
+                REPLY_REQUIRED_TEXT,
+                now,
+                formatting=notice_formatting(REPLY_REQUIRED_TEXT),
             )
             self.store.audit(sender_key, "CHALLENGE_WRONG_REPLY_TARGET", "ignored", now)
             return "challenge_pending"
 
         answer = canonical_answer(message.text)
         if answer is None:
-            await self._send_notice(
+            await self._send_guidance_once(
                 sender_key,
+                state,
                 actions,
                 DIGITS_REQUIRED_TEXT,
                 now,
-                reply_to_message_id=state.challenge_message_id,
+                formatting=notice_formatting(DIGITS_REQUIRED_TEXT),
             )
             self.store.audit(sender_key, "CHALLENGE_NON_NUMERIC", "ignored", now)
             return "challenge_pending"
@@ -437,8 +519,9 @@ class GatekeeperService:
             sender_key, state.challenge_id or "", answer
         )
         if state.answer_digest and self.protector.matches(state.answer_digest, actual):
-            if not await actions.restore_from_pending():
+            if not await self._restore_with_retry(actions):
                 self.store.audit(sender_key, "CHALLENGE_RESTORE", "action_failed", now)
+                self._enqueue_review(sender_key, message, "restore_failed", (), now)
                 return "fail_safe"
             self.store.mark_provisional(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
@@ -449,6 +532,7 @@ class GatekeeperService:
                 VERIFICATION_PASSED_TEXT,
                 now,
                 reply_to_message_id=message.message_id,
+                formatting=notice_formatting(VERIFICATION_PASSED_TEXT),
             )
             if sender_key == self.test_sender_key:
                 actions.schedule_test_state_reset(
@@ -466,13 +550,19 @@ class GatekeeperService:
             return "quarantined"
         remaining = self.challenge_max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
+        incorrect_text = (
+            "Incorrect answer\n\nReply to the same verification message with "
+            f"digits only. {remaining} {noun} remaining."
+        )
         await self._send_notice(
             sender_key,
             actions,
-            "Incorrect answer. Reply to the same verification message with digits "
-            f"only. {remaining} {noun} remaining.",
+            incorrect_text,
             now,
             reply_to_message_id=state.challenge_message_id,
+            formatting=emphasized(
+                incorrect_text, "Incorrect answer", f"{remaining} {noun} remaining"
+            ),
         )
         return "challenge_incorrect"
 
@@ -483,16 +573,32 @@ class GatekeeperService:
         actions: MessageActions,
         text: str,
         now: int,
+        *,
+        formatting: tuple[TextStyleSpan, ...] = (),
     ) -> None:
-        if state.guidance_sent or not self.store.claim_challenge_guidance(sender_key):
+        if state.guidance_sent:
             return
-        await self._send_notice(
+        sent = await self._send_notice(
             sender_key,
             actions,
             text,
             now,
             reply_to_message_id=state.challenge_message_id,
+            formatting=formatting,
         )
+        if sent:
+            self.store.mark_challenge_guidance_sent(sender_key)
+
+    async def _restore_with_retry(self, actions: MessageActions) -> bool:
+        for delay in RESTORE_RETRY_DELAYS_SECONDS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                if await actions.restore_from_pending():
+                    return True
+            except Exception:
+                pass
+        return False
 
     async def _send_notice(
         self,
@@ -502,13 +608,16 @@ class GatekeeperService:
         now: int,
         *,
         reply_to_message_id: int | None = None,
+        formatting: tuple[TextStyleSpan, ...] = (),
     ) -> bool:
         if not self._claim_outbound_slot(sender_key, now):
             self.store.audit(sender_key, "OUTBOUND_RATE_LIMIT", "suppressed", now)
             return False
         try:
             message_id = await actions.send_text(
-                text, reply_to_message_id=reply_to_message_id
+                text,
+                reply_to_message_id=reply_to_message_id,
+                formatting=formatting,
             )
             self.store.record_automated_message(sender_key, message_id, self.clock())
             return True
@@ -530,7 +639,13 @@ class GatekeeperService:
     ) -> None:
         if sender_key != self.test_sender_key:
             return
-        await self._send_notice(sender_key, actions, VERIFICATION_FAILED_TEXT, now)
+        await self._send_notice(
+            sender_key,
+            actions,
+            VERIFICATION_FAILED_TEXT,
+            now,
+            formatting=notice_formatting(VERIFICATION_FAILED_TEXT),
+        )
         challenge_started_at = (
             challenge_state.challenge_expires_at - self.challenge_ttl_seconds
             if challenge_state.challenge_expires_at is not None
@@ -594,6 +709,9 @@ class GatekeeperService:
             if state.status not in {"challenge_issuing", "challenge_archiving"}:
                 return False
             if not state.challenge_expires_at or state.challenge_expires_at <= now:
+                stale_message_id = recovered_message_id or state.challenge_message_id
+                if stale_message_id is not None:
+                    await actions.delete_message(stale_message_id)
                 self.store.reset_incomplete_challenge(sender_key, now)
                 self.store.audit(sender_key, "CHALLENGE_RECOVERY", "expired_reset", now)
                 return False
@@ -604,7 +722,12 @@ class GatekeeperService:
                         self.store.reset_incomplete_challenge(sender_key, now)
                         return False
                     try:
-                        message_id = await actions.send_text(state.challenge_prompt)
+                        message_id = await actions.send_text(
+                            state.challenge_prompt,
+                            formatting=challenge_prompt_formatting(
+                                state.challenge_prompt
+                            ),
+                        )
                     except Exception:
                         self.store.reset_incomplete_challenge(sender_key, now)
                         self.store.audit(
@@ -612,15 +735,42 @@ class GatekeeperService:
                         )
                         return False
                 self.store.record_automated_message(sender_key, message_id, now)
-                if not self.store.bind_challenge_message(sender_key, message_id, now):
+                refreshed_expiry = now + self.challenge_ttl_seconds
+                if not self.store.refresh_challenge_expiry(
+                    sender_key, refreshed_expiry, now
+                ):
+                    await actions.delete_message(message_id)
+                    self.store.reset_incomplete_challenge(sender_key, now)
+                    self.store.audit(
+                        sender_key, "CHALLENGE_RECOVERY", "expiry_failed", now
+                    )
                     return False
+                if not self.store.bind_challenge_message(sender_key, message_id, now):
+                    await actions.delete_message(message_id)
+                    self.store.reset_incomplete_challenge(sender_key, now)
+                    self.store.audit(
+                        sender_key, "CHALLENGE_RECOVERY", "bind_failed", now
+                    )
+                    return False
+            else:
+                message_id = state.challenge_message_id
             if not await actions.archive_and_mute():
+                if message_id is not None:
+                    await actions.delete_message(message_id)
                 self.store.reset_incomplete_challenge(sender_key, now)
                 self.store.audit(
                     sender_key, "CHALLENGE_RECOVERY", "archive_failed", now
                 )
                 return False
             if not self.store.activate_challenge(sender_key, now):
+                restored = await self._restore_with_retry(actions)
+                if restored:
+                    if message_id is not None:
+                        await actions.delete_message(message_id)
+                    self.store.reset_incomplete_challenge(sender_key, now)
+                self.store.audit(
+                    sender_key, "CHALLENGE_RECOVERY", "activate_failed", now
+                )
                 return False
             refreshed = self.store.sender(sender_key)
             actions.schedule_timeout(

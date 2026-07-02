@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from telethon import functions, types
 
 from .service import GatekeeperService
-from .store import ReviewItem, StateStore
+from .store import DialogSnapshot, ReviewItem, StateStore
 
 
 LOG = logging.getLogger("gatekeeper.review")
@@ -183,7 +183,7 @@ class ReviewAdminServer:
             if action == "legitimate":
                 if state.status in {"challenged", "quarantined"}:
                     peer = self._peer_from_item(item)
-                    if not await self._restore(peer):
+                    if not await self._restore(peer, item.sender_key):
                         return 500, {}, self._page(
                             "Telegram action failed; item was not changed"
                         )
@@ -193,13 +193,14 @@ class ReviewAdminServer:
             elif action == "spam":
                 if state.status not in {"challenged", "quarantined"}:
                     peer = self._peer_from_item(item)
-                    if not await self._archive_and_mute(peer):
+                    if not await self._archive_and_mute(peer, item.sender_key):
                         return 500, {}, self._page(
                             "Telegram action failed; item was not changed"
                         )
                     self.store.quarantine(item.sender_key)
                 elif state.status == "challenged":
                     self.store.quarantine(item.sender_key)
+                self.store.clear_dialog_snapshot(item.sender_key)
                 self.cancel_timeout(item.sender_key)
                 self.store.decide_sender_reviews(item.sender_key, "spam")
             elif action == "dismiss":
@@ -273,9 +274,33 @@ class ReviewAdminServer:
         """
         return 200, {}, self._page(content, raw=True, refresh_seconds=30)
 
-    async def _archive_and_mute(self, peer: types.InputPeerUser) -> bool:
+    async def _archive_and_mute(
+        self, peer: types.InputPeerUser, sender_key: str
+    ) -> bool:
         archive_applied = False
         try:
+            if self.store.dialog_snapshot(sender_key) is None:
+                dialogs = await self.telegram_client(
+                    functions.messages.GetPeerDialogsRequest(
+                        [types.InputDialogPeer(peer)]
+                    )
+                )
+                if not dialogs.dialogs:
+                    raise RuntimeError("dialog state unavailable")
+                dialog = dialogs.dialogs[0]
+                mute_until = getattr(dialog.notify_settings, "mute_until", None)
+                self.store.save_dialog_snapshot(
+                    sender_key,
+                    DialogSnapshot(
+                        folder_id=getattr(dialog, "folder_id", None) or 0,
+                        silent=bool(getattr(dialog.notify_settings, "silent", False)),
+                        mute_until=(
+                            int(mute_until.timestamp())
+                            if isinstance(mute_until, datetime)
+                            else None
+                        ),
+                    ),
+                )
             await self.telegram_client(
                 functions.folders.EditPeerFoldersRequest(
                     [types.InputFolderPeer(peer=peer, folder_id=1)]
@@ -295,26 +320,35 @@ class ReviewAdminServer:
             return True
         except Exception:
             if archive_applied:
-                await self._restore(peer)
+                await self._restore(peer, sender_key)
             LOG.error("review_quarantine_failed")
             return False
 
-    async def _restore(self, peer: types.InputPeerUser) -> bool:
+    async def _restore(self, peer: types.InputPeerUser, sender_key: str) -> bool:
         try:
+            snapshot = self.store.dialog_snapshot(sender_key)
+            folder_id = snapshot.folder_id if snapshot is not None else 0
+            silent = snapshot.silent if snapshot is not None else False
+            mute_until = (
+                datetime.fromtimestamp(snapshot.mute_until, timezone.utc)
+                if snapshot is not None and snapshot.mute_until is not None
+                else datetime.now(timezone.utc)
+            )
             await self.telegram_client(
                 functions.folders.EditPeerFoldersRequest(
-                    [types.InputFolderPeer(peer=peer, folder_id=0)]
+                    [types.InputFolderPeer(peer=peer, folder_id=folder_id)]
                 )
             )
             await self.telegram_client(
                 functions.account.UpdateNotifySettingsRequest(
                     peer=types.InputNotifyPeer(peer),
                     settings=types.InputPeerNotifySettings(
-                        silent=False,
-                        mute_until=datetime.now(timezone.utc),
+                        silent=silent,
+                        mute_until=mute_until,
                     ),
                 )
             )
+            self.store.clear_dialog_snapshot(sender_key)
             return True
         except Exception:
             LOG.error("review_restore_failed")

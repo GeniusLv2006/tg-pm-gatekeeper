@@ -27,9 +27,12 @@ PROMOTION_TERMS: dict[str, tuple[str, ...]] = {
     ),
     "crypto": (
         "带单",
+        "合约跟单",
         "稳赚",
         "套利",
         "合约群",
+        "高返",
+        "返佣",
         "空投",
         "搬砖",
         "量化",
@@ -108,6 +111,7 @@ def domain_is_denied(domain: str, denylist: frozenset[str]) -> bool:
 @dataclass(frozen=True, slots=True)
 class MessageFacts:
     text: str = ""
+    preview_text: str = ""
     quote_text: str = ""
     urls: tuple[str, ...] = ()
     domains: tuple[str, ...] = ()
@@ -138,9 +142,12 @@ def evaluate_hard_rules(
 ) -> RuleDecision:
     rules: list[str] = []
     normalized = normalize_text(facts.text)
+    normalized_preview = normalize_text(facts.preview_text)
     normalized_quote = normalize_text(facts.quote_text)
     promotion = any(
-        term in normalized for terms in PROMOTION_TERMS.values() for term in terms
+        term in normalized or term in normalized_preview
+        for terms in PROMOTION_TERMS.values()
+        for term in terms
     )
     quoted_crypto_asset = bool(CRYPTO_ASSET_RE.search(normalized_quote))
     quoted_service_signals = sum(

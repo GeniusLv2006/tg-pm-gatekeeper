@@ -33,6 +33,17 @@ class FakeTelegramClient:
 
     async def __call__(self, request):
         self.requests.append(request)
+        if isinstance(request, functions.messages.GetPeerDialogsRequest):
+            return SimpleNamespace(
+                dialogs=[
+                    SimpleNamespace(
+                        folder_id=0,
+                        notify_settings=SimpleNamespace(
+                            silent=False, mute_until=None
+                        ),
+                    )
+                ]
+            )
         if (
             self.fail_next_mute
             and isinstance(request, functions.account.UpdateNotifySettingsRequest)
@@ -154,9 +165,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST", f"/review/{self.review_id}", body
         )
         self.assertEqual(status, 303)
-        self.assertEqual(len(self.client.requests), 2)
+        self.assertEqual(len(self.client.requests), 3)
         self.assertIsInstance(
-            self.client.requests[0], functions.folders.EditPeerFoldersRequest
+            self.client.requests[1], functions.folders.EditPeerFoldersRequest
         )
         self.assertEqual(self.store.sender("sender").status, "quarantined")
         self.assertEqual(self.cancelled, ["sender"])

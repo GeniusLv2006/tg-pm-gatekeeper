@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS automated_messages (
 );
 CREATE INDEX IF NOT EXISTS automated_messages_created_idx
     ON automated_messages(created_at);
+CREATE TABLE IF NOT EXISTS dialog_snapshots (
+    sender_key TEXT PRIMARY KEY,
+    folder_id INTEGER NOT NULL,
+    silent INTEGER NOT NULL CHECK (silent IN (0, 1)),
+    mute_until INTEGER
+);
 CREATE TABLE IF NOT EXISTS review_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sender_key TEXT NOT NULL,
@@ -123,6 +129,13 @@ class ReviewItem:
     updated_at: int
     expires_at: int
     reviewed_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class DialogSnapshot:
+    folder_id: int
+    silent: bool
+    mute_until: int | None
 
 
 class StateStore:
@@ -451,7 +464,7 @@ class StateStore:
     def mark_provisional(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "provisional", now=now)
 
-    def claim_challenge_guidance(self, sender_key: str) -> bool:
+    def mark_challenge_guidance_sent(self, sender_key: str) -> bool:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE sender_state SET guidance_sent=1 WHERE sender_key=? "
@@ -459,6 +472,56 @@ class StateStore:
                 (sender_key,),
             )
         return cursor.rowcount == 1
+
+    def refresh_challenge_expiry(
+        self, sender_key: str, expires_at: int, now: int | None = None
+    ) -> bool:
+        timestamp = now or int(time.time())
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET challenge_expires_at=?, updated_at=? "
+                "WHERE sender_key=? AND status='challenge_issuing'",
+                (expires_at, timestamp, sender_key),
+            )
+        return cursor.rowcount == 1
+
+    def save_dialog_snapshot(
+        self, sender_key: str, snapshot: DialogSnapshot
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO dialog_snapshots("
+                "sender_key, folder_id, silent, mute_until) VALUES (?, ?, ?, ?)",
+                (
+                    sender_key,
+                    snapshot.folder_id,
+                    int(snapshot.silent),
+                    snapshot.mute_until,
+                ),
+            )
+
+    def dialog_snapshot(self, sender_key: str) -> DialogSnapshot | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT folder_id, silent, mute_until FROM dialog_snapshots "
+                "WHERE sender_key=?",
+                (sender_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return DialogSnapshot(
+            folder_id=int(row["folder_id"]),
+            silent=bool(row["silent"]),
+            mute_until=(
+                int(row["mute_until"]) if row["mute_until"] is not None else None
+            ),
+        )
+
+    def clear_dialog_snapshot(self, sender_key: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
+            )
 
     def expire_challenge(
         self, sender_key: str, expires_at: int, now: int | None = None
@@ -742,6 +805,18 @@ class StateStore:
                     "SELECT COUNT(*) FROM review_queue WHERE status='pending'"
                 ).fetchone()[0]
             )
+            challenge_metrics = {
+                row["rule_code"]: int(row["count"])
+                for row in self._connection.execute(
+                    "SELECT rule_code, COUNT(*) AS count FROM audit "
+                    "WHERE created_at>=? AND rule_code IN ("
+                    "'CHALLENGE_SENT','CHALLENGE_CORRECT',"
+                    "'CHALLENGE_WRONG_REPLY_TARGET','CHALLENGE_NON_NUMERIC',"
+                    "'CHALLENGE_TIMEOUT','attempts_exhausted',"
+                    "'CHALLENGE_RESTORE') GROUP BY rule_code",
+                    (int(time.time()) - 7 * 86400,),
+                )
+            }
         return {
             "mode": self.get_mode(),
             "allowed": states.get("allowed", 0),
@@ -753,4 +828,19 @@ class StateStore:
             "audit_records": audit_count,
             "pending_reviews": pending_reviews,
             "heartbeat": int(heartbeat["value"]) if heartbeat else None,
+            "challenge_sent_7d": challenge_metrics.get("CHALLENGE_SENT", 0),
+            "challenge_correct_7d": challenge_metrics.get("CHALLENGE_CORRECT", 0),
+            "challenge_wrong_reply_7d": challenge_metrics.get(
+                "CHALLENGE_WRONG_REPLY_TARGET", 0
+            ),
+            "challenge_non_numeric_7d": challenge_metrics.get(
+                "CHALLENGE_NON_NUMERIC", 0
+            ),
+            "challenge_timeout_7d": challenge_metrics.get("CHALLENGE_TIMEOUT", 0),
+            "challenge_exhausted_7d": challenge_metrics.get(
+                "attempts_exhausted", 0
+            ),
+            "challenge_restore_failed_7d": challenge_metrics.get(
+                "CHALLENGE_RESTORE", 0
+            ),
         }
