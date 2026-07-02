@@ -41,6 +41,11 @@ The arithmetic check is interaction friction, not a CAPTCHA. It filters senders 
 to instructions, but it does not claim to distinguish a person from automation. The default mode is
 observation-only. Enforcement is a deliberate CLI action.
 
+The challenge uses Telegram-native bold formatting for its warning title, deadline, expression, and
+attempt count. Its configured response window starts after Telegram confirms prompt delivery. A
+single corrective hint covers wrong Reply targets or non-numeric input without consuming an attempt
+or allowing one sender to exhaust the global outbound budget with repeated hints.
+
 ## Review dashboard
 
 Observation mode places simulated challenge and quarantine decisions in a local review queue. The
@@ -125,6 +130,10 @@ After a pass, its sender state resets to unknown after 60 seconds. After final f
 Gatekeeper sends a failure notice, keeps the dialog archived and muted, deletes only the messages
 recorded for that challenge after 10 seconds, and resets the sender state after 60 seconds. Leave the
 setting empty in normal deployments.
+
+The status response includes seven-day aggregate challenge counters for prompts sent, correct
+answers, wrong Reply targets, non-numeric replies, timeouts, exhausted attempts, and restoration
+failures. These counters contain no sender identity or message content.
 
 See [SECURITY.md](SECURITY.md) before reporting a security issue,
 [docs/architecture.md](docs/architecture.md) for the design, and

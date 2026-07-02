@@ -29,20 +29,26 @@ later manual reply from the account owner, an explicit review, or a safe operato
 
 1. Accept only incoming private-message events.
 2. Exclude contacts, local allowlist entries, service accounts, bots, and peers with a trusted prior conversation.
-3. Apply deterministic, high-precision spam rules. Authored text and links are kept separate from
-   quoted text and links so quoted content cannot trigger generic promotion or link-count rules.
-   The dedicated quoted crypto-service rule still inspects quote text in memory.
+3. Apply deterministic, high-precision spam rules. Authored text, Telegram-supplied webpage preview
+   metadata, and links are kept separate from quoted text and links so quoted content cannot trigger
+   generic promotion or link-count rules. The dedicated quoted crypto-service rule still inspects
+   quote text in memory.
 4. In observation mode, record the simulated result for operator review and take no Telegram action.
 5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender and
    bind it to the outgoing Telegram message ID.
 6. Accept only a direct Reply to that message. Restore a correct sender as `provisional`; quarantine
    after two incorrect numeric answers or timeout.
 
-In enforcement mode the challenge is written in English and expires after 60 seconds. The dialog is
-archived and muted before the challenge becomes active. Replies to another message, standalone
-answers, and non-numeric replies do not consume an attempt or extend the deadline. Numeric input is
-NFKC-normalized before comparison. A correct answer restores the dialog and notifications but keeps
-hard-rule screening active; timeout or two incorrect numeric answers leave it archived and muted.
+In enforcement mode the challenge is written in English and defaults to 60 seconds. Its title is
+`⚠️ Verification Required`; Telegram-native bold entities emphasize the title, deadline, expression,
+and configured attempt count without adding markup to the persisted recovery text. The response
+window starts only after Telegram confirms prompt delivery. The dialog is archived and muted before
+the challenge becomes active. Replies to another message, standalone answers, and non-numeric replies
+do not consume an attempt or extend the deadline. At most one corrective hint is sent per challenge.
+Numeric input is NFKC-normalized before comparison. A correct answer restores the dialog and its
+previous archive, silent, and mute settings while keeping hard-rule screening active. Restoration is
+retried three times; persistent failure creates a manual review item instead of silently treating a
+correct sender as spam. Timeout or two incorrect numeric answers leave the dialog archived and muted.
 The arithmetic is interaction friction rather than a CAPTCHA and is not treated as proof of humanity.
 Each challenge independently selects addition, non-negative subtraction, or basic multiplication;
 operands are bounded so answers remain suitable for quick mental arithmetic.
@@ -109,9 +115,10 @@ above, scoped to message IDs recorded during its failed challenge.
 
 The persistent store contains sender state, challenge metadata, generated challenge prompts while
 delivery is incomplete, rule identifiers, timestamps, action outcomes, structural review features,
-automated outgoing message IDs, and encrypted short-lived Telegram references. It does not store
-private message bodies or profile data. Generated prompts and recovery references are cleared when a
-challenge activates or rolls back.
+automated outgoing message IDs, encrypted short-lived Telegram references, and the prior archive and
+notification settings needed to reverse a Gatekeeper action. It does not store private message bodies
+or profile data. Generated prompts and recovery references are cleared when a challenge activates or
+rolls back. Dialog-setting snapshots are cleared after restoration or a terminal review decision.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
@@ -141,11 +148,12 @@ authorization key without persisting Telethon's entity cache of names, usernames
 - Challenge delivery is persisted in issuing and archiving phases. Startup reconciles a sent prompt,
   retries the reversible archive action, and resets incomplete work when it cannot recover safely.
 - Activated challenges are already archived, so timeout and restart recovery require only an atomic
-  database transition. Normal processing has a five-second grace period; startup allows 30 seconds
-  for queued Telegram updates while still judging timeliness from the message's send timestamp.
+  database transition. Normal processing and startup both allow 30 seconds for queued Telegram
+  updates while still judging timeliness from the message's send timestamp.
 - Sending or archiving failures compensate any confirmed partial Telegram action before rolling an
-  incomplete challenge back to `unknown`. If restoration itself fails, the recoverable archiving
-  phase is preserved for startup reconciliation instead of claiming that the sender is unconfined.
+  incomplete challenge back to `unknown`, and delete a prompt that never became active. If
+  restoration itself fails, the recoverable archiving phase is preserved for startup reconciliation
+  instead of claiming that the sender is unconfined.
 - Exhausted outbound capacity archives the unknown dialog and creates a manual review item instead
   of allowing challenge delivery to fail open.
 - Archiving and muting are the only destructive-adjacent operations in v1. Deletion, blocking, and

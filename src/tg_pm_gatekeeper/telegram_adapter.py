@@ -18,8 +18,9 @@ from .service import (
     TEST_STATE_RESET_DELAY_SECONDS,
     GatekeeperService,
     IncomingMessage,
+    TextStyleSpan,
 )
-from .store import StateStore
+from .store import DialogSnapshot, StateStore
 
 
 LOG = logging.getLogger("gatekeeper.telegram")
@@ -34,13 +35,43 @@ LINK_BUTTON_TYPES = (
 )
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
+    "⚠️ Verification Required",
     "Verification required",
+    "Reply required",
+    "Digits only",
+    "Incorrect answer",
+    "Verification passed",
+    "Verification failed",
     "Please use Telegram's Reply action",
     "Reply with digits only.",
     "Incorrect answer.",
     "Verification passed.",
     "Verification failed.",
 )
+
+
+def formatting_entities_from_spans(
+    text: str, spans: tuple[TextStyleSpan, ...]
+) -> list[types.TypeMessageEntity]:
+    entity_types = {
+        "bold": types.MessageEntityBold,
+        "italic": types.MessageEntityItalic,
+        "code": types.MessageEntityCode,
+    }
+    entities: list[types.TypeMessageEntity] = []
+    for span in spans:
+        if (
+            span.offset < 0
+            or span.length <= 0
+            or span.offset + span.length > len(text)
+        ):
+            raise ValueError("invalid formatting span")
+        offset = len(text[: span.offset].encode("utf-16-le")) // 2
+        length = len(
+            text[span.offset : span.offset + span.length].encode("utf-16-le")
+        ) // 2
+        entities.append(entity_types[span.style](offset=offset, length=length))
+    return entities
 
 
 def load_denylist(path: Path | None) -> frozenset[str]:
@@ -107,6 +138,11 @@ def facts_from_message(message: types.Message) -> MessageFacts:
     webpage_url = getattr(webpage, "url", None)
     if webpage_url:
         urls.add(webpage_url)
+    preview_text = "\n".join(
+        value
+        for attribute in ("site_name", "title", "description", "author")
+        if isinstance((value := getattr(webpage, attribute, None)), str) and value
+    )
     domains = tuple(
         sorted({domain for url in urls if (domain := normalized_domain(url))})
     )
@@ -117,6 +153,7 @@ def facts_from_message(message: types.Message) -> MessageFacts:
     )
     return MessageFacts(
         text=text,
+        preview_text=preview_text,
         quote_text=quote_text,
         urls=tuple(sorted(urls)),
         domains=domains,
@@ -162,14 +199,20 @@ class TelegramActions:
         self.sender_key = sender_key
 
     async def send_text(
-        self, text: str, *, reply_to_message_id: int | None = None
+        self,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        formatting: tuple[TextStyleSpan, ...] = (),
     ) -> int:
+        formatting_entities = formatting_entities_from_spans(text, formatting)
         try:
             message = await self.adapter.client.send_message(
                 self.peer,
                 text,
                 reply_to=reply_to_message_id,
                 link_preview=False,
+                formatting_entities=formatting_entities or None,
             )
         except Exception as error:
             LOG.error(f"send_message_failed:{type(error).__name__}")
@@ -180,6 +223,28 @@ class TelegramActions:
         archive_applied = False
         try:
             peer = self.peer
+            if self.adapter.store.dialog_snapshot(self.sender_key) is None:
+                dialogs = await self.adapter.client(
+                    functions.messages.GetPeerDialogsRequest(
+                        [types.InputDialogPeer(peer)]
+                    )
+                )
+                if not dialogs.dialogs:
+                    raise RuntimeError("dialog state unavailable")
+                dialog = dialogs.dialogs[0]
+                mute_until = getattr(dialog.notify_settings, "mute_until", None)
+                self.adapter.store.save_dialog_snapshot(
+                    self.sender_key,
+                    DialogSnapshot(
+                        folder_id=getattr(dialog, "folder_id", None) or 0,
+                        silent=bool(getattr(dialog.notify_settings, "silent", False)),
+                        mute_until=(
+                            int(mute_until.timestamp())
+                            if isinstance(mute_until, datetime)
+                            else None
+                        ),
+                    ),
+                )
             await self.adapter.client(
                 functions.folders.EditPeerFoldersRequest(
                     [types.InputFolderPeer(peer=peer, folder_id=1)]
@@ -206,23 +271,42 @@ class TelegramActions:
     async def restore_from_pending(self) -> bool:
         try:
             peer = self.peer
+            snapshot = self.adapter.store.dialog_snapshot(self.sender_key)
+            folder_id = snapshot.folder_id if snapshot is not None else 0
+            silent = snapshot.silent if snapshot is not None else False
+            mute_until = (
+                datetime.fromtimestamp(snapshot.mute_until, timezone.utc)
+                if snapshot is not None and snapshot.mute_until is not None
+                else datetime.now(timezone.utc)
+            )
             await self.adapter.client(
                 functions.folders.EditPeerFoldersRequest(
-                    [types.InputFolderPeer(peer=peer, folder_id=0)]
+                    [types.InputFolderPeer(peer=peer, folder_id=folder_id)]
                 )
             )
             await self.adapter.client(
                 functions.account.UpdateNotifySettingsRequest(
                     peer=types.InputNotifyPeer(peer),
                     settings=types.InputPeerNotifySettings(
-                        silent=False,
-                        mute_until=datetime.now(timezone.utc),
+                        silent=silent,
+                        mute_until=mute_until,
                     ),
                 )
             )
+            self.adapter.store.clear_dialog_snapshot(self.sender_key)
             return True
         except Exception:
             LOG.error("restore_action_failed")
+            return False
+
+    async def delete_message(self, message_id: int) -> bool:
+        try:
+            await self.adapter.client.delete_messages(
+                self.peer, [message_id], revoke=True
+            )
+            return True
+        except Exception:
+            LOG.error("delete_message_failed")
             return False
 
     def schedule_timeout(

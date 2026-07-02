@@ -11,11 +11,13 @@ from telethon import functions, types
 from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.service import GatekeeperService
+from tg_pm_gatekeeper.service import TextStyleSpan
 from tg_pm_gatekeeper.store import StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
     TelegramAdapter,
     TelegramActions,
     facts_from_message,
+    formatting_entities_from_spans,
     input_peer_from_sender,
     load_denylist,
     message_timestamp,
@@ -60,6 +62,25 @@ class TelegramAdapterTests(unittest.TestCase):
         self.assertTrue(facts.has_link_button)
         self.assertEqual(facts.link_button_count, 1)
         self.assertIn("bad.invalid", facts.domains)
+
+    def test_webpage_preview_text_and_url_are_extracted(self) -> None:
+        webpage = SimpleNamespace(
+            url="https://t.me/+invite",
+            site_name="Telegram",
+            title="汇盈社区 高返70% 合约跟单",
+            description="免费跟单，交易所返佣",
+            author=None,
+        )
+        facts = facts_from_message(
+            self.message(
+                message="T.me/+invite",
+                media=SimpleNamespace(webpage=webpage),
+            )
+        )
+        self.assertIn("https://t.me/+invite", facts.urls)
+        self.assertIn("t.me", facts.domains)
+        self.assertIn("高返70%", facts.preview_text)
+        self.assertIn("交易所返佣", facts.preview_text)
 
     def test_quoted_text_and_entities_are_extracted(self) -> None:
         quote = "TRX 服务 click"
@@ -115,6 +136,16 @@ class TelegramAdapterTests(unittest.TestCase):
         self.assertEqual(reply_to_message_id(message), 42)
         self.assertEqual(message_timestamp(message, fallback=1), int(date.timestamp()))
 
+    def test_formatting_spans_use_telegram_utf16_offsets(self) -> None:
+        text = "🔐 Verification required"
+        entities = formatting_entities_from_spans(
+            text, (TextStyleSpan(offset=2, length=12),)
+        )
+        self.assertEqual(len(entities), 1)
+        self.assertIsInstance(entities[0], types.MessageEntityBold)
+        self.assertEqual(entities[0].offset, 3)
+        self.assertEqual(entities[0].length, 12)
+
     def test_input_peer_is_rebuilt_from_resolved_sender(self) -> None:
         peer = input_peer_from_sender(SimpleNamespace(id=123, access_hash=456))
         self.assertIsInstance(peer, types.InputPeerUser)
@@ -132,18 +163,55 @@ class FakeHistoryClient:
 
 
 class PartialArchiveClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fail_first_mute: bool = True,
+        folder_id: int = 0,
+        silent: bool = False,
+        mute_until=None,
+    ) -> None:
         self.requests: list[object] = []
+        self.fail_first_mute = fail_first_mute
         self.failed_mute = False
+        self.folder_id = folder_id
+        self.silent = silent
+        self.mute_until = mute_until
 
     async def __call__(self, request):
         self.requests.append(request)
+        if isinstance(request, functions.messages.GetPeerDialogsRequest):
+            return SimpleNamespace(
+                dialogs=[
+                    SimpleNamespace(
+                        folder_id=self.folder_id,
+                        notify_settings=SimpleNamespace(
+                            silent=self.silent, mute_until=self.mute_until
+                        ),
+                    )
+                ]
+            )
         if (
             isinstance(request, functions.account.UpdateNotifySettingsRequest)
+            and self.fail_first_mute
             and not self.failed_mute
         ):
             self.failed_mute = True
             raise RuntimeError("mute failed")
+
+
+class FakeSnapshotStore:
+    def __init__(self) -> None:
+        self.snapshot = None
+
+    def dialog_snapshot(self, sender_key: str):
+        return self.snapshot
+
+    def save_dialog_snapshot(self, sender_key: str, snapshot) -> None:
+        self.snapshot = snapshot
+
+    def clear_dialog_snapshot(self, sender_key: str) -> None:
+        self.snapshot = None
 
 
 class TelegramActionTests(unittest.IsolatedAsyncioTestCase):
@@ -152,6 +220,7 @@ class TelegramActionTests(unittest.IsolatedAsyncioTestCase):
         adapter = SimpleNamespace(
             client=client,
             settings=SimpleNamespace(mute_days=30),
+            store=FakeSnapshotStore(),
         )
         peer = types.InputPeerUser(user_id=123, access_hash=456)
         actions = TelegramActions(adapter, peer, "sender")
@@ -165,6 +234,43 @@ class TelegramActionTests(unittest.IsolatedAsyncioTestCase):
             [request.folder_peers[0].folder_id for request in folder_requests],
             [1, 0],
         )
+
+    async def test_restore_reinstates_original_dialog_settings(self) -> None:
+        original_mute = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        client = PartialArchiveClient(
+            fail_first_mute=False,
+            folder_id=0,
+            silent=True,
+            mute_until=original_mute,
+        )
+        store = FakeSnapshotStore()
+        adapter = SimpleNamespace(
+            client=client,
+            settings=SimpleNamespace(mute_days=30),
+            store=store,
+        )
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
+        actions = TelegramActions(adapter, peer, "sender")
+        self.assertTrue(await actions.archive_and_mute())
+        self.assertTrue(await actions.restore_from_pending())
+        folder_requests = [
+            request
+            for request in client.requests
+            if isinstance(request, functions.folders.EditPeerFoldersRequest)
+        ]
+        self.assertEqual(
+            [request.folder_peers[0].folder_id for request in folder_requests],
+            [1, 0],
+        )
+        notify_requests = [
+            request
+            for request in client.requests
+            if isinstance(request, functions.account.UpdateNotifySettingsRequest)
+        ]
+        restored = notify_requests[-1].settings
+        self.assertTrue(restored.silent)
+        self.assertEqual(restored.mute_until, original_mute)
+        self.assertIsNone(store.snapshot)
 
 
 class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):

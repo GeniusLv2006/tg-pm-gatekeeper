@@ -60,6 +60,26 @@ class RuleTests(unittest.TestCase):
         )
         self.assertIn("HR-03_PROMOTION_WITH_LINK", decision.rule_codes)
 
+    def test_promotional_webpage_preview_with_link_is_hard_rule(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(
+                text="T.me/+invite",
+                preview_text="汇盈社区 高返70% 合约跟单 免费跟单，交易所返佣",
+                urls=("https://t.me/+invite",),
+            )
+        )
+        self.assertIn("HR-03_PROMOTION_WITH_LINK", decision.rule_codes)
+
+    def test_ordinary_webpage_preview_with_link_is_not_hard_rule(self) -> None:
+        decision = evaluate_hard_rules(
+            MessageFacts(
+                text="https://example.invalid/article",
+                preview_text="Project documentation and release notes",
+                urls=("https://example.invalid/article",),
+            )
+        )
+        self.assertFalse(decision.hard_spam)
+
     def test_quoted_promotion_does_not_pollute_authored_rules(self) -> None:
         decision = evaluate_hard_rules(
             MessageFacts(

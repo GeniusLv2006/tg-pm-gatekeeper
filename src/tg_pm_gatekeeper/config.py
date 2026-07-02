@@ -28,6 +28,13 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    value = _positive_int(name, default)
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 def _optional_positive_int(name: str) -> int | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -103,8 +110,12 @@ class Settings:
                 os.environ.get("TG_HMAC_KEY_FILE", "/run/secrets/hmac_key")
             ),
             denylist_file=Path(denylist) if denylist else None,
-            challenge_ttl_seconds=_positive_int("TG_CHALLENGE_TTL_SECONDS", 60),
-            challenge_max_attempts=_positive_int("TG_CHALLENGE_MAX_ATTEMPTS", 2),
+            challenge_ttl_seconds=_bounded_int(
+                "TG_CHALLENGE_TTL_SECONDS", 60, 30, 600
+            ),
+            challenge_max_attempts=_bounded_int(
+                "TG_CHALLENGE_MAX_ATTEMPTS", 2, 1, 5
+            ),
             audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
             review_retention_days=min(
                 _positive_int("TG_REVIEW_RETENTION_DAYS", 7), 7
@@ -116,6 +127,8 @@ class Settings:
                 )
             ),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
-            outbound_limit_per_hour=_positive_int("TG_OUTBOUND_LIMIT_PER_HOUR", 10),
+            outbound_limit_per_hour=_bounded_int(
+                "TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100
+            ),
             test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
         )

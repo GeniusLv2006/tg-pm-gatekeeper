@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
-from tg_pm_gatekeeper.store import StateStore, StoreMigrationError
+from tg_pm_gatekeeper.store import DialogSnapshot, StateStore, StoreMigrationError
 
 
 class StoreTests(unittest.TestCase):
@@ -67,6 +68,22 @@ class StoreTests(unittest.TestCase):
         self.store.heartbeat(100)
         self.assertTrue(self.store.healthy(now=150))
         self.assertFalse(self.store.healthy(now=221))
+
+    def test_dialog_snapshot_round_trip_and_clear(self) -> None:
+        snapshot = DialogSnapshot(folder_id=2, silent=True, mute_until=500)
+        self.store.save_dialog_snapshot("sender", snapshot)
+        self.assertEqual(self.store.dialog_snapshot("sender"), snapshot)
+        self.store.clear_dialog_snapshot("sender")
+        self.assertIsNone(self.store.dialog_snapshot("sender"))
+
+    def test_statistics_include_privacy_safe_challenge_funnel(self) -> None:
+        now = int(time.time())
+        self.store.audit("sender", "CHALLENGE_SENT", "archived_muted", now)
+        self.store.audit("sender", "CHALLENGE_CORRECT", "provisional", now)
+        statistics = self.store.statistics()
+        self.assertEqual(statistics["challenge_sent_7d"], 1)
+        self.assertEqual(statistics["challenge_correct_7d"], 1)
+        self.assertNotIn("sender", str(statistics))
 
     def test_review_decision_erases_reversible_reference(self) -> None:
         review_id = self.store.enqueue_review(
@@ -172,6 +189,26 @@ class StoreMigrationTests(unittest.TestCase):
         self.create_legacy_database("challenged")
         with self.assertRaises(StoreMigrationError):
             StateStore(self.path)
+
+    def test_v1_database_adds_dialog_snapshot_table_compatibly(self) -> None:
+        store = StateStore(self.path)
+        store._connection.execute("DROP TABLE dialog_snapshots")
+        store._connection.commit()
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            table = reopened._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='dialog_snapshots'"
+            ).fetchone()
+            self.assertIsNotNone(table)
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0],
+                1,
+            )
+        finally:
+            reopened.close()
 
 
 if __name__ == "__main__":
