@@ -17,9 +17,9 @@ The project is pre-release and tracks the latest commit on `main`. The implement
   queue through an SSH-forwarded, owner-only Unix socket;
 - can be explicitly switched to `enforce` mode to challenge ordinary unknown senders and archive
   and mute high-confidence spam; and
-- deletes only verification-flow messages after a pass or a failed sender's private dialog after
-  exhausted attempts; it does not block, report, call an AI service, or expose a public
-  administration port.
+- deletes only verification-flow messages after a pass or, after a 10-second warning, a failed
+  sender's private dialog when attempts are exhausted; it does not block, report, call an AI
+  service, or expose a public administration port.
 
 ## Runtime flow
 
@@ -36,7 +36,8 @@ incoming private message
           -> direct Reply with the correct answer: restore dialog, clear verification messages,
              and keep screening
           -> account owner replies later: allow sender permanently
-          -> two incorrect numeric answers: delete the private conversation for both sides
+          -> two incorrect numeric answers: warn, then delete the private conversation for both
+             sides after 10 seconds
           -> timeout: remain archived and muted
           -> challenge send limit reached: archive, mute, and queue for manual review
 ```
@@ -131,10 +132,11 @@ For repeated arithmetic-flow testing, `TG_TEST_SENDER_ID` may name one dedicated
 That account always follows the real challenge path, even in observation mode or when it is a
 contact with prior outgoing history, and its test notices do not consume the global outbound quota.
 After a pass, Gatekeeper clears the verification exchange and resets the test sender state to
-unknown after 60 seconds. Exhausting the numeric attempts deletes the entire private conversation
-for both sides and schedules the same state reset. A timeout still sends a failure notice, keeps the
-dialog archived and muted, deletes only the messages recorded for that timed-out challenge after 10
-seconds, and resets the sender state after 60 seconds. Leave the setting empty in normal deployments.
+unknown after 60 seconds. Exhausting the numeric attempts sends a failure notice stating that the
+conversation will be deleted, waits 10 seconds, deletes the entire private conversation for both
+sides, and schedules the same state reset. A timeout still sends a failure notice, keeps the dialog
+archived and muted, deletes only the messages recorded for that timed-out challenge after 10 seconds,
+and resets the sender state after 60 seconds. Leave the setting empty in normal deployments.
 
 The status response includes seven-day aggregate challenge counters for prompts sent, correct
 answers, wrong Reply targets, non-numeric replies, timeouts, exhausted attempts, and restoration

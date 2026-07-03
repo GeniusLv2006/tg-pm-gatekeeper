@@ -306,6 +306,22 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    async def test_delayed_dialog_worker_deletes_the_dialog_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                client = SimpleNamespace(delete_dialog=AsyncMock())
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.client = client
+                adapter.store = store
+                peer = types.InputPeerUser(user_id=123, access_hash=456)
+
+                await adapter._dialog_deletion_worker(peer, "sender", 0)
+
+                client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
+            finally:
+                store.close()
+
 
 class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_automated_outgoing_message_does_not_create_trust(self) -> None:

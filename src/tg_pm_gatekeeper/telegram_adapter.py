@@ -14,6 +14,7 @@ from .config import ConfigurationError, Settings, read_private_file
 from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
 from .service import (
+    FAILED_DIALOG_DELETE_DELAY_SECONDS,
     TEST_MESSAGE_DELETE_DELAY_SECONDS,
     TEST_STATE_RESET_DELAY_SECONDS,
     GatekeeperService,
@@ -355,6 +356,9 @@ class TelegramActions:
             self.peer, sender_key, since, delete_at
         )
 
+    def schedule_dialog_deletion(self, sender_key: str, delete_at: int) -> None:
+        self.adapter.schedule_dialog_deletion(self.peer, sender_key, delete_at)
+
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int
     ) -> None:
@@ -583,12 +587,25 @@ class TelegramAdapter:
                     challenge_started_at = (
                         state.updated_at - self.settings.challenge_ttl_seconds
                     )
-                self.schedule_test_message_deletion(
-                    peer,
-                    sender_key,
-                    challenge_started_at,
-                    state.updated_at + TEST_MESSAGE_DELETE_DELAY_SECONDS,
+                terminal_event = self.store.latest_challenge_terminal_event(
+                    sender_key, challenge_started_at
                 )
+                if terminal_event == (
+                    "attempts_exhausted",
+                    "dialog_deletion_scheduled",
+                ):
+                    self.schedule_dialog_deletion(
+                        peer,
+                        sender_key,
+                        state.updated_at + FAILED_DIALOG_DELETE_DELAY_SECONDS,
+                    )
+                elif terminal_event and terminal_event[0] == "CHALLENGE_TIMEOUT":
+                    self.schedule_test_message_deletion(
+                        peer,
+                        sender_key,
+                        challenge_started_at,
+                        state.updated_at + TEST_MESSAGE_DELETE_DELAY_SECONDS,
+                    )
         self.schedule_test_state_reset(
             sender_key,
             state.updated_at,
@@ -673,6 +690,31 @@ class TelegramAdapter:
             pass
         except Exception:
             LOG.error("test_message_deletion_failed")
+
+    def schedule_dialog_deletion(
+        self, peer, sender_key: str, delete_at: int
+    ) -> None:
+        self._track_maintenance_task(
+            self._dialog_deletion_worker(peer, sender_key, delete_at)
+        )
+
+    async def _dialog_deletion_worker(
+        self, peer, sender_key: str, delete_at: int
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, delete_at - int(time.time())))
+            actions = TelegramActions(self, peer, sender_key)
+            deleted = await actions.delete_dialog()
+            self.store.audit(
+                sender_key,
+                "DIALOG_DELETE",
+                "deleted" if deleted else "action_failed",
+                int(time.time()),
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOG.error("dialog_deletion_failed")
 
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int

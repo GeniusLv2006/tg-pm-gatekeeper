@@ -51,6 +51,15 @@ class StoreTests(unittest.TestCase):
             self.store.message_ids_between("sender", 10, 12), [10, 11, 12]
         )
 
+    def test_latest_challenge_terminal_event_distinguishes_wrong_from_timeout(self) -> None:
+        self.store.audit("sender", "CHALLENGE_TIMEOUT", "already_archived", 100)
+        self.store.audit("sender", "attempts_exhausted", "scheduled", 200)
+        self.assertEqual(
+            self.store.latest_challenge_terminal_event("sender", 150),
+            ("attempts_exhausted", "scheduled"),
+        )
+        self.assertIsNone(self.store.latest_challenge_terminal_event("sender", 201))
+
     def test_state_does_not_require_raw_identity(self) -> None:
         self.store.allow("hmac-value", 100)
         self.assertEqual(self.store.sender("hmac-value").status, "allowed")

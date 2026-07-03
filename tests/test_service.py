@@ -12,6 +12,7 @@ from tg_pm_gatekeeper.service import (
     DIGITS_REQUIRED_TEXT,
     REPLY_REQUIRED_TEXT,
     VERIFICATION_FAILED_TEXT,
+    VERIFICATION_TIMEOUT_TEXT,
     Challenge,
     GatekeeperService,
     IncomingMessage,
@@ -43,6 +44,7 @@ class FakeActions:
         self.deleted_messages: list[int] = []
         self.deleted_message_batches: list[tuple[int, ...]] = []
         self.deleted_dialogs = 0
+        self.dialog_deletions: list[tuple[str, int]] = []
         self.resets: list[tuple[str, int, int]] = []
         self.restores = 0
         self.archive_success = archive_success
@@ -93,6 +95,9 @@ class FakeActions:
     async def delete_dialog(self) -> bool:
         self.deleted_dialogs += 1
         return True
+
+    def schedule_dialog_deletion(self, sender_key: str, delete_at: int) -> None:
+        self.dialog_deletions.append((sender_key, delete_at))
 
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
@@ -412,7 +417,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "quarantined",
         )
-        self.assertEqual(actions.deleted_dialogs, 1)
+        self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
+        self.assertIn(
+            "This conversation will be deleted in 10 seconds.",
+            actions.sent[-1][0],
+        )
+        self.assertEqual(actions.deleted_dialogs, 0)
+        self.assertEqual(actions.dialog_deletions, [(sender_key, self.now + 10)])
         self.assertEqual(actions.deletions, [])
         self.assertEqual(actions.resets, [(sender_key, self.now, self.now + 60)])
 
@@ -498,7 +509,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "challenge_pending")
         self.assertEqual(self.store.sender(sender_key).attempts, 0)
 
-    async def test_incorrect_answers_exhaust_attempts_without_new_telegram_action(self) -> None:
+    async def test_incorrect_answers_schedule_delayed_dialog_deletion(self) -> None:
         sender_key = self.set_active_challenge()
         actions = FakeActions()
         first = await self.service.handle(
@@ -510,8 +521,23 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first, second), ("challenge_incorrect", "quarantined"))
         self.assertEqual(self.store.sender(sender_key).status, "quarantined")
         self.assertEqual(actions.quarantines, 0)
-        self.assertEqual(actions.deleted_dialogs, 1)
+        self.assertEqual(actions.deleted_dialogs, 0)
+        self.assertEqual(actions.dialog_deletions, [(sender_key, self.now + 10)])
+        self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
         self.assertIn("1 attempt remaining", actions.sent[0][0])
+
+    async def test_failed_warning_does_not_schedule_silent_dialog_deletion(self) -> None:
+        sender_key = self.set_active_challenge()
+        actions = FakeActions(send_success=False)
+        await self.service.handle(
+            self.message(2, "11", reply_to_message_id=100), actions
+        )
+        outcome = await self.service.handle(
+            self.message(3, "10", reply_to_message_id=100), actions
+        )
+        self.assertEqual(outcome, "quarantined")
+        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+        self.assertEqual(actions.dialog_deletions, [])
 
     async def test_message_sent_before_deadline_can_pass_after_processing_delay(self) -> None:
         sender_key = self.set_active_challenge()
@@ -705,7 +731,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 actions=actions,
             )
         )
-        self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
+        self.assertEqual(actions.sent[-1][0], VERIFICATION_TIMEOUT_TEXT)
         self.assertEqual(
             actions.deletions, [(sender_key, self.now, self.now + 75)]
         )
