@@ -22,17 +22,17 @@ DIGITS_RE = re.compile(r"^[0-9]+$")
 CHALLENGE_PROCESSING_GRACE_SECONDS = 30
 RESTORE_RETRY_DELAYS_SECONDS = (0.0, 0.1, 0.5)
 REPLY_REQUIRED_TEXT = (
-    "Reply required\n\nLong-press the verification message, choose Reply, and "
+    "↩️ Reply Required\n\nLong-press the verification message, choose Reply, and "
     "send only the answer. No attempt was used."
 )
 DIGITS_REQUIRED_TEXT = (
-    "Digits only\n\nReply with digits only. No attempt was used."
+    "🔢 Digits Only\n\nReply with digits only. No attempt was used."
 )
 VERIFICATION_PASSED_TEXT = (
-    "Verification passed\n\nThis conversation has been restored."
+    "✅ Verification Passed\n\nThis conversation has been restored."
 )
 VERIFICATION_FAILED_TEXT = (
-    "Verification failed\n\nThis conversation remains archived and muted."
+    "⛔ Verification Failed\n\nThis conversation remains archived and muted."
 )
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
@@ -551,7 +551,7 @@ class GatekeeperService:
         remaining = self.challenge_max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
         incorrect_text = (
-            "Incorrect answer\n\nReply to the same verification message with "
+            "❌ Incorrect Answer\n\nReply to the same verification message with "
             f"digits only. {remaining} {noun} remaining."
         )
         await self._send_notice(
@@ -561,7 +561,9 @@ class GatekeeperService:
             now,
             reply_to_message_id=state.challenge_message_id,
             formatting=emphasized(
-                incorrect_text, "Incorrect answer", f"{remaining} {noun} remaining"
+                incorrect_text,
+                "❌ Incorrect Answer",
+                f"{remaining} {noun} remaining",
             ),
         )
         return "challenge_incorrect"

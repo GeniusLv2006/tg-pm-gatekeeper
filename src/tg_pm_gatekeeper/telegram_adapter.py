@@ -36,6 +36,11 @@ LINK_BUTTON_TYPES = (
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
     "⚠️ Verification Required",
+    "↩️ Reply Required",
+    "🔢 Digits Only",
+    "❌ Incorrect Answer",
+    "✅ Verification Passed",
+    "⛔ Verification Failed",
     "Verification required",
     "Reply required",
     "Digits only",
