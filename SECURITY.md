@@ -23,13 +23,20 @@ If a secret is committed, removing it in a later commit is insufficient. Revoke 
 - The runtime database contains HMAC-derived sender keys, Telegram message IDs, generated challenge
   text during incomplete delivery, and authenticated encrypted short-lived action references. It
   does not contain raw user IDs, private message content, usernames, or profile names.
+- Optional training samples are stored only in a separate owner-only database. Authored text and
+  structural features are AES-256-GCM encrypted under an independent dataset key; media, quoted
+  text, profile data, raw IDs, access hashes, and the dedicated test sender are excluded.
 - Arithmetic verification is an interaction check, not a CAPTCHA or proof that a sender is human.
 - Challenge delivery, timeout, and review transitions must be serialized per derived sender key;
   outbound-rate exhaustion must not bypass screening.
+- Whole-dialog deletion must be represented by a persistent action with an expected state revision.
+  It may execute only in `protect` mode; switching to `monitor` cancels pending destructive jobs.
 - The application must not expose a listening port or mount the Docker socket.
 - Root compromise of the host is considered compromise of the Telegram account. Container isolation
   does not protect a session from the host administrator.
 - Two-step verification is required, but it does not invalidate an already stolen session.
+- Plaintext dataset exports are sensitive message data. Transfer them only to a trusted workstation
+  and remove the server-side export immediately.
 
 ## Incident response
 

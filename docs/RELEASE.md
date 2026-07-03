@@ -45,6 +45,7 @@ For tests, executable scripts, configuration, or runtime changes:
 ```shell
 PYTHONPATH=src .venv/bin/python -m unittest discover -v
 PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
+docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
 
@@ -98,7 +99,7 @@ Follow [deployment.md](deployment.md) for host preparation. For every live updat
 1. Verify the server checkout is clean, record its current commit, and confirm the container is
    healthy.
 2. Confirm the service mode before changing anything. Deployment must not silently switch from
-   `observe` to `enforce`.
+   `monitor` to `protect`.
 3. Create a remote-only temporary backup only for schema, migration, or persistent-state changes.
 4. Fast-forward the server checkout to the reviewed `main` commit.
 5. Rebuild and recreate the container only when the file classification above requires it.

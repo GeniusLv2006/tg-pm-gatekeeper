@@ -11,10 +11,10 @@ from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 
 from .config import ConfigurationError, Settings, read_private_file
+from .dataset import TrainingStore
 from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
 from .service import (
-    FAILED_DIALOG_DELETE_DELAY_SECONDS,
     TEST_MESSAGE_DELETE_DELAY_SECONDS,
     TEST_STATE_RESET_DELAY_SECONDS,
     GatekeeperService,
@@ -66,16 +66,12 @@ def formatting_entities_from_spans(
     }
     entities: list[types.TypeMessageEntity] = []
     for span in spans:
-        if (
-            span.offset < 0
-            or span.length <= 0
-            or span.offset + span.length > len(text)
-        ):
+        if span.offset < 0 or span.length <= 0 or span.offset + span.length > len(text):
             raise ValueError("invalid formatting span")
         offset = len(text[: span.offset].encode("utf-16-le")) // 2
-        length = len(
-            text[span.offset : span.offset + span.length].encode("utf-16-le")
-        ) // 2
+        length = (
+            len(text[span.offset : span.offset + span.length].encode("utf-16-le")) // 2
+        )
         entities.append(entity_types[span.style](offset=offset, length=length))
     return entities
 
@@ -153,9 +149,7 @@ def facts_from_message(message: types.Message) -> MessageFacts:
         sorted({domain for url in urls if (domain := normalized_domain(url))})
     )
     quote_domains = tuple(
-        sorted(
-            {domain for url in quote_urls if (domain := normalized_domain(url))}
-        )
+        sorted({domain for url in quote_urls if (domain := normalized_domain(url))})
     )
     return MessageFacts(
         text=text,
@@ -356,8 +350,8 @@ class TelegramActions:
             self.peer, sender_key, since, delete_at
         )
 
-    def schedule_dialog_deletion(self, sender_key: str, delete_at: int) -> None:
-        self.adapter.schedule_dialog_deletion(self.peer, sender_key, delete_at)
+    def schedule_dialog_deletion(self, action_id: int, delete_at: int) -> None:
+        self.adapter.schedule_dialog_deletion(action_id, delete_at)
 
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int
@@ -369,11 +363,17 @@ class TelegramActions:
 
 class TelegramAdapter:
     def __init__(
-        self, settings: Settings, store: StateStore, service: GatekeeperService
+        self,
+        settings: Settings,
+        store: StateStore,
+        service: GatekeeperService,
+        *,
+        training_store: TrainingStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.service = service
+        self.training_store = training_store
         session = read_private_file(
             settings.session_file, minimum_bytes=64, strip=True
         ).decode("ascii")
@@ -395,6 +395,10 @@ class TelegramAdapter:
             self.client,
             mute_days=settings.mute_days,
             cancel_timeout=self.cancel_timeout,
+            training_store=training_store,
+            dataset_collection=settings.dataset_collection,
+            dataset_retention_days=settings.dataset_retention_days,
+            dataset_max_messages_per_sender=settings.dataset_max_messages_per_sender,
         )
 
     async def run(self) -> None:
@@ -404,6 +408,7 @@ class TelegramAdapter:
         await self.client.get_me()
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
+        await self._recover_pending_actions()
         await self._review_admin.start()
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
@@ -430,6 +435,8 @@ class TelegramAdapter:
             write_runtime_heartbeat(HEARTBEAT_PATH, now)
             if now >= next_prune:
                 self.store.prune(self.settings.audit_retention_days, now)
+                if self.training_store is not None:
+                    self.training_store.prune(now)
                 next_prune = now + PRUNE_INTERVAL_SECONDS
             await asyncio.sleep(60)
 
@@ -494,7 +501,11 @@ class TelegramAdapter:
         async for message in self.client.iter_messages(
             event.input_chat, limit=20, from_user="me"
         ):
-            if since is not None and message.date and int(message.date.timestamp()) < since:
+            if (
+                since is not None
+                and message.date
+                and int(message.date.timestamp()) < since
+            ):
                 continue
             text = message.message or ""
             generated_by_gatekeeper = text.startswith(GATEKEEPER_MESSAGE_PREFIXES)
@@ -512,16 +523,16 @@ class TelegramAdapter:
             if state.status == "challenged":
                 if state.challenge_expires_at is not None:
                     peer = None
-                    if (
-                        self.settings.test_sender_id is not None
-                        and sender_key == self.service.test_sender_key
-                    ):
+                    if state.challenge_action_reference is not None:
                         try:
-                            peer = await self.client.get_input_entity(
-                                self.settings.test_sender_id
+                            user_id, access_hash, _ = (
+                                self.service.protector.open_review_reference(
+                                    state.challenge_action_reference
+                                )
                             )
+                            peer = types.InputPeerUser(user_id, access_hash)
                         except Exception:
-                            LOG.error("test_sender_resolution_failed")
+                            LOG.error("challenge_peer_recovery_failed")
                     self.schedule_timeout(
                         sender_key,
                         state.challenge_expires_at,
@@ -590,16 +601,7 @@ class TelegramAdapter:
                 terminal_event = self.store.latest_challenge_terminal_event(
                     sender_key, challenge_started_at
                 )
-                if terminal_event == (
-                    "attempts_exhausted",
-                    "dialog_deletion_scheduled",
-                ):
-                    self.schedule_dialog_deletion(
-                        peer,
-                        sender_key,
-                        state.updated_at + FAILED_DIALOG_DELETE_DELAY_SECONDS,
-                    )
-                elif terminal_event and terminal_event[0] == "CHALLENGE_TIMEOUT":
+                if terminal_event and terminal_event[0] == "CHALLENGE_TIMEOUT":
                     self.schedule_test_message_deletion(
                         peer,
                         sender_key,
@@ -611,6 +613,10 @@ class TelegramAdapter:
             state.updated_at,
             state.updated_at + TEST_STATE_RESET_DELAY_SECONDS,
         )
+
+    async def _recover_pending_actions(self) -> None:
+        for action in self.store.pending_actions():
+            self.schedule_dialog_deletion(action.id, action.execute_at)
 
     def schedule_timeout(
         self,
@@ -655,9 +661,7 @@ class TelegramAdapter:
             actions = (
                 TelegramActions(self, peer, sender_key) if peer is not None else None
             )
-            await self.service.expire_challenge(
-                sender_key, expires_at, actions=actions
-            )
+            await self.service.expire_challenge(sender_key, expires_at, actions=actions)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -691,22 +695,31 @@ class TelegramAdapter:
         except Exception:
             LOG.error("test_message_deletion_failed")
 
-    def schedule_dialog_deletion(
-        self, peer, sender_key: str, delete_at: int
-    ) -> None:
-        self._track_maintenance_task(
-            self._dialog_deletion_worker(peer, sender_key, delete_at)
-        )
+    def schedule_dialog_deletion(self, action_id: int, delete_at: int) -> None:
+        self._track_maintenance_task(self._dialog_deletion_worker(action_id, delete_at))
 
-    async def _dialog_deletion_worker(
-        self, peer, sender_key: str, delete_at: int
-    ) -> None:
+    async def _dialog_deletion_worker(self, action_id: int, delete_at: int) -> None:
+        action = None
         try:
             await asyncio.sleep(max(0, delete_at - int(time.time())))
-            actions = TelegramActions(self, peer, sender_key)
+            action = self.store.claim_action(action_id)
+            if action is None:
+                return
+            user_id, access_hash, _ = self.service.protector.open_review_reference(
+                action.reference
+            )
+            peer = types.InputPeerUser(user_id, access_hash)
+            actions = TelegramActions(self, peer, action.sender_key)
             deleted = await actions.delete_dialog()
+            self.store.finish_action(action_id, "completed" if deleted else "failed")
+            if deleted:
+                self.store.clear_action_reference(
+                    action.sender_key, action.expected_revision
+                )
+            if not deleted:
+                self.store.enqueue_action_failure(action)
             self.store.audit(
-                sender_key,
+                action.sender_key,
                 "DIALOG_DELETE",
                 "deleted" if deleted else "action_failed",
                 int(time.time()),
@@ -715,14 +728,21 @@ class TelegramAdapter:
             pass
         except Exception:
             LOG.error("dialog_deletion_failed")
+            if action is not None:
+                self.store.finish_action(action_id, "failed")
+                self.store.enqueue_action_failure(action)
+                self.store.audit(
+                    action.sender_key,
+                    "DIALOG_DELETE",
+                    "action_failed",
+                    int(time.time()),
+                )
 
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int
     ) -> None:
         self._track_maintenance_task(
-            self._test_state_reset_worker(
-                sender_key, expected_updated_at, reset_at
-            )
+            self._test_state_reset_worker(sender_key, expected_updated_at, reset_at)
         )
 
     async def _test_state_reset_worker(

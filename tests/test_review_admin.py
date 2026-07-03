@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import stat
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from urllib.parse import urlencode
 from telethon import functions
 
 from tg_pm_gatekeeper.crypto import IdentifierProtector
+from tg_pm_gatekeeper.dataset import DatasetProtector, TrainingStore
 from tg_pm_gatekeeper.review_admin import ReviewAdminServer
 from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.store import StateStore
@@ -38,15 +40,12 @@ class FakeTelegramClient:
                 dialogs=[
                     SimpleNamespace(
                         folder_id=0,
-                        notify_settings=SimpleNamespace(
-                            silent=False, mute_until=None
-                        ),
+                        notify_settings=SimpleNamespace(silent=False, mute_until=None),
                     )
                 ]
             )
-        if (
-            self.fail_next_mute
-            and isinstance(request, functions.account.UpdateNotifySettingsRequest)
+        if self.fail_next_mute and isinstance(
+            request, functions.account.UpdateNotifySettingsRequest
         ):
             self.fail_next_mute = False
             raise RuntimeError("mute failed")
@@ -75,7 +74,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "would_quarantine",
             '["HR-01_MULTIPLE_LINK_BUTTONS"]',
             "{}",
-            700,
+            int(time.time()) + 700,
             100,
         )
 
@@ -141,6 +140,70 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await self.server.stop()
+
+    async def test_production_dispatch_requires_access_cookie(self) -> None:
+        status, _, _ = await self.server._dispatch(
+            "GET", "/", b"", request_headers={"host": "127.0.0.1:8765"}
+        )
+        self.assertEqual(status, 404)
+        login_token = self.server._access_token
+        status, headers, _ = await self.server._dispatch(
+            "GET",
+            f"/login?token={login_token}",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(status, 303)
+        self.assertNotEqual(self.server._access_token, login_token)
+        replay_status, _, _ = await self.server._dispatch(
+            "GET",
+            f"/login?token={login_token}",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(replay_status, 400)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, _, _ = await self.server._dispatch(
+            "GET",
+            "/",
+            b"",
+            request_headers={"host": "127.0.0.1:8765", "cookie": cookie},
+        )
+        self.assertEqual(status, 200)
+
+    async def test_dataset_list_hides_text_until_detail_and_supports_label(
+        self,
+    ) -> None:
+        training = TrainingStore(
+            Path(self.temp.name) / "training.sqlite3",
+            DatasetProtector(b"d" * 32),
+        )
+        self.addCleanup(training.close)
+        sample_id = training.collect(
+            sender_id=123,
+            message_id=1,
+            payload={"text": "dataset-private-canary", "features": {}},
+            weak_label="uncertain",
+            retention_days=30,
+            max_per_sender=3,
+        )
+        self.server.training_store = training
+        index = self.server._dataset_index_page()
+        self.assertNotIn(b"dataset-private-canary", index)
+        self.assertIn(b"Manually labeled", index)
+        self.assertIn(b"Weak spam / legitimate / uncertain", index)
+        self.assertIn(b"Expiring within 24 hours", index)
+        status, _, detail = self.server._dispatch_dataset(
+            "GET", f"/dataset/{sample_id}", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"dataset-private-canary", detail)
+        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
+        status, _, _ = self.server._dispatch_dataset(
+            "POST", f"/dataset/{sample_id}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(training.sample(sample_id).manual_label, "spam")
         self.assertFalse(self.server.socket_path.exists())
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
@@ -158,9 +221,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sender", self.server._identity_cache)
 
     async def test_spam_decision_performs_explicit_telegram_actions(self) -> None:
-        body = urlencode(
-            {"token": self.server._csrf_token, "action": "spam"}
-        ).encode()
+        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
         )
@@ -174,9 +235,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_spam_decision_does_not_repeat_existing_quarantine(self) -> None:
         self.store.quarantine("sender", 150)
-        body = urlencode(
-            {"token": self.server._csrf_token, "action": "spam"}
-        ).encode()
+        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
         )
@@ -187,9 +246,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_spam_partial_archive_failure_is_compensated(self) -> None:
         self.client.fail_next_mute = True
-        body = urlencode(
-            {"token": self.server._csrf_token, "action": "spam"}
-        ).encode()
+        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
         )
@@ -219,9 +276,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(
             self.client.requests[0], functions.folders.EditPeerFoldersRequest
         )
-        self.assertEqual(
-            self.client.requests[0].folder_peers[0].folder_id, 0
-        )
+        self.assertEqual(self.client.requests[0].folder_peers[0].folder_id, 0)
         self.assertEqual(self.store.sender("sender").status, "allowed")
 
     async def test_legitimate_decision_resolves_active_challenge(self) -> None:

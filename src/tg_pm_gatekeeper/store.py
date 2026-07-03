@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -17,13 +17,14 @@ SENDER_STATUSES = (
     "provisional",
     "allowed",
     "quarantined",
+    "suppressed",
 )
 SENDER_STATE_SCHEMA = """
 CREATE TABLE sender_state (
     sender_key TEXT PRIMARY KEY,
     status TEXT NOT NULL CHECK (status IN (
         'unknown', 'challenge_issuing', 'challenge_archiving', 'challenged',
-        'provisional', 'allowed', 'quarantined'
+        'provisional', 'allowed', 'quarantined', 'suppressed'
     )),
     challenge_id TEXT,
     answer_digest TEXT,
@@ -33,6 +34,9 @@ CREATE TABLE sender_state (
     challenge_action_reference BLOB,
     guidance_sent INTEGER NOT NULL DEFAULT 0 CHECK (guidance_sent IN (0, 1)),
     attempts INTEGER NOT NULL DEFAULT 0,
+    suppression_reason TEXT,
+    suppressed_until INTEGER,
+    revision INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
 """
@@ -94,6 +98,37 @@ CREATE TABLE IF NOT EXISTS review_queue (
 );
 CREATE INDEX IF NOT EXISTS review_queue_status_created_idx
     ON review_queue(status, created_at);
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_key TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('delete_dialog')),
+    reason TEXT NOT NULL,
+    reference BLOB NOT NULL,
+    execute_at INTEGER NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    mode_independent INTEGER NOT NULL DEFAULT 0 CHECK (mode_independent IN (0, 1)),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'cancelled', 'completed', 'failed')),
+    created_at INTEGER NOT NULL,
+    finished_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS pending_actions_status_time_idx
+    ON pending_actions(status, execute_at);
+CREATE TABLE IF NOT EXISTS decision_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_key TEXT NOT NULL,
+    detector TEXT NOT NULL,
+    signals TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    score REAL,
+    model_version TEXT,
+    planned_action TEXT NOT NULL,
+    actual_action TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS decision_events_created_idx
+    ON decision_events(created_at);
 """
 
 
@@ -108,6 +143,9 @@ class SenderState:
     challenge_action_reference: bytes | None
     guidance_sent: bool
     attempts: int
+    suppression_reason: str | None
+    suppressed_until: int | None
+    revision: int
     updated_at: int
 
 
@@ -138,6 +176,21 @@ class DialogSnapshot:
     mute_until: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class PendingAction:
+    id: int
+    sender_key: str
+    action: str
+    reason: str
+    reference: bytes
+    execute_at: int
+    expected_revision: int
+    mode_independent: int
+    status: str
+    created_at: int
+    finished_at: int | None
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -151,7 +204,7 @@ class StateStore:
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._initialize_schema()
             self._connection.execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES ('mode', 'observe')"
+                "INSERT OR IGNORE INTO settings(key, value) VALUES ('mode', 'monitor')"
             )
 
     def _initialize_schema(self) -> None:
@@ -165,6 +218,9 @@ class StateStore:
             return
         if version == 0:
             self._migrate_v0_to_v1()
+            version = SCHEMA_VERSION
+        if version == 1:
+            self._migrate_v1_to_v2()
         elif version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
@@ -201,6 +257,48 @@ class StateStore:
                 "CREATE INDEX IF NOT EXISTS automated_messages_created_idx "
                 "ON automated_messages(created_at)"
             )
+            self._connection.execute(
+                "UPDATE settings SET value=CASE value "
+                "WHEN 'observe' THEN 'monitor' WHEN 'enforce' THEN 'protect' "
+                "ELSE value END WHERE key='mode'"
+            )
+            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _migrate_v1_to_v2(self) -> None:
+        active = int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM sender_state WHERE status IN "
+                "('challenge_issuing','challenge_archiving','challenged')"
+            ).fetchone()[0]
+        )
+        if active:
+            raise StoreMigrationError("cannot migrate while active challenges exist")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                "ALTER TABLE sender_state RENAME TO sender_state_v1"
+            )
+            self._connection.execute(SENDER_STATE_SCHEMA)
+            self._connection.execute(
+                "INSERT INTO sender_state(sender_key,status,challenge_id,answer_digest,"
+                "challenge_expires_at,challenge_message_id,challenge_prompt,"
+                "challenge_action_reference,guidance_sent,attempts,updated_at) "
+                "SELECT sender_key,status,challenge_id,answer_digest,challenge_expires_at,"
+                "challenge_message_id,challenge_prompt,challenge_action_reference,"
+                "guidance_sent,attempts,updated_at FROM sender_state_v1"
+            )
+            self._connection.execute("DROP TABLE sender_state_v1")
+            self._connection.execute(
+                "UPDATE settings SET value=CASE value "
+                "WHEN 'observe' THEN 'monitor' WHEN 'enforce' THEN 'protect' "
+                "ELSE value END WHERE key='mode'"
+            )
             self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         except Exception:
             if self._connection.in_transaction:
@@ -235,15 +333,84 @@ class StateStore:
             row = self._connection.execute(
                 "SELECT value FROM settings WHERE key='mode'"
             ).fetchone()
-        return row["value"] if row else "observe"
+        return row["value"] if row else "monitor"
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"observe", "enforce"}:
+        if mode not in {"monitor", "protect"}:
             raise ValueError("invalid mode")
         with self._lock, self._connection:
             self._connection.execute(
                 "UPDATE settings SET value=? WHERE key='mode'", (mode,)
             )
+            if mode == "monitor":
+                now = int(time.time())
+                pending = self._connection.execute(
+                    "SELECT sender_key,reference,reason FROM pending_actions "
+                    "WHERE status='pending' AND mode_independent=0"
+                ).fetchall()
+                self._connection.execute(
+                    "UPDATE pending_actions SET status='cancelled',finished_at=? "
+                    "WHERE status='pending' AND mode_independent=0",
+                    (now,),
+                )
+                for item in pending:
+                    exists = self._connection.execute(
+                        "SELECT 1 FROM review_queue WHERE sender_key=? AND status='pending'",
+                        (item["sender_key"],),
+                    ).fetchone()
+                    if not exists:
+                        self._connection.execute(
+                            "INSERT INTO review_queue(sender_key,reference,classification,"
+                            "rule_codes,features,created_at,updated_at,expires_at) "
+                            "VALUES (?,?,?,'[]','{}',?,?,?)",
+                            (
+                                item["sender_key"],
+                                item["reference"],
+                                f"cancelled_{item['reason']}",
+                                now,
+                                now,
+                                now + 7 * 86400,
+                            ),
+                        )
+
+    def protect_preflight(self, *, max_heartbeat_age: int = 120) -> list[str]:
+        failures: list[str] = []
+        if not self.healthy(max_age=max_heartbeat_age):
+            failures.append("service heartbeat is stale")
+        with self._lock:
+            integrity = str(
+                self._connection.execute("PRAGMA quick_check").fetchone()[0]
+            )
+            active = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM sender_state WHERE status IN "
+                    "('challenge_issuing','challenge_archiving','challenged')"
+                ).fetchone()[0]
+            )
+            failed = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM pending_actions WHERE status='failed'"
+                ).fetchone()[0]
+            )
+            unsafe_pending = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM pending_actions AS action "
+                    "LEFT JOIN sender_state AS sender "
+                    "ON sender.sender_key=action.sender_key "
+                    "WHERE action.status='pending' AND (sender.sender_key IS NULL "
+                    "OR sender.status NOT IN ('suppressed','quarantined') "
+                    "OR sender.revision<>action.expected_revision)"
+                ).fetchone()[0]
+            )
+        if integrity != "ok":
+            failures.append("database integrity check failed")
+        if active:
+            failures.append("active challenges exist")
+        if failed:
+            failures.append("failed actions require review")
+        if unsafe_pending:
+            failures.append("stale pending actions require review")
+        return failures
 
     def claim_message(
         self, sender_key: str, message_id: int, now: int | None = None
@@ -269,13 +436,26 @@ class StateStore:
             row = self._connection.execute(
                 "SELECT status, challenge_id, answer_digest, challenge_expires_at, "
                 "challenge_message_id, challenge_prompt, challenge_action_reference, "
-                "guidance_sent, attempts, updated_at "
+                "guidance_sent, attempts, suppression_reason, suppressed_until, "
+                "revision, updated_at "
                 "FROM sender_state WHERE sender_key=?",
                 (sender_key,),
             ).fetchone()
         if not row:
             return SenderState(
-                "unknown", None, None, None, None, None, None, False, 0, 0
+                "unknown",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                False,
+                0,
+                None,
+                None,
+                0,
+                0,
             )
         return SenderState(
             row["status"],
@@ -287,6 +467,9 @@ class StateStore:
             row["challenge_action_reference"],
             bool(row["guidance_sent"]),
             row["attempts"],
+            row["suppression_reason"],
+            row["suppressed_until"],
+            row["revision"],
             row["updated_at"],
         )
 
@@ -308,14 +491,16 @@ class StateStore:
             self._connection.execute(
                 "INSERT INTO sender_state(sender_key, status, challenge_id, answer_digest, "
                 "challenge_expires_at, challenge_message_id, challenge_prompt, "
-                "challenge_action_reference, guidance_sent, attempts, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?) "
+                "challenge_action_reference, guidance_sent, attempts, suppression_reason, "
+                "suppressed_until, revision, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, NULL, NULL, 1, ?) "
                 "ON CONFLICT(sender_key) DO UPDATE SET status=excluded.status, "
                 "challenge_id=excluded.challenge_id, answer_digest=excluded.answer_digest, "
                 "challenge_expires_at=excluded.challenge_expires_at, attempts=excluded.attempts, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
                 "challenge_action_reference=NULL, guidance_sent=0, "
-                "updated_at=excluded.updated_at",
+                "suppression_reason=NULL, suppressed_until=NULL, "
+                "revision=sender_state.revision+1, updated_at=excluded.updated_at",
                 (
                     sender_key,
                     status,
@@ -329,9 +514,21 @@ class StateStore:
 
     def allow(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "allowed", now=now)
+        self.resolve_sender_actions(sender_key, now)
 
     def revoke(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "unknown", now=now)
+        self.resolve_sender_actions(sender_key, now)
+
+    def resolve_sender_actions(self, sender_key: str, now: int | None = None) -> int:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE pending_actions SET status='cancelled',finished_at=? "
+                "WHERE sender_key=? AND status IN ('pending','failed')",
+                (timestamp, sender_key),
+            )
+        return cursor.rowcount
 
     def reset_test_sender(
         self, sender_key: str, expected_updated_at: int, now: int | None = None
@@ -343,14 +540,55 @@ class StateStore:
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
                 "challenge_action_reference=NULL, guidance_sent=0, attempts=0, "
+                "suppression_reason=NULL, suppressed_until=NULL, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND updated_at=? "
-                "AND status IN ('provisional', 'quarantined')",
+                "AND status IN ('provisional', 'quarantined', 'suppressed')",
                 (timestamp, sender_key, expected_updated_at),
             )
         return cursor.rowcount == 1
 
     def quarantine(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "quarantined", now=now)
+
+    def suppress(
+        self,
+        sender_key: str,
+        reason: str,
+        *,
+        until: int | None,
+        reference: bytes | None = None,
+        now: int | None = None,
+    ) -> SenderState:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO sender_state(sender_key,status,suppression_reason,"
+                "suppressed_until,challenge_action_reference,revision,updated_at) "
+                "VALUES (?,'suppressed',?,?,?,1,?) ON CONFLICT(sender_key) DO UPDATE SET "
+                "status='suppressed',challenge_id=NULL,answer_digest=NULL,"
+                "challenge_expires_at=NULL,challenge_message_id=NULL,challenge_prompt=NULL,"
+                "challenge_action_reference=COALESCE(excluded.challenge_action_reference,"
+                "sender_state.challenge_action_reference),guidance_sent=0,attempts=0,"
+                "suppression_reason=excluded.suppression_reason,"
+                "suppressed_until=excluded.suppressed_until,revision=sender_state.revision+1,"
+                "updated_at=excluded.updated_at",
+                (sender_key, reason, until, reference, timestamp),
+            )
+        return self.sender(sender_key)
+
+    def release_expired_suppression(
+        self, sender_key: str, now: int | None = None
+    ) -> bool:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
+                "suppressed_until=NULL,challenge_action_reference=NULL,revision=revision+1,"
+                "updated_at=? WHERE sender_key=? AND status='suppressed' "
+                "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
+                (timestamp, sender_key, timestamp),
+            )
+        return cursor.rowcount == 1
 
     def set_challenge(
         self,
@@ -432,14 +670,12 @@ class StateStore:
             )
         return cursor.rowcount == 1
 
-    def activate_challenge(
-        self, sender_key: str, now: int | None = None
-    ) -> bool:
+    def activate_challenge(self, sender_key: str, now: int | None = None) -> bool:
         timestamp = now or int(time.time())
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE sender_state SET status='challenged', challenge_prompt=NULL, "
-                "challenge_action_reference=NULL, updated_at=? WHERE sender_key=? "
+                "revision=revision+1, updated_at=? WHERE sender_key=? "
                 "AND status='challenge_archiving'",
                 (timestamp, sender_key),
             )
@@ -485,9 +721,7 @@ class StateStore:
             )
         return cursor.rowcount == 1
 
-    def save_dialog_snapshot(
-        self, sender_key: str, snapshot: DialogSnapshot
-    ) -> None:
+    def save_dialog_snapshot(self, sender_key: str, snapshot: DialogSnapshot) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT OR IGNORE INTO dialog_snapshots("
@@ -529,13 +763,14 @@ class StateStore:
         timestamp = now or int(time.time())
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "UPDATE sender_state SET status='quarantined', challenge_id=NULL, "
+                "UPDATE sender_state SET status='suppressed', challenge_id=NULL, "
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
-                "challenge_action_reference=NULL, guidance_sent=0, attempts=0, "
+                "guidance_sent=0, attempts=0, suppression_reason='challenge_timeout', "
+                "suppressed_until=?, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND status='challenged' "
                 "AND challenge_expires_at=?",
-                (timestamp, sender_key, expires_at),
+                (timestamp + 86400, timestamp, sender_key, expires_at),
             )
         return cursor.rowcount == 1
 
@@ -571,6 +806,159 @@ class StateStore:
                 "INSERT INTO audit(sender_key, rule_code, outcome, created_at) VALUES (?, ?, ?, ?)",
                 (sender_key, rule_code, outcome, timestamp),
             )
+
+    def record_decision(
+        self,
+        sender_key: str,
+        *,
+        detector: str,
+        signals: str,
+        severity: str,
+        score: float | None,
+        model_version: str | None,
+        planned_action: str,
+        actual_action: str,
+        policy_version: str,
+        now: int | None = None,
+    ) -> None:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO decision_events(sender_key,detector,signals,severity,score,"
+                "model_version,planned_action,actual_action,policy_version,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    sender_key,
+                    detector,
+                    signals,
+                    severity,
+                    score,
+                    model_version,
+                    planned_action,
+                    actual_action,
+                    policy_version,
+                    timestamp,
+                ),
+            )
+
+    def schedule_action(
+        self,
+        sender_key: str,
+        *,
+        reason: str,
+        reference: bytes,
+        execute_at: int,
+        expected_revision: int,
+        mode_independent: bool = False,
+        now: int | None = None,
+    ) -> int:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            self._connection.execute(
+                "UPDATE pending_actions SET status='cancelled',finished_at=? "
+                "WHERE sender_key=? AND status='pending'",
+                (timestamp, sender_key),
+            )
+            cursor = self._connection.execute(
+                "INSERT INTO pending_actions(sender_key,action,reason,reference,execute_at,"
+                "expected_revision,mode_independent,created_at) "
+                "VALUES (?,'delete_dialog',?,?,?,?,?,?)",
+                (
+                    sender_key,
+                    reason,
+                    reference,
+                    execute_at,
+                    expected_revision,
+                    int(mode_independent),
+                    timestamp,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def pending_actions(self) -> list[PendingAction]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id,sender_key,action,reason,reference,execute_at,"
+                "expected_revision,mode_independent,status,created_at,finished_at "
+                "FROM pending_actions "
+                "WHERE status='pending' ORDER BY execute_at"
+            ).fetchall()
+        return [PendingAction(**dict(row)) for row in rows]
+
+    def claim_action(self, action_id: int) -> PendingAction | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT id,sender_key,action,reason,reference,execute_at,"
+                "expected_revision,mode_independent,status,created_at,finished_at "
+                "FROM pending_actions "
+                "WHERE id=? AND status='pending'",
+                (action_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if self.get_mode() != "protect" and not bool(row["mode_independent"]):
+                return None
+            state = self.sender(str(row["sender_key"]))
+            if state.status not in {
+                "suppressed",
+                "quarantined",
+            } or state.revision != int(row["expected_revision"]):
+                return None
+        return PendingAction(**dict(row))
+
+    def finish_action(
+        self, action_id: int, status: str, now: int | None = None
+    ) -> bool:
+        if status not in {"completed", "failed", "cancelled"}:
+            raise ValueError("invalid action status")
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            if status == "completed":
+                cursor = self._connection.execute(
+                    "UPDATE pending_actions SET status=?,finished_at=?,reference=X'' "
+                    "WHERE id=? AND status='pending'",
+                    (status, timestamp, action_id),
+                )
+            else:
+                cursor = self._connection.execute(
+                    "UPDATE pending_actions SET status=?,finished_at=? "
+                    "WHERE id=? AND status='pending'",
+                    (status, timestamp, action_id),
+                )
+        return cursor.rowcount == 1
+
+    def clear_action_reference(self, sender_key: str, expected_revision: int) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET challenge_action_reference=NULL "
+                "WHERE sender_key=? AND status='suppressed' AND revision=?",
+                (sender_key, expected_revision),
+            )
+        return cursor.rowcount == 1
+
+    def enqueue_action_failure(
+        self, action: PendingAction, now: int | None = None
+    ) -> None:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            exists = self._connection.execute(
+                "SELECT 1 FROM review_queue WHERE sender_key=? AND status='pending'",
+                (action.sender_key,),
+            ).fetchone()
+            if not exists:
+                self._connection.execute(
+                    "INSERT INTO review_queue(sender_key,reference,classification,rule_codes,"
+                    "features,created_at,updated_at,expires_at) "
+                    "VALUES (?,?,?,'[]','{}',?,?,?)",
+                    (
+                        action.sender_key,
+                        action.reference,
+                        f"{action.reason}_action_failed",
+                        timestamp,
+                        timestamp,
+                        timestamp + 7 * 86400,
+                    ),
+                )
 
     def enqueue_review(
         self,
@@ -632,15 +1020,18 @@ class StateStore:
             )
         return int(cursor.lastrowid)
 
-    def review_items(self, *, limit: int = 100) -> list[ReviewItem]:
+    def review_items(
+        self, *, limit: int = 100, now: int | None = None
+    ) -> list[ReviewItem]:
+        timestamp = int(time.time()) if now is None else now
         with self._lock:
             rows = self._connection.execute(
                 "SELECT id, sender_key, reference, classification, rule_codes, "
                 "features, status, message_count, created_at, updated_at, "
                 "expires_at, reviewed_at "
-                "FROM review_queue WHERE status='pending' "
+                "FROM review_queue WHERE status='pending' AND expires_at>? "
                 "ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                (timestamp, limit),
             ).fetchall()
         return [ReviewItem(**dict(row)) for row in rows]
 
@@ -680,6 +1071,11 @@ class StateStore:
                 "UPDATE review_queue SET status=?, reviewed_at=?, reference=NULL "
                 "WHERE sender_key=? AND status='pending'",
                 (status, timestamp, sender_key),
+            )
+            self._connection.execute(
+                "UPDATE pending_actions SET status='cancelled',finished_at=? "
+                "WHERE sender_key=? AND status IN ('pending','failed')",
+                (timestamp, sender_key),
             )
         return cursor.rowcount
 
@@ -761,9 +1157,18 @@ class StateStore:
             ).fetchall()
         return [int(row["message_id"]) for row in rows]
 
-    def latest_challenge_started_at(
-        self, sender_key: str, before: int
-    ) -> int | None:
+    def automated_message_ids_between(
+        self, sender_key: str, first_message_id: int, last_message_id: int
+    ) -> list[int]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT message_id FROM automated_messages WHERE sender_key=? "
+                "AND message_id BETWEEN ? AND ? ORDER BY message_id",
+                (sender_key, first_message_id, last_message_id),
+            ).fetchall()
+        return [int(row["message_id"]) for row in rows]
+
+    def latest_challenge_started_at(self, sender_key: str, before: int) -> int | None:
         with self._lock:
             row = self._connection.execute(
                 "SELECT MAX(processed_at) AS started_at FROM processed_messages "
@@ -814,6 +1219,13 @@ class StateStore:
                 "DELETE FROM automated_messages WHERE created_at < ?", (cutoff,)
             )
             self._connection.execute(
+                "DELETE FROM decision_events WHERE created_at < ?", (cutoff,)
+            )
+            self._connection.execute(
+                "DELETE FROM pending_actions WHERE status!='pending' AND finished_at < ?",
+                (cutoff,),
+            )
+            self._connection.execute(
                 "DELETE FROM review_queue WHERE "
                 "(status='pending' AND expires_at <= ?) OR "
                 "(status!='pending' AND reviewed_at < ?)",
@@ -851,6 +1263,16 @@ class StateStore:
                     (int(time.time()) - 7 * 86400,),
                 )
             }
+            pending_actions = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM pending_actions WHERE status='pending'"
+                ).fetchone()[0]
+            )
+            action_failures = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM pending_actions WHERE status='failed'"
+                ).fetchone()[0]
+            )
         return {
             "mode": self.get_mode(),
             "allowed": states.get("allowed", 0),
@@ -859,8 +1281,11 @@ class StateStore:
             "challenge_archiving": states.get("challenge_archiving", 0),
             "provisional": states.get("provisional", 0),
             "quarantined": states.get("quarantined", 0),
+            "suppressed": states.get("suppressed", 0),
             "audit_records": audit_count,
             "pending_reviews": pending_reviews,
+            "pending_actions": pending_actions,
+            "action_failures": action_failures,
             "heartbeat": int(heartbeat["value"]) if heartbeat else None,
             "challenge_sent_7d": challenge_metrics.get("CHALLENGE_SENT", 0),
             "challenge_correct_7d": challenge_metrics.get("CHALLENGE_CORRECT", 0),
@@ -871,9 +1296,7 @@ class StateStore:
                 "CHALLENGE_NON_NUMERIC", 0
             ),
             "challenge_timeout_7d": challenge_metrics.get("CHALLENGE_TIMEOUT", 0),
-            "challenge_exhausted_7d": challenge_metrics.get(
-                "attempts_exhausted", 0
-            ),
+            "challenge_exhausted_7d": challenge_metrics.get("attempts_exhausted", 0),
             "challenge_restore_failed_7d": challenge_metrics.get(
                 "CHALLENGE_RESTORE", 0
             ),

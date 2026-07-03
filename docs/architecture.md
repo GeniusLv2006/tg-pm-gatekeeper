@@ -12,10 +12,10 @@
 ```text
 unknown -> challenge_issuing -> challenge_archiving -> challenged
                                                      -> provisional -> allowed
-                                                     -> quarantined
+                                                     -> suppressed
 
-unknown -> quarantined (high-confidence rule)
-provisional -> quarantined (high-confidence rule)
+unknown -> suppressed (critical deterministic rule)
+provisional -> suppressed (critical deterministic rule)
 allowed -> unknown (manual revoke)
 ```
 
@@ -29,19 +29,21 @@ later manual reply from the account owner, an explicit review, or a safe operato
 
 1. Accept only incoming private-message events.
 2. Exclude contacts, local allowlist entries, service accounts, bots, and peers with a trusted prior conversation.
-3. Apply deterministic, high-precision spam rules. Authored text, Telegram-supplied webpage preview
+3. Apply tiered deterministic rules. Critical rules are denylisted domains, multiple interactive
+   link buttons, and forwarded interactive link buttons. High-risk rules enter the challenge flow;
+   a repeated-link burst is only a signal. Authored text, Telegram-supplied webpage preview
    metadata, and links are kept separate from quoted text and links so quoted content cannot trigger
    generic promotion or link-count rules. The dedicated quoted crypto-service rule still inspects
    quote text in memory.
-4. In observation mode, record the simulated result for operator review and take no Telegram action.
-5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender and
-   bind it to the outgoing Telegram message ID.
+4. In monitor mode, record the simulated result for operator review and take no Telegram action.
+5. In protect mode, persist and silently delete critical-rule dialogs; send one expiring challenge
+   to ordinary and high-risk unknown senders and bind it to the outgoing Telegram message ID.
 6. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
    the verification exchange. After two incorrect numeric answers, warn that deletion is pending,
-   wait 10 seconds, then revoke and delete the entire private conversation. A timeout leaves the
-   dialog quarantined.
+   wait 10 seconds, then delete the entire private conversation and suppress the sender for seven
+   days. A timeout follows the same warned deletion flow with a 24-hour suppression.
 
-In enforcement mode the challenge is written in English and defaults to 60 seconds. Its title is
+In protect mode the challenge is written in English and defaults to 60 seconds. Its title is
 `⚠️ Verification Required`; Telegram-native bold entities emphasize the title, deadline, expression,
 and configured attempt count without adding markup to the persisted recovery text. The response
 window starts only after Telegram confirms prompt delivery. The dialog is archived and muted before
@@ -49,18 +51,18 @@ the challenge becomes active. Replies to another message, standalone answers, an
 do not consume an attempt or extend the deadline. At most one corrective hint is sent per challenge.
 Numeric input is NFKC-normalized before comparison. A correct answer restores the dialog and its
 previous archive, silent, and mute settings while keeping hard-rule screening active, then deletes
-the challenge prompt, replies, corrective notices, and success notice in one Telegram request.
-Restoration is retried three times; persistent failure creates a manual review item instead of
-silently treating a correct sender as spam. A timeout leaves the dialog archived and muted. Two
+only explicitly indexed challenge, answer, corrective, and success messages in one Telegram request.
+Restoration is retried three times; persistent failure creates an exception review instead of
+silently treating a correct sender as spam. A timeout sends a deletion warning. Two
 incorrect numeric answers send a failure notice with a 10-second countdown, then delete the private
 conversation for both sides. If the warning cannot be delivered, deletion is not scheduled; if the
-eventual deletion fails, the already archived and muted dialog remains quarantined.
+eventual deletion fails, the already archived and muted dialog enters exception review.
 The arithmetic is interaction friction rather than a CAPTCHA and is not treated as proof of humanity.
 Each challenge independently selects addition, non-negative subtraction, or basic multiplication;
 operands are bounded so answers remain suitable for quick mental arithmetic.
 
 An optional single-account test path is enabled only when `TG_TEST_SENDER_ID` is configured. It
-bypasses contact, prior-history, hard-rule, observation-mode, and outbound-quota shortcuts so
+bypasses contact, prior-history, hard-rule, monitor-mode, and outbound-quota shortcuts so
 repeated tests exercise the actual arithmetic flow. Successful and terminal-failure states are
 conditionally reset to `unknown` after 60 seconds; the conditional update prevents an older timer
 from resetting a newer challenge. Exhausted attempts use the normal warning plus delayed
@@ -68,13 +70,13 @@ whole-dialog deletion policy. A timeout sends a failure notice, then deletes onl
 recorded during that challenge after 10 seconds. Delayed test-account cleanup and state reset are
 reconstructed after restart.
 
-Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
+Monitor mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
 with a simulated challenge or quarantine. Further messages from that sender update the same item and
 increment its message counter. The retained reference normally follows the newest message. If a row
 already represents a simulated quarantine, a later lower-risk message increments the counter without
-replacing that higher-severity classification or its referenced message. Observation mode sends no
+replacing that higher-severity classification or its referenced message. Monitor mode sends no
 challenges and changes no Telegram dialog.
-Enforcement must be enabled with the local operator CLI after review.
+Protection must be enabled with `mode protect`; `mode monitor` cancels pending destructive jobs.
 
 ## Post-event review
 
@@ -104,28 +106,30 @@ verdicts may remain for the normal audit retention period.
 
 ## Implemented action policy
 
-| Input | Observation mode | Enforcement mode |
+| Input | Monitor mode | Protect mode |
 | --- | --- | --- |
 | Trusted sender | Allow | Allow |
 | Ordinary unknown sender | Queue simulated challenge | Temporary archive/mute and challenge |
 | Provisional sender | Continue hard-rule screening | Continue hard-rule screening |
-| High-confidence rule | Queue simulated quarantine | Archive and mute |
+| Critical rule | Queue planned deletion | Persist, delete, and suppress |
+| High-risk rule | Queue simulated challenge | Challenge |
+| Repeated-link signal | Queue simulated challenge | Challenge |
 | Challenge send limit reached | Not applicable | Archive, mute, and queue review |
 | Manual legitimate review | Allow sender | Allow sender |
 | Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
 
-Deletion is limited to verification cleanup after success, warned and delayed whole-dialog deletion
-after exhausted numeric attempts, and the dedicated test account's timed-out challenge cleanup.
-Blocking, reporting, AI classification, and unrelated conversation cleanup are not implemented.
+Whole-dialog deletion is used for critical deterministic rules and warned challenge failure. Pending
+deletions persist across restart and execute only when mode, sender status, and state revision still
+match. Blocking, reporting, model inference, and unrelated conversation cleanup are not implemented.
 
 ## Data boundaries
 
 The persistent store contains sender state, challenge metadata, generated challenge prompts while
 delivery is incomplete, rule identifiers, timestamps, action outcomes, structural review features,
 automated outgoing message IDs, encrypted short-lived Telegram references, and the prior archive and
-notification settings needed to reverse a Gatekeeper action. It does not store private message bodies
-or profile data. Generated prompts and recovery references are cleared when a challenge activates or
-rolls back. Dialog-setting snapshots are cleared after restoration or a terminal review decision.
+notification settings needed to reverse a Gatekeeper action, pending action jobs, suppression state,
+and privacy-safe detector decisions. The core state database does not store private message bodies or
+profile data. Peer references remain encrypted until a challenge reaches its terminal action.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
@@ -149,6 +153,13 @@ including these envelopes, must not be included in general backups.
 The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
 authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.
 
+Optional training samples live in a separate owner-only `training.sqlite3`. Authored text/captions
+and structural features are encrypted with AES-256-GCM under an independent dataset key. Dataset-key
+derived HMAC tokens enforce per-sender and per-message limits without storing raw identities. Media,
+quoted text, names, usernames, raw IDs, access hashes, and the dedicated test sender are excluded.
+Samples expire after 30 days by default and no later than 90 days. This release does not train or run
+a model.
+
 ## Failure behavior
 
 - Incoming messages, timeouts, recovery, and review decisions are serialized per derived sender key.
@@ -163,5 +174,5 @@ authorization key without persisting Telethon's entity cache of names, usernames
   instead of claiming that the sender is unconfined.
 - Exhausted outbound capacity archives the unknown dialog and creates a manual review item instead
   of allowing challenge delivery to fail open.
-- Archiving and muting are the only destructive-adjacent operations in v1. Deletion, blocking, and
-  reporting are not implemented.
+- Pending deletion jobs include an expected state revision. Switching to monitor cancels them and
+  creates exception reviews; restart recovery cannot execute stale work.

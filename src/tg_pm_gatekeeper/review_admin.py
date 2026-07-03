@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from telethon import functions, types
 
+from .dataset import TrainingStore
 from .service import GatekeeperService
 from .store import DialogSnapshot, ReviewItem, StateStore
 
@@ -46,6 +47,10 @@ class ReviewAdminServer:
         *,
         mute_days: int,
         cancel_timeout: Callable[[str], None] = lambda _sender_key: None,
+        training_store: TrainingStore | None = None,
+        dataset_collection: bool = False,
+        dataset_retention_days: int = 30,
+        dataset_max_messages_per_sender: int = 3,
     ) -> None:
         self.socket_path = socket_path
         self.store = store
@@ -54,11 +59,16 @@ class ReviewAdminServer:
         self.telegram_client = telegram_client
         self.mute_days = mute_days
         self.cancel_timeout = cancel_timeout
+        self.training_store = training_store
+        self.dataset_collection = dataset_collection
+        self.dataset_retention_days = dataset_retention_days
+        self.dataset_max_messages_per_sender = dataset_max_messages_per_sender
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
-        self._identity_cache: dict[
-            str, tuple[float, str | None, str | None]
-        ] = {}
+        self._access_token = secrets.token_urlsafe(32)
+        self._session_token = secrets.token_urlsafe(32)
+        self.access_token_path = socket_path.with_suffix(".access-token")
+        self._identity_cache: dict[str, tuple[float, str | None, str | None]] = {}
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -74,6 +84,7 @@ class ReviewAdminServer:
             self._handle_connection, path=self.socket_path
         )
         os.chmod(self.socket_path, 0o600)
+        self._write_access_token()
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -84,13 +95,16 @@ class ReviewAdminServer:
             self.socket_path.unlink()
         except FileNotFoundError:
             pass
+        self.access_token_path.unlink(missing_ok=True)
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            method, target, body = await self._read_request(reader)
-            status, headers, response = await self._dispatch(method, target, body)
+            method, target, body, request_headers = await self._read_request(reader)
+            status, headers, response = await self._dispatch(
+                method, target, body, request_headers=request_headers
+            )
         except (ValueError, asyncio.IncompleteReadError):
             status, headers, response = 400, {}, self._page("Invalid request")
         except Exception:
@@ -127,7 +141,7 @@ class ReviewAdminServer:
 
     async def _read_request(
         self, reader: asyncio.StreamReader
-    ) -> tuple[str, str, bytes]:
+    ) -> tuple[str, str, bytes, dict[str, str]]:
         header = await reader.readuntil(b"\r\n\r\n")
         if len(header) > MAX_HEADER_BYTES:
             raise ValueError("headers too large")
@@ -149,14 +163,63 @@ class ReviewAdminServer:
             raise ValueError("invalid content length") from exc
         if content_length < 0 or content_length > MAX_BODY_BYTES:
             raise ValueError("body too large")
-        return parts[0], parts[1], await reader.readexactly(content_length)
+        return (
+            parts[0],
+            parts[1],
+            await reader.readexactly(content_length),
+            headers,
+        )
 
     async def _dispatch(
-        self, method: str, target: str, body: bytes
+        self,
+        method: str,
+        target: str,
+        body: bytes,
+        *,
+        request_headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
-        path = urlsplit(target).path
+        parsed = urlsplit(target)
+        path = parsed.path
+        if request_headers is not None:
+            host = request_headers.get("host", "")
+            if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
+                return 400, {}, self._page("Invalid host")
+            if path == "/login":
+                token = parse_qs(parsed.query).get("token", [""])[0]
+                if not secrets.compare_digest(token, self._access_token):
+                    return 400, {}, self._page("Invalid access token")
+                self._access_token = secrets.token_urlsafe(32)
+                self._write_access_token()
+                return (
+                    303,
+                    {
+                        "Location": "/",
+                        "Set-Cookie": (
+                            f"gatekeeper_session={self._session_token}; HttpOnly; "
+                            "SameSite=Strict; Path=/"
+                        ),
+                    },
+                    b"",
+                )
+            cookie = request_headers.get("cookie", "")
+            if not secrets.compare_digest(
+                self._cookie_value(cookie, "gatekeeper_session"), self._session_token
+            ):
+                return 404, {}, self._page("Not found")
+            if method == "POST":
+                origin = request_headers.get("origin", "")
+                if origin not in {f"http://{host}"}:
+                    return 400, {}, self._page("Invalid origin")
         if path == "/" and method == "GET":
             return 200, {}, await self._index_page()
+        if path == "/dataset" and method == "GET":
+            try:
+                page = max(1, int(parse_qs(parsed.query).get("page", ["1"])[0]))
+            except ValueError:
+                return 400, {}, self._page("Invalid page")
+            return 200, {}, self._dataset_index_page(page)
+        if path.startswith("/dataset/"):
+            return self._dispatch_dataset(method, path, body)
         if not path.startswith("/review/"):
             return 404, {}, self._page("Not found")
         try:
@@ -164,7 +227,9 @@ class ReviewAdminServer:
         except ValueError:
             return 404, {}, self._page("Not found")
         item = self.store.review_item(review_id)
-        if item is None:
+        if item is None or (
+            item.status == "pending" and item.expires_at <= int(time.time())
+        ):
             return 404, {}, self._page("Review item not found")
         if method == "GET":
             return await self._show_review(item)
@@ -181,21 +246,25 @@ class ReviewAdminServer:
                 return 409, {}, self._page("This item has already been reviewed")
             state = self.store.sender(item.sender_key)
             if action == "legitimate":
-                if state.status in {"challenged", "quarantined"}:
+                if state.status in {"challenged", "quarantined", "suppressed"}:
                     peer = self._peer_from_item(item)
                     if not await self._restore(peer, item.sender_key):
-                        return 500, {}, self._page(
-                            "Telegram action failed; item was not changed"
+                        return (
+                            500,
+                            {},
+                            self._page("Telegram action failed; item was not changed"),
                         )
                 self.store.allow(item.sender_key)
                 self.cancel_timeout(item.sender_key)
                 self.store.decide_sender_reviews(item.sender_key, "legitimate")
             elif action == "spam":
-                if state.status not in {"challenged", "quarantined"}:
+                if state.status not in {"challenged", "quarantined", "suppressed"}:
                     peer = self._peer_from_item(item)
                     if not await self._archive_and_mute(peer, item.sender_key):
-                        return 500, {}, self._page(
-                            "Telegram action failed; item was not changed"
+                        return (
+                            500,
+                            {},
+                            self._page("Telegram action failed; item was not changed"),
                         )
                     self.store.quarantine(item.sender_key)
                 elif state.status == "challenged":
@@ -210,15 +279,145 @@ class ReviewAdminServer:
             self._identity_cache.pop(item.sender_key, None)
         return 303, {"Location": "/"}, b""
 
+    def _write_access_token(self) -> None:
+        temporary = self.access_token_path.with_suffix(".access-token.tmp")
+        temporary.unlink(missing_ok=True)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="ascii") as output:
+                output.write(self._access_token)
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.replace(self.access_token_path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _cookie_value(header: str, name: str) -> str:
+        for item in header.split(";"):
+            key, separator, value = item.strip().partition("=")
+            if separator and key == name:
+                return value
+        return ""
+
+    def _dataset_index_page(self, page: int = 1) -> bytes:
+        if self.training_store is None:
+            return self._page("Dataset collection is disabled")
+        stats = self.training_store.statistics()
+        samples = self.training_store.summaries(limit=101, offset=(page - 1) * 100)
+        has_next = len(samples) > 100
+        groups: dict[str, str] = {}
+        for sample in samples[:100]:
+            groups.setdefault(sample.sender_token, f"Sender {len(groups) + 1}")
+        rows = (
+            "".join(
+                f"<tr><td><a href='/dataset/{sample.id}'>#{sample.id}</a></td>"
+                f"<td>{html.escape(groups[sample.sender_token])}</td>"
+                f"<td>{html.escape(sample.weak_label)}</td>"
+                f"<td>{html.escape(sample.manual_label or 'Unlabeled')}</td>"
+                f"<td>{html.escape(self._relative_age(sample.created_at))}</td></tr>"
+                for sample in samples[:100]
+            )
+            or "<tr><td colspan='5'>No unexpired samples.</td></tr>"
+        )
+        navigation = "<p class='back'>"
+        if page > 1:
+            navigation += f"<a href='/dataset?page={page - 1}'>← Newer</a> "
+        if has_next:
+            navigation += f"<a href='/dataset?page={page + 1}'>Older →</a>"
+        navigation += "</p>"
+        labeled = sum(
+            stats.get(label, 0) for label in ("spam", "legitimate", "uncertain")
+        )
+        overview = (
+            "<dl>"
+            f"<dt>Total samples</dt><dd>{stats.get('total', 0)}</dd>"
+            f"<dt>Manually labeled</dt><dd>{labeled}</dd>"
+            f"<dt>Spam / Legitimate / Uncertain</dt><dd>"
+            f"{stats.get('spam', 0)} / {stats.get('legitimate', 0)} / "
+            f"{stats.get('uncertain', 0)}</dd>"
+            f"<dt>Weak spam / legitimate / uncertain</dt><dd>"
+            f"{stats.get('weak_spam_candidate', 0)} / "
+            f"{stats.get('weak_legitimate_candidate', 0)} / "
+            f"{stats.get('weak_uncertain', 0)}</dd>"
+            f"<dt>Expiring within 24 hours</dt><dd>{stats.get('expiring_24h', 0)}</dd>"
+            f"<dt>Exportable gold labels</dt><dd>{stats.get('exportable_gold', 0)}</dd>"
+            "</dl>"
+        )
+        content = (
+            self._masthead("Dataset", f"{stats.get('total', 0)} samples")
+            + "<p class='back'><a href='/'>← Review queue</a></p><main>"
+            + "<section class='queue-intro'><p class='eyebrow'>Encrypted local dataset</p>"
+            + f"<h2>{stats.get('exportable_gold', 0)} gold labels ready to export.</h2>"
+            + f"<p>Collection: {'on' if self.dataset_collection else 'off'} · "
+            + f"retention {self.dataset_retention_days} days · "
+            + f"maximum {self.dataset_max_messages_per_sender} messages per sender.</p>"
+            + overview
+            + "</section>"
+            + "<div class='table-shell'><table><thead><tr><th>Sample</th><th>Sender group</th>"
+            + "<th>Weak label</th><th>Manual label</th><th>Age</th></tr></thead>"
+            + f"<tbody>{rows}</tbody></table></div>{navigation}</main>"
+        )
+        return self._page(content, raw=True)
+
+    def _dispatch_dataset(
+        self, method: str, path: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        if self.training_store is None:
+            return 404, {}, self._page("Dataset collection is disabled")
+        try:
+            sample_id = int(path.removeprefix("/dataset/"))
+        except ValueError:
+            return 404, {}, self._page("Sample not found")
+        sample = self.training_store.sample(sample_id)
+        if sample is None:
+            return 404, {}, self._page("Sample not found")
+        if method == "POST":
+            values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+            if not secrets.compare_digest(
+                values.get("token", [""])[0], self._csrf_token
+            ):
+                return 400, {}, self._page("Invalid action token")
+            action = values.get("action", [""])[0]
+            if action == "delete":
+                self.training_store.delete(sample_id)
+            elif action in {"spam", "legitimate", "uncertain"}:
+                self.training_store.label(sample_id, action)
+            else:
+                return 400, {}, self._page("Unknown action")
+            return 303, {"Location": "/dataset"}, b""
+        if method != "GET":
+            return 405, {"Allow": "GET, POST"}, self._page("Method not allowed")
+        payload = sample.payload
+        text = str(payload.get("text", ""))
+        details = html.escape(json.dumps(payload, ensure_ascii=False, indent=2))
+        actions = "".join(
+            self._action_form(sample_id, label, label.title(), base="dataset")
+            for label in ("spam", "legitimate", "uncertain")
+        ) + self._action_form(
+            sample_id, "delete", "Delete sample", danger=True, base="dataset"
+        )
+        content = (
+            self._masthead("Dataset sample", f"#{sample.id}")
+            + "<p class='back'><a href='/dataset'>← Dataset</a></p>"
+            + f"<main><section class='message-panel'><pre class='message'>{html.escape(text)}</pre>"
+            + f"<details><summary>Encrypted payload metadata</summary><pre>{details}</pre></details>"
+            + f"<div class='actions'>{actions}</div></section></main>"
+        )
+        return 200, {}, self._page(content, raw=True)
+
     def _peer_from_item(self, item: ReviewItem) -> types.InputPeerUser:
         if item.reference is None:
             raise ValueError("review reference has expired")
         user_id, access_hash, _ = self.protector.open_review_reference(item.reference)
         return types.InputPeerUser(user_id=user_id, access_hash=access_hash)
 
-    async def _show_review(
-        self, item: ReviewItem
-    ) -> tuple[int, dict[str, str], bytes]:
+    async def _show_review(self, item: ReviewItem) -> tuple[int, dict[str, str], bytes]:
         if item.status != "pending" or item.reference is None:
             return 409, {}, self._page("This item is no longer pending")
         user_id, access_hash, message_id = self.protector.open_review_reference(
@@ -369,7 +568,8 @@ class ReviewAdminServer:
         if not rows:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
-            self._masthead("Observation desk", f"{len(items)} pending")
+            self._masthead("Monitor desk", f"{len(items)} pending")
+            + "<p class='back'><a href='/dataset'>Dataset →</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Private review channel</p>"
             "<h2>Decisions waiting for a human signal.</h2>"
             "<p>Sender identity is resolved live from Telegram and kept only in short-lived "
@@ -467,14 +667,17 @@ class ReviewAdminServer:
 
     @staticmethod
     def _sender_name(sender) -> tuple[str, str | None]:
-        name = " ".join(
-            value
-            for value in (
-                getattr(sender, "first_name", None),
-                getattr(sender, "last_name", None),
+        name = (
+            " ".join(
+                value
+                for value in (
+                    getattr(sender, "first_name", None),
+                    getattr(sender, "last_name", None),
+                )
+                if value
             )
-            if value
-        ) or "Unnamed sender"
+            or "Unnamed sender"
+        )
         return name, getattr(sender, "username", None)
 
     @staticmethod
@@ -505,11 +708,17 @@ class ReviewAdminServer:
         )
 
     def _action_form(
-        self, review_id: int, action: str, label: str, *, danger: bool = False
+        self,
+        review_id: int,
+        action: str,
+        label: str,
+        *,
+        danger: bool = False,
+        base: str = "review",
     ) -> str:
         button_class = " class='danger'" if danger else ""
         return (
-            f"<form method='post' action='/review/{review_id}'>"
+            f"<form method='post' action='/{base}/{review_id}'>"
             f"<input type='hidden' name='token' value='{self._csrf_token}'>"
             f"<input type='hidden' name='action' value='{action}'>"
             f"<button{button_class} type='submit'>{html.escape(label)}</button></form>"

@@ -20,6 +20,7 @@ class RuleTests(unittest.TestCase):
             MessageFacts(has_link_button=True, link_button_count=3)
         )
         self.assertIn("HR-01_MULTIPLE_LINK_BUTTONS", decision.rule_codes)
+        self.assertEqual(decision.severity, "critical")
 
     def test_forwarded_link_button_is_a_hard_rule(self) -> None:
         decision = evaluate_hard_rules(
@@ -44,9 +45,7 @@ class RuleTests(unittest.TestCase):
                 quote_text="0.01TRX 转账 0.01TRX=131K能量+500带宽 @haojia 能量下单地",
             )
         )
-        self.assertIn(
-            "HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION", decision.rule_codes
-        )
+        self.assertIn("HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION", decision.rule_codes)
 
     def test_quoted_crypto_discussion_is_not_hard_rule(self) -> None:
         decision = evaluate_hard_rules(
@@ -59,6 +58,7 @@ class RuleTests(unittest.TestCase):
             MessageFacts(text="机场推荐 永久套餐", urls=("https://example.invalid",))
         )
         self.assertIn("HR-03_PROMOTION_WITH_LINK", decision.rule_codes)
+        self.assertEqual(decision.severity, "high")
 
     def test_promotional_webpage_preview_with_link_is_hard_rule(self) -> None:
         decision = evaluate_hard_rules(
@@ -123,6 +123,7 @@ class RuleTests(unittest.TestCase):
             MessageFacts(urls=("https://example.invalid",)), previous_link_messages=1
         )
         self.assertIn("HR-05_LINK_BURST", decision.rule_codes)
+        self.assertEqual(decision.severity, "signal")
 
     def test_subdomain_denylist_matches(self) -> None:
         decision = evaluate_hard_rules(
@@ -130,6 +131,7 @@ class RuleTests(unittest.TestCase):
             denylist=frozenset({"bad.invalid"}),
         )
         self.assertIn("HR-06_DENIED_DOMAIN", decision.rule_codes)
+        self.assertEqual(decision.severity, "critical")
 
     def test_normalization_and_domain_do_not_fetch(self) -> None:
         self.assertEqual(normalize_text("  ＶＰＮ  Subscription "), "vpn subscription")

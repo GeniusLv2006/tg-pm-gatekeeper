@@ -48,6 +48,15 @@ def _optional_positive_int(name: str) -> int | None:
     return value
 
 
+def _boolean(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "on" if default else "off").strip().casefold()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be on or off")
+
+
 def read_private_file(
     path: Path, *, minimum_bytes: int = 1, strip: bool = False
 ) -> bytes:
@@ -83,6 +92,11 @@ class Settings:
     mute_days: int
     outbound_limit_per_hour: int
     test_sender_id: int | None
+    dataset_collection: bool
+    dataset_path: Path
+    dataset_key_file: Path
+    dataset_retention_days: int
+    dataset_max_messages_per_sender: int
 
     @classmethod
     def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
@@ -97,7 +111,7 @@ class Settings:
         except ValueError as exc:
             raise ConfigurationError("TG_API_ID must be an integer") from exc
         denylist = os.environ.get("TG_DENYLIST_FILE", "").strip()
-        return cls(
+        settings = cls(
             api_id=api_id,
             api_hash=api_hash,
             database_path=Path(
@@ -110,16 +124,10 @@ class Settings:
                 os.environ.get("TG_HMAC_KEY_FILE", "/run/secrets/hmac_key")
             ),
             denylist_file=Path(denylist) if denylist else None,
-            challenge_ttl_seconds=_bounded_int(
-                "TG_CHALLENGE_TTL_SECONDS", 60, 30, 600
-            ),
-            challenge_max_attempts=_bounded_int(
-                "TG_CHALLENGE_MAX_ATTEMPTS", 2, 1, 5
-            ),
+            challenge_ttl_seconds=_bounded_int("TG_CHALLENGE_TTL_SECONDS", 60, 30, 600),
+            challenge_max_attempts=_bounded_int("TG_CHALLENGE_MAX_ATTEMPTS", 2, 1, 5),
             audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
-            review_retention_days=min(
-                _positive_int("TG_REVIEW_RETENTION_DAYS", 7), 7
-            ),
+            review_retention_days=min(_positive_int("TG_REVIEW_RETENTION_DAYS", 7), 7),
             review_socket_path=Path(
                 os.environ.get(
                     "TG_REVIEW_SOCKET_PATH",
@@ -131,4 +139,30 @@ class Settings:
                 "TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100
             ),
             test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
+            dataset_collection=_boolean("TG_DATASET_COLLECTION"),
+            dataset_path=Path(
+                os.environ.get(
+                    "TG_DATASET_PATH",
+                    "/var/lib/tg-pm-gatekeeper/training.sqlite3",
+                )
+            ),
+            dataset_key_file=Path(
+                os.environ.get("TG_DATASET_KEY_FILE", "/run/secrets/dataset_key")
+            ),
+            dataset_retention_days=_bounded_int("TG_DATASET_RETENTION_DAYS", 30, 1, 90),
+            dataset_max_messages_per_sender=_bounded_int(
+                "TG_DATASET_MAX_MESSAGES_PER_SENDER", 3, 1, 10
+            ),
         )
+        if settings.dataset_path == settings.database_path:
+            raise ConfigurationError("training and state databases must be separate")
+        private_paths = {
+            settings.session_file,
+            settings.hmac_key_file,
+            settings.dataset_key_file,
+        }
+        if len(private_paths) != 3:
+            raise ConfigurationError(
+                "session, state HMAC, and dataset keys must be separate"
+            )
+        return settings

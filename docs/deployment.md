@@ -31,7 +31,8 @@ python3 -m venv .venv
 ```
 
 The initializer securely prompts for the API ID, API hash, phone number, login code, and 2FA password.
-It creates `telegram.session.secret`, `hmac.key`, `config.env`, and `deny-domains.txt` with mode `0600`.
+It creates `telegram.session.secret`, `hmac.key`, `dataset.key`, `config.env`, and
+`deny-domains.txt` with mode `0600`.
 None of these files may be printed, copied into an environment variable, or committed.
 
 ## 2. Prepare the host
@@ -53,13 +54,13 @@ Transfer secrets through SCP to temporary root-only filenames, install them with
 then remove the temporary copies:
 
 ```shell
-scp telegram.session.secret hmac.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
-ssh "$DEPLOY_HOST" 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/config.env /tmp/deny-domains.txt'
+scp telegram.session.secret hmac.key dataset.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
+ssh "$DEPLOY_HOST" 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o 10001 -g 10001 -m 0600 /tmp/dataset.key /etc/tg-pm-gatekeeper/dataset.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/dataset.key /tmp/config.env /tmp/deny-domains.txt'
 ```
 
 Do not add these files to a general server backup job.
 
-## 3. Build and start in observation mode
+## 3. Build and start in monitor mode
 
 Record and verify the exact commit before building:
 
@@ -67,7 +68,7 @@ Record and verify the exact commit before building:
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && git fetch origin && git checkout main && git pull --ff-only && git rev-parse HEAD && docker compose build --pull && docker compose up -d'
 ```
 
-The database defaults to `observe`. Check health and redacted status:
+The database defaults to `monitor`. Check health and redacted status:
 
 ```shell
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
@@ -75,12 +76,12 @@ ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker comp
 
 ### Schema-changing updates
 
-Before deploying an update that changes the state schema, keep the service in `observe`, require
+Before deploying an update that changes the state schema, keep the service in `monitor`, require
 `challenged`, `challenge_issuing`, and `challenge_archiving` to be zero, and create a temporary
 remote-only SQLite backup with the online backup API:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -c '\''import os, sqlite3; source=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3"); backup=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3"); source.backup(backup); backup.close(); source.close(); os.chmod("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3", 0o600)'\'''
 ```
 
@@ -88,19 +89,19 @@ After the rebuilt service is healthy, verify `PRAGMA user_version`, redacted sta
 Delete `state.pre-migration.sqlite3` only after all deployment checks pass. If migration fails, keep
 the failed database for diagnosis and restore the temporary backup together with the prior image.
 
-After seven days of reviewed observation, enable enforcement explicitly:
+After monitoring and preflight checks, enable protection explicitly:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli resume'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode protect'
 ```
 
-Pause immediately without stopping update processing:
+Return immediately to monitor mode to cancel pending destructive jobs without stopping update processing:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli pause'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor'
 ```
 
-### Review observation decisions
+### Review decisions and encrypted samples
 
 The dashboard has no TCP listener. From the local repository, run the tunnel helper:
 
@@ -108,7 +109,8 @@ The dashboard has no TCP listener. From the local repository, run the tunnel hel
 scripts/review-tunnel.sh "$DEPLOY_HOST"
 ```
 
-It prints `Connected` only after the dashboard responds. Keep that terminal open; `Ctrl+C` closes the
+The helper reads the short-lived owner-only `review.access-token`, prints a one-time login URL only
+after the authenticated dashboard responds, and keeps the dedicated tunnel open. `Ctrl+C` closes the
 dedicated tunnel. The helper disables SSH connection sharing so the forwarding process cannot be
 silently handed to a background ControlMaster. The target may be an OpenSSH alias or `user@host`,
 and must be able to access the owner-only remote socket; this guide uses the root maintenance login.
@@ -120,6 +122,7 @@ configuration file are configurable through flags or environment variables:
 TG_REVIEW_HOST=root@gatekeeper.example \
 TG_REVIEW_PORT=18765 \
 TG_REVIEW_SOCKET=/srv/gatekeeper/review.sock \
+TG_REVIEW_TOKEN=/srv/gatekeeper/review.access-token \
 TG_REVIEW_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf" \
 scripts/review-tunnel.sh
 ```
@@ -146,7 +149,7 @@ are:
 - **Spam**: archive and mute the Telegram dialog, then mark the sender quarantined.
 - **Dismiss**: record no classification and perform no Telegram action.
 
-If challenge delivery is suppressed by the global outbound limit, enforcement archives and mutes
+If challenge delivery is suppressed by the global outbound limit, protection archives and mutes
 the dialog and adds it to this queue. Marking it Legitimate restores it; Spam keeps the existing
 quarantine without repeating Telegram actions; Dismiss leaves the quarantine unchanged.
 
@@ -173,8 +176,25 @@ For a temporary dedicated arithmetic test account, add its positive numeric ID t
 TG_TEST_SENDER_ID=REPLACE_WITH_DEDICATED_TEST_ACCOUNT_ID
 ```
 
-This setting intentionally takes Telegram actions even while the global mode is `observe`. Do not
+This setting intentionally takes Telegram actions even while the global mode is `monitor`. Do not
 set it to a real correspondent. Remove the line or leave it empty when testing is complete.
+
+### Optional encrypted dataset
+
+Collection is disabled by default. To retain up to three authored texts/captions per unknown sender
+for 30 days, set the following in the private config and recreate the container:
+
+```shell
+TG_DATASET_COLLECTION=on
+TG_DATASET_RETENTION_DAYS=30
+TG_DATASET_MAX_MESSAGES_PER_SENDER=3
+```
+
+The Dataset dashboard decrypts a sample only when its detail page is opened. It supports manual
+Spam, Legitimate, and Uncertain labels and individual deletion. It does not train a model. Use
+`samples export` only to create a temporary owner-only plaintext JSONL for transfer to a trusted
+workstation; remove that export from the server immediately afterward. `samples purge --confirm
+DELETE-ALL-SAMPLES` irreversibly deletes every retained sample.
 
 ## 4. Verify the boundary
 
@@ -183,14 +203,15 @@ The deployment is acceptable only when all checks pass:
 ```shell
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh "$DEPLOY_HOST" 'ss -lnt'
-ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /var/lib/tg-pm-gatekeeper'
+ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/dataset.key /var/lib/tg-pm-gatekeeper'
 ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock'
 ```
 
 Expected values are user `10001:10001`, read-only root filesystem, all capabilities dropped, no port
 bindings, `no-new-privileges`, secret modes `600`, and state-directory mode `700`. The application
 must not add a listening TCP port. The review socket must be a Unix socket with mode `600` owned by
-UID/GID `10001:10001`.
+UID/GID `10001:10001`. The adjacent `review.access-token` must also be mode `600` and is replaced on
+every service start.
 
 ## 5. Emergency revocation
 

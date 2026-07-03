@@ -14,6 +14,7 @@ from telethon.sync import TelegramClient
 TARGETS = (
     Path("telegram.session.secret"),
     Path("hmac.key"),
+    Path("dataset.key"),
     Path("config.env"),
     Path("deny-domains.txt"),
 )
@@ -33,6 +34,11 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_DB_PATH=/var/lib/tg-pm-gatekeeper/state.sqlite3\n"
         "TG_SESSION_FILE=/run/secrets/telegram_session\n"
         "TG_HMAC_KEY_FILE=/run/secrets/hmac_key\n"
+        "TG_DATASET_KEY_FILE=/run/secrets/dataset_key\n"
+        "TG_DATASET_PATH=/var/lib/tg-pm-gatekeeper/training.sqlite3\n"
+        "TG_DATASET_COLLECTION=off\n"
+        "TG_DATASET_RETENTION_DAYS=30\n"
+        "TG_DATASET_MAX_MESSAGES_PER_SENDER=3\n"
         "TG_DENYLIST_FILE=/run/config/deny-domains.txt\n"
         "TG_CHALLENGE_TTL_SECONDS=60\n"
         "TG_CHALLENGE_MAX_ATTEMPTS=2\n"
@@ -75,8 +81,9 @@ def main() -> None:
     values = {
         TARGETS[0]: session,
         TARGETS[1]: secrets.token_bytes(32),
-        TARGETS[2]: render_config(api_id, api_hash),
-        TARGETS[3]: b"# One normalized denied domain per line.\n",
+        TARGETS[2]: secrets.token_bytes(32),
+        TARGETS[3]: render_config(api_id, api_hash),
+        TARGETS[4]: b"# One normalized denied domain per line.\n",
     }
     created: list[Path] = []
     try:

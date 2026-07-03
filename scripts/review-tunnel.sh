@@ -15,6 +15,7 @@ Arguments:
 Options:
   -p PORT                Local TCP port (default: TG_REVIEW_PORT or 8765)
   -s REMOTE_SOCKET       Remote Unix socket path
+  -t REMOTE_TOKEN        Remote access-token path
   -F SSH_CONFIG          Alternate OpenSSH config file
   -h                     Show this help
 
@@ -22,15 +23,17 @@ Environment:
   TG_REVIEW_HOST         Default SSH target
   TG_REVIEW_PORT         Default local port
   TG_REVIEW_SOCKET       Default remote Unix socket path
+  TG_REVIEW_TOKEN        Default remote access-token path
   TG_REVIEW_SSH_CONFIG   Default alternate OpenSSH config file
 EOF
 }
 
 port="${TG_REVIEW_PORT:-8765}"
 remote_socket="${TG_REVIEW_SOCKET:-/var/lib/tg-pm-gatekeeper/review.sock}"
+remote_token="${TG_REVIEW_TOKEN:-/var/lib/tg-pm-gatekeeper/review.access-token}"
 ssh_config="${TG_REVIEW_SSH_CONFIG:-}"
 
-while getopts "hp:s:F:" option; do
+while getopts "hp:s:t:F:" option; do
     case "$option" in
         h)
             usage
@@ -38,6 +41,7 @@ while getopts "hp:s:F:" option; do
             ;;
         p) port="$OPTARG" ;;
         s) remote_socket="$OPTARG" ;;
+        t) remote_token="$OPTARG" ;;
         F) ssh_config="$OPTARG" ;;
         *)
             usage >&2
@@ -63,6 +67,19 @@ fi
 case "$host" in
     -*)
         echo "SSH target must not begin with '-'." >&2
+        exit 2
+        ;;
+esac
+case "$remote_token" in
+    /*) ;;
+    *)
+        echo "Remote token must be an absolute path." >&2
+        exit 2
+        ;;
+esac
+case "$remote_token" in
+    *[!A-Za-z0-9_./-]*)
+        echo "Remote token path contains unsupported characters." >&2
         exit 2
         ;;
 esac
@@ -100,7 +117,15 @@ connected=false
 closed_reported=false
 
 dashboard_reachable() {
-    curl --fail --silent --show-error --max-time 1 "$url" >/dev/null 2>&1
+    curl --silent --show-error --max-time 1 "$url" >/dev/null 2>&1
+}
+
+read_access_token() {
+    if [ -n "$ssh_config" ]; then
+        ssh -F "$ssh_config" "$host" "cat $remote_token"
+    else
+        ssh "$host" "cat $remote_token"
+    fi
 }
 
 report_closed() {
@@ -150,6 +175,17 @@ open_tunnel() {
         "$host"
 }
 
+access_token="$(read_access_token)" || {
+    echo "Could not read the remote dashboard access token." >&2
+    exit 1
+}
+case "$access_token" in
+    ''|*[!A-Za-z0-9_-]*)
+        echo "Remote dashboard access token is invalid." >&2
+        exit 1
+        ;;
+esac
+
 echo "Opening a dedicated review tunnel to ${host}..."
 open_tunnel &
 tunnel_pid=$!
@@ -175,7 +211,7 @@ if [ "$connected" != true ]; then
     exit 1
 fi
 
-echo "Connected: ${url}"
+echo "Connected: ${url}login?token=${access_token}"
 echo "Keep this terminal open. Press Ctrl+C to close the tunnel."
 
 wait "$tunnel_pid"
