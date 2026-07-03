@@ -91,7 +91,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Telegram ID", response)
         self.assertIn(b"123456789", response)
         self.assertIn(b'http-equiv="refresh" content="30"', response)
-        self.assertIn(b"Live connection", response)
+        self.assertIn(b"Connected", response)
         database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
         self.assertNotIn(b"transient-canary", database)
         self.assertNotIn(b"Test Sender", database)
@@ -101,9 +101,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
         response = await self.server._index_page()
         self.assertIn(b'http-equiv="refresh" content="10"', response)
-        self.assertIn(b"Live connection", response)
-        self.assertIn(b"Response ", response)
-        self.assertIn(b"Connection check repeats every 10 seconds", response)
+        self.assertIn(b"Connected", response)
+        self.assertIn(b"Updated ", response)
+        self.assertIn(b"checks the connection every 10 seconds", response)
         self.assertIn(b"Test Sender (@testsender)", response)
         self.assertIn(b"ID 123456789", response)
 
@@ -129,7 +129,15 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             b".actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))",
             response,
         )
-        self.assertIn(b"button{width:100%;min-height:3.25rem", response)
+        self.assertIn(b"button{width:100%}", response)
+
+    async def test_error_page_uses_dashboard_layout_and_actionable_copy(self) -> None:
+        response = self.server._page("Invalid access token")
+        self.assertIn(b"class='masthead'", response)
+        self.assertIn(b"class='error-card'", response)
+        self.assertIn(b"has already been used", response)
+        self.assertIn(b"scripts/review-tunnel.sh SSH_TARGET", response)
+        self.assertNotIn(b"<body><h1>", response)
 
     async def test_admin_server_uses_owner_only_unix_socket(self) -> None:
         await self.server.start()
@@ -193,6 +201,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Manually labeled", index)
         self.assertIn(b"Weak spam / legitimate / uncertain", index)
         self.assertIn(b"Expiring within 24 hours", index)
+        self.assertIn(b"Dataset overview", index)
+        self.assertIn(b"Exportable manual labels", index)
+        self.assertNotIn(b"gold labels ready", index)
+        self.assertIn(b'font-feature-settings:"tnum" 1,"zero" 1', index)
         status, _, detail = self.server._dispatch_dataset(
             "GET", f"/dataset/{sample_id}", b""
         )

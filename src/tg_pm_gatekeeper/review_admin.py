@@ -335,28 +335,30 @@ class ReviewAdminServer:
             stats.get(label, 0) for label in ("spam", "legitimate", "uncertain")
         )
         overview = (
-            "<dl>"
-            f"<dt>Total samples</dt><dd>{stats.get('total', 0)}</dd>"
-            f"<dt>Manually labeled</dt><dd>{labeled}</dd>"
-            f"<dt>Spam / Legitimate / Uncertain</dt><dd>"
+            "<dl class='metric-grid'>"
+            f"<div><dt>Total samples</dt><dd class='data-value'>{stats.get('total', 0)}</dd></div>"
+            f"<div><dt>Manually labeled</dt><dd class='data-value'>{labeled}</dd></div>"
+            f"<div><dt>Spam / Legitimate / Uncertain</dt><dd class='data-value'>"
             f"{stats.get('spam', 0)} / {stats.get('legitimate', 0)} / "
-            f"{stats.get('uncertain', 0)}</dd>"
-            f"<dt>Weak spam / legitimate / uncertain</dt><dd>"
+            f"{stats.get('uncertain', 0)}</dd></div>"
+            f"<div><dt>Weak spam / legitimate / uncertain</dt><dd class='data-value'>"
             f"{stats.get('weak_spam_candidate', 0)} / "
             f"{stats.get('weak_legitimate_candidate', 0)} / "
-            f"{stats.get('weak_uncertain', 0)}</dd>"
-            f"<dt>Expiring within 24 hours</dt><dd>{stats.get('expiring_24h', 0)}</dd>"
-            f"<dt>Exportable gold labels</dt><dd>{stats.get('exportable_gold', 0)}</dd>"
+            f"{stats.get('weak_uncertain', 0)}</dd></div>"
+            f"<div><dt>Expiring within 24 hours</dt><dd class='data-value'>"
+            f"{stats.get('expiring_24h', 0)}</dd></div>"
+            f"<div><dt>Exportable manual labels</dt><dd class='data-value'>"
+            f"{stats.get('exportable_gold', 0)}</dd></div>"
             "</dl>"
         )
         content = (
             self._masthead("Dataset", f"{stats.get('total', 0)} samples")
             + "<p class='back'><a href='/'>← Review queue</a></p><main>"
-            + "<section class='queue-intro'><p class='eyebrow'>Encrypted local dataset</p>"
-            + f"<h2>{stats.get('exportable_gold', 0)} gold labels ready to export.</h2>"
-            + f"<p>Collection: {'on' if self.dataset_collection else 'off'} · "
-            + f"retention {self.dataset_retention_days} days · "
-            + f"maximum {self.dataset_max_messages_per_sender} messages per sender.</p>"
+            + "<section class='queue-intro'><p class='eyebrow'>Dataset status</p>"
+            + "<h2>Dataset overview</h2>"
+            + f"<p>Collection {'enabled' if self.dataset_collection else 'disabled'} · "
+            + f"{self.dataset_retention_days}-day retention · "
+            + f"up to {self.dataset_max_messages_per_sender} messages per sender.</p>"
             + overview
             + "</section>"
             + "<div class='table-shell'><table><thead><tr><th>Sample</th><th>Sender group</th>"
@@ -443,17 +445,17 @@ class ReviewAdminServer:
             "%Y-%m-%d %H:%M UTC"
         )
         content = f"""
-        {self._masthead("Decision desk", f"Review #{item.id}")}
+        {self._masthead("Review item", f"Review #{item.id}")}
         <p class="back"><a href="/">← Back to pending queue</a></p>
         <main class="review-grid">
           <section class="message-panel">
-            <p class="eyebrow">Live from Telegram · not stored locally</p>
+            <p class="eyebrow">Fetched from Telegram · not stored locally</p>
             <h2>{html.escape(identity)}</h2>
             <pre class="message">{html.escape(text)}</pre>
             <a class="telegram-link" href="tg://user?id={user_id}">Open this conversation in Telegram ↗</a>
           </section>
           <aside class="case-file">
-            <p class="eyebrow">Case file</p>
+            <p class="eyebrow">Review details</p>
             <dl><dt>Simulated decision</dt><dd><span class="badge">{html.escape(item.classification)}</span></dd>
             <dt>Rules</dt><dd>{html.escape(rules)}</dd>
             <dt>Telegram ID</dt><dd>{user_id}</dd>
@@ -462,8 +464,8 @@ class ReviewAdminServer:
             <details><summary>Structural features</summary><pre>{html.escape(features)}</pre></details>
           </aside>
         </main>
-        <section class="decision-panel"><p class="eyebrow">Resolve this sender</p>
-          <h2>One decision clears every pending item for this conversation.</h2>
+        <section class="decision-panel"><p class="eyebrow">Sender decision</p>
+          <h2>This decision applies to all pending entries for this sender.</h2>
           <div class="actions">
             {self._action_form(item.id, "legitimate", "Legitimate · allow sender")}
             {self._action_form(item.id, "spam", "Spam · archive and mute", danger=True)}
@@ -568,14 +570,14 @@ class ReviewAdminServer:
         if not rows:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
-            self._masthead("Monitor desk", f"{len(items)} pending")
+            self._masthead("Review queue", f"{len(items)} pending")
             + "<p class='back'><a href='/dataset'>Dataset →</a></p>"
-            + "<main><section class='queue-intro'><p class='eyebrow'>Private review channel</p>"
-            "<h2>Decisions waiting for a human signal.</h2>"
-            "<p>Sender identity is resolved live from Telegram and kept only in short-lived "
-            "process memory. Message content is fetched only when you open a case.</p>"
-            "<p class='refresh-note'>Connection check repeats every 10 seconds. If the tunnel "
-            "closes, the next check will replace this page with a connection error.</p></section>"
+            + "<main><section class='queue-intro'><p class='eyebrow'>Pending reviews</p>"
+            "<h2>Review pending senders</h2>"
+            "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
+            "Message content is fetched only when a review item is opened.</p>"
+            "<p class='refresh-note'>This page checks the connection every 10 seconds and shows "
+            "an error when the SSH tunnel is unavailable.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Simulation</th>"
             "<th>Rules</th><th>Messages</th>"
             f"<th>Last seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
@@ -701,8 +703,8 @@ class ReviewAdminServer:
         return (
             "<header class='masthead'><div><span class='mark'>TG</span>"
             "<span class='product'>PM Gatekeeper</span></div>"
-            "<div class='connection'><span class='live'><i></i>Live connection</span>"
-            f"<small>Response {checked_at}</small></div>"
+            "<div class='connection'><span class='live'><i></i>Connected</span>"
+            f"<small>Updated {checked_at}</small></div>"
             f"<div class='section'>{html.escape(section)}<span>{html.escape(status)}</span></div>"
             "</header>"
         )
@@ -733,11 +735,36 @@ class ReviewAdminServer:
             return f"{seconds // 3600}h"
         return f"{seconds // 86400}d"
 
-    @staticmethod
+    @classmethod
     def _page(
-        content: str, *, raw: bool = False, refresh_seconds: int | None = None
+        cls, content: str, *, raw: bool = False, refresh_seconds: int | None = None
     ) -> bytes:
-        body = content if raw else f"<h1>{html.escape(content)}</h1>"
+        if raw:
+            body = content
+        else:
+            guidance = {
+                "Invalid access token": (
+                    "This login link is invalid or has already been used. Run "
+                    "the tunnel helper again to generate a new one-time link."
+                ),
+                "Not found": (
+                    "The page is unavailable or the dashboard session is missing. "
+                    "Open the one-time link printed by the tunnel helper."
+                ),
+                "Request failed": (
+                    "The request could not be completed. No dashboard action was confirmed."
+                ),
+            }.get(content, "Check the request and return to the dashboard.")
+            body = (
+                cls._masthead("Error", "Request not completed")
+                + "<main class='error-layout'><section class='error-card'>"
+                + "<p class='eyebrow'>Dashboard error</p>"
+                + f"<h1>{html.escape(content)}</h1>"
+                + f"<p>{html.escape(guidance)}</p>"
+                + "<p class='error-command'><code>scripts/review-tunnel.sh SSH_TARGET</code></p>"
+                + "<a class='button-link' href='/'>Return to dashboard</a>"
+                + "</section></main>"
+            )
         refresh = (
             f'<meta http-equiv="refresh" content="{refresh_seconds}">'
             if refresh_seconds is not None
@@ -746,25 +773,27 @@ class ReviewAdminServer:
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 {refresh}<title>Gatekeeper review</title><style>
-:root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#e2532f;--safe:#1e6b52}}
-*{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}}
+:root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#d84a28;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}}
+*{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}
 .masthead,main,.back{{position:relative;max-width:1120px;margin-left:auto;margin-right:auto}}
 .masthead{{display:grid;grid-template-columns:1fr auto auto;gap:2.5rem;align-items:center;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}}.masthead>div{{min-width:0}}
 .mark{{display:inline-grid;place-items:center;width:2.5rem;height:2.5rem;margin-right:.8rem;color:var(--paper);background:var(--ink);font-weight:800;letter-spacing:-.08em}}
-.product{{font:700 1.15rem Georgia,serif;letter-spacing:.03em}}.section{{text-transform:uppercase;font-size:.72rem;letter-spacing:.12em;text-align:right}}
+.product{{font-size:1.15rem;font-weight:750;letter-spacing:-.01em}}.section{{text-transform:uppercase;font:700 .72rem/1.4 var(--font-data);letter-spacing:.08em;text-align:right;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .section span{{display:block;color:var(--signal);font-weight:800;margin-top:.25rem}}main{{padding:3rem 1.25rem 5rem}}
-.connection{{padding:.5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font-size:.62rem;letter-spacing:.05em}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:900;text-transform:uppercase;letter-spacing:.1em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}
-.queue-intro{{max-width:none;margin-bottom:2.5rem}}h1,h2{{font-family:Georgia,serif;line-height:1.1}}.queue-intro h2{{font-size:clamp(1.85rem,3.6vw,3rem);font-weight:400;letter-spacing:-.03em;margin:.55rem 0 1.3rem}}
+.connection{{padding:.5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font:400 .65rem/1.4 var(--font-data);letter-spacing:.03em;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}
+.queue-intro{{max-width:none;margin-bottom:2.5rem}}h1,h2{{font-family:var(--font-ui);line-height:1.12;letter-spacing:-.025em}}.queue-intro h2{{font-size:clamp(1.85rem,3.6vw,3rem);font-weight:720;margin:.55rem 0 1rem}}
 .queue-intro p{{max-width:none;color:var(--muted)}}.refresh-note{{margin-top:1.2rem;padding-left:1rem;border-left:3px solid var(--safe);font-size:.78rem}}.eyebrow{{margin:0;text-transform:uppercase;letter-spacing:.13em;font-size:.7rem;font-weight:800;color:var(--signal)}}
+.metric-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin:2rem 0 0}}.metric-grid>div{{min-width:0;padding:1rem;border:1px solid var(--line);background:rgba(255,253,247,.72)}}.metric-grid dd{{margin:.45rem 0 0}}.data-value{{font:700 1.15rem/1.35 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .table-shell{{overflow-x:auto;border:1px solid var(--line);background:var(--panel);box-shadow:8px 8px 0 var(--ink)}}table{{border-collapse:collapse;width:100%;min-width:860px}}
 th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}}tbody tr:last-child td{{border-bottom:0}}tbody tr:hover{{background:#f8e9d8}}a{{color:var(--ink);text-underline-offset:.22em}}td:first-child a{{font-weight:900;color:var(--signal)}}
-.identity-name,.identity-id{{display:block}}.identity-name{{font-family:Georgia,serif;font-size:1rem;font-weight:700}}.identity-id{{margin-top:.2rem;color:var(--muted);font-size:.68rem;letter-spacing:.04em}}
+.identity-name,.identity-id{{display:block}}.identity-name{{font-size:1rem;font-weight:700}}.identity-id{{margin-top:.2rem;color:var(--muted);font:400 .7rem/1.4 var(--font-data);letter-spacing:.02em;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .back{{padding:1.25rem 1.25rem 0}}.review-grid{{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.75fr);gap:1.5rem;padding-bottom:2rem}}
 .message-panel,.case-file,.decision-panel{{min-width:0;border:1px solid var(--line);background:var(--panel);padding:clamp(1.25rem,4vw,2.4rem)}}.message-panel h2{{font-size:2rem;margin:.5rem 0 1.8rem;overflow-wrap:anywhere}}
-pre{{white-space:pre-wrap;overflow-wrap:anywhere}}pre.message{{min-height:180px;margin:0 0 1.5rem;padding:1.4rem;background:var(--ink);color:#f7f1df;font:1rem/1.65 Georgia,serif;border-left:5px solid var(--signal)}}
+pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}pre.message{{min-height:180px;margin:0 0 1.5rem;padding:1.4rem;background:var(--ink);color:#f7f1df;font:1rem/1.65 var(--font-ui);border-left:5px solid var(--signal)}}
 .telegram-link{{display:inline-block;max-width:100%;font-weight:800;overflow-wrap:anywhere}}dt{{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}dd{{margin:.2rem 0 1.2rem;overflow-wrap:anywhere}}.badge{{display:inline-block;max-width:100%;padding:.2rem .45rem;background:#f8e9d8;border:1px solid var(--signal);color:#9d3118;font-weight:800;overflow-wrap:anywhere}}
 details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:pointer;font-weight:800}}details pre{{font-size:.75rem;color:var(--muted)}}.decision-panel{{position:relative;width:calc(100% - 2.5rem);max-width:1080px;margin:0 auto 4rem;border-top:5px solid var(--ink)}}.decision-panel h2{{font-size:1.7rem;margin-bottom:0}}
-.actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button{{width:100%;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 ui-monospace,monospace;cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
-@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions{{grid-template-columns:1fr}}}}
+.actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
+.error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-card>p:not(.eyebrow){{max-width:54ch;color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
+@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")
