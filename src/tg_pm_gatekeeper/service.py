@@ -49,6 +49,8 @@ class MessageActions(Protocol):
     async def archive_and_mute(self) -> bool: ...
     async def restore_from_pending(self) -> bool: ...
     async def delete_message(self, message_id: int) -> bool: ...
+    async def delete_messages(self, message_ids: tuple[int, ...]) -> bool: ...
+    async def delete_dialog(self) -> bool: ...
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
     ) -> None: ...
@@ -526,13 +528,34 @@ class GatekeeperService:
             self.store.mark_provisional(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
             actions.cancel_timeout(sender_key)
-            await self._send_notice(
+            passed_message_id = await self._send_notice(
                 sender_key,
                 actions,
                 VERIFICATION_PASSED_TEXT,
                 now,
                 reply_to_message_id=message.message_id,
                 formatting=notice_formatting(VERIFICATION_PASSED_TEXT),
+            )
+            verification_message_ids = set(
+                self.store.message_ids_between(
+                    sender_key,
+                    state.challenge_message_id or message.message_id,
+                    max(message.message_id, passed_message_id or message.message_id),
+                )
+            )
+            verification_message_ids.add(message.message_id)
+            if state.challenge_message_id is not None:
+                verification_message_ids.add(state.challenge_message_id)
+            if passed_message_id is not None:
+                verification_message_ids.add(passed_message_id)
+            cleanup_succeeded = await actions.delete_messages(
+                tuple(sorted(verification_message_ids))
+            )
+            self.store.audit(
+                sender_key,
+                "CHALLENGE_CLEANUP",
+                "messages_deleted" if cleanup_succeeded else "action_failed",
+                now,
             )
             if sender_key == self.test_sender_key:
                 actions.schedule_test_state_reset(
@@ -544,9 +567,18 @@ class GatekeeperService:
         self.store.audit(sender_key, "CHALLENGE_INCORRECT", "rejected", now)
         if attempts >= self.challenge_max_attempts:
             self.store.quarantine(sender_key, now)
-            self.store.audit(sender_key, "attempts_exhausted", "already_archived", now)
             actions.cancel_timeout(sender_key)
-            await self._finalize_test_failure(sender_key, state, actions, now)
+            dialog_deleted = await actions.delete_dialog()
+            self.store.audit(
+                sender_key,
+                "attempts_exhausted",
+                "dialog_deleted" if dialog_deleted else "action_failed",
+                now,
+            )
+            if sender_key == self.test_sender_key:
+                actions.schedule_test_state_reset(
+                    sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
+                )
             return "quarantined"
         remaining = self.challenge_max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
@@ -611,10 +643,10 @@ class GatekeeperService:
         *,
         reply_to_message_id: int | None = None,
         formatting: tuple[TextStyleSpan, ...] = (),
-    ) -> bool:
+    ) -> int | None:
         if not self._claim_outbound_slot(sender_key, now):
             self.store.audit(sender_key, "OUTBOUND_RATE_LIMIT", "suppressed", now)
-            return False
+            return None
         try:
             message_id = await actions.send_text(
                 text,
@@ -622,10 +654,10 @@ class GatekeeperService:
                 formatting=formatting,
             )
             self.store.record_automated_message(sender_key, message_id, self.clock())
-            return True
+            return message_id
         except Exception:
             self.store.audit(sender_key, "OUTBOUND_NOTICE", "action_failed", now)
-            return False
+            return None
 
     def _claim_outbound_slot(self, sender_key: str, now: int) -> bool:
         return sender_key == self.test_sender_key or self.store.claim_outbound_slot(

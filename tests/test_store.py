@@ -41,6 +41,16 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.reset_test_sender("sender", 200, 260))
         self.assertEqual(self.store.sender("sender").status, "unknown")
 
+    def test_challenge_message_lookup_is_bounded_by_message_id(self) -> None:
+        self.store.record_automated_message("sender", 10, 100)
+        self.store.record_automated_message("sender", 12, 102)
+        self.store.claim_message("sender", 11, 101)
+        self.store.finish_message("sender", 11, "challenge_incorrect")
+        self.store.record_automated_message("sender", 14, 104)
+        self.assertEqual(
+            self.store.message_ids_between("sender", 10, 12), [10, 11, 12]
+        )
+
     def test_state_does_not_require_raw_identity(self) -> None:
         self.store.allow("hmac-value", 100)
         self.assertEqual(self.store.sender("hmac-value").status, "allowed")

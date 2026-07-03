@@ -740,6 +740,27 @@ class StateStore:
             ).fetchall()
         return [int(row["message_id"]) for row in rows]
 
+    def message_ids_between(
+        self, sender_key: str, first_message_id: int, last_message_id: int
+    ) -> list[int]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT message_id FROM processed_messages "
+                "WHERE sender_key=? AND message_id BETWEEN ? AND ? UNION "
+                "SELECT message_id FROM automated_messages "
+                "WHERE sender_key=? AND message_id BETWEEN ? AND ? "
+                "ORDER BY message_id",
+                (
+                    sender_key,
+                    first_message_id,
+                    last_message_id,
+                    sender_key,
+                    first_message_id,
+                    last_message_id,
+                ),
+            ).fetchall()
+        return [int(row["message_id"]) for row in rows]
+
     def latest_challenge_started_at(
         self, sender_key: str, before: int
     ) -> int | None:

@@ -314,6 +314,27 @@ class TelegramActions:
             LOG.error("delete_message_failed")
             return False
 
+    async def delete_messages(self, message_ids: tuple[int, ...]) -> bool:
+        if not message_ids:
+            return True
+        try:
+            await self.adapter.client.delete_messages(
+                self.peer, list(message_ids), revoke=True
+            )
+            return True
+        except Exception:
+            LOG.error("delete_messages_failed")
+            return False
+
+    async def delete_dialog(self) -> bool:
+        try:
+            await self.adapter.client.delete_dialog(self.peer, revoke=True)
+            self.adapter.store.clear_dialog_snapshot(self.sender_key)
+            return True
+        except Exception:
+            LOG.error("delete_dialog_failed")
+            return False
+
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
     ) -> None:
