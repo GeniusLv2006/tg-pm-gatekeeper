@@ -5,6 +5,8 @@ import unicodedata
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .policy import DetectionResult, Severity
+
 
 URL_RE = re.compile(r"(?i)(?:https?://|tg://|www\.)[^\s<>()\[\]{}]+")
 TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？'\"”’》】）"
@@ -58,9 +60,7 @@ PROMOTION_TERMS: dict[str, tuple[str, ...]] = {
 CRYPTO_SERVICE_TERMS = ("转账", "能量", "带宽", "代付", "gas fee")
 COMMERCIAL_TERMS = ("下单", "购买", "出售", "兑换", "客服", "活动", "联系")
 CRYPTO_ASSET_RE = re.compile(r"(?<![a-z])(?:trx|usdt|usdc|ton)(?![a-z])")
-USERNAME_RE = re.compile(
-    r"(?<![a-z0-9_@])@[a-z0-9_]{5,32}(?![a-z0-9_])", re.IGNORECASE
-)
+USERNAME_RE = re.compile(r"(?<![a-z0-9_@])@[a-z0-9_]{5,32}(?![a-z0-9_])", re.IGNORECASE)
 
 
 def normalize_text(text: str) -> str:
@@ -130,8 +130,19 @@ class MessageFacts:
 
 @dataclass(frozen=True, slots=True)
 class RuleDecision:
-    hard_spam: bool
     rule_codes: tuple[str, ...]
+    severity: Severity
+
+    @property
+    def hard_spam(self) -> bool:
+        return self.severity in {"high", "critical"}
+
+    def detection_result(self) -> DetectionResult:
+        return DetectionResult(
+            detector="hard_rules",
+            signals=self.rule_codes,
+            severity=self.severity,
+        )
 
 
 def evaluate_hard_rules(
@@ -175,10 +186,21 @@ def evaluate_hard_rules(
         rules.append("HR-05_LINK_BURST")
     if denylist and any(domain_is_denied(domain, denylist) for domain in facts.domains):
         rules.append("HR-06_DENIED_DOMAIN")
-    if (
-        quoted_crypto_asset
-        and quoted_service_signals >= 2
-        and quoted_commercial_signal
-    ):
+    if quoted_crypto_asset and quoted_service_signals >= 2 and quoted_commercial_signal:
         rules.append("HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION")
-    return RuleDecision(hard_spam=bool(rules), rule_codes=tuple(rules))
+    critical = {
+        "HR-01_MULTIPLE_LINK_BUTTONS",
+        "HR-02_FORWARDED_LINK_BUTTON",
+        "HR-06_DENIED_DOMAIN",
+    }
+    high = {
+        "HR-03_PROMOTION_WITH_LINK",
+        "HR-04_MULTIPLE_LINKS",
+        "HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION",
+    }
+    severity = (
+        "critical"
+        if critical.intersection(rules)
+        else ("high" if high.intersection(rules) else ("signal" if rules else "none"))
+    )
+    return RuleDecision(rule_codes=tuple(rules), severity=severity)

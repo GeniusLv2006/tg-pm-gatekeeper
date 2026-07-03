@@ -93,9 +93,7 @@ class TelegramAdapterTests(unittest.TestCase):
                 )
             ],
         )
-        facts = facts_from_message(
-            self.message(message="核心在此", reply_to=reply_to)
-        )
+        facts = facts_from_message(self.message(message="核心在此", reply_to=reply_to))
         self.assertEqual(facts.quote_text, quote)
         self.assertNotIn("https://bad.invalid", facts.urls)
         self.assertNotIn("bad.invalid", facts.domains)
@@ -131,9 +129,7 @@ class TelegramAdapterTests(unittest.TestCase):
 
     def test_reply_target_and_message_timestamp_are_extracted(self) -> None:
         date = datetime(2026, 6, 30, tzinfo=timezone.utc)
-        message = self.message(
-            reply_to=SimpleNamespace(reply_to_msg_id=42), date=date
-        )
+        message = self.message(reply_to=SimpleNamespace(reply_to_msg_id=42), date=date)
         self.assertEqual(reply_to_message_id(message), 42)
         self.assertEqual(message_timestamp(message, fallback=1), int(date.timestamp()))
 
@@ -283,9 +279,7 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await actions.delete_messages((10, 11, 12)))
 
-        client.delete_messages.assert_awaited_once_with(
-            peer, [10, 11, 12], revoke=True
-        )
+        client.delete_messages.assert_awaited_once_with(peer, [10, 11, 12], revoke=True)
 
     async def test_delete_dialog_revokes_history_and_clears_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -314,11 +308,55 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
                 adapter = TelegramAdapter.__new__(TelegramAdapter)
                 adapter.client = client
                 adapter.store = store
+                protector = IdentifierProtector(b"k" * 32)
+                adapter.service = SimpleNamespace(protector=protector)
                 peer = types.InputPeerUser(user_id=123, access_hash=456)
+                reference = protector.seal_review_reference(123, 456, 1)
+                state = store.suppress(
+                    "sender", "critical_rule", until=None, reference=reference
+                )
+                action_id = store.schedule_action(
+                    "sender",
+                    reason="critical_rule",
+                    reference=reference,
+                    execute_at=0,
+                    expected_revision=state.revision,
+                )
+                store.set_mode("protect")
 
-                await adapter._dialog_deletion_worker(peer, "sender", 0)
+                await adapter._dialog_deletion_worker(action_id, 0)
 
                 client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
+            finally:
+                store.close()
+
+    async def test_invalid_persistent_reference_enters_exception_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
+                adapter.store = store
+                adapter.service = SimpleNamespace(
+                    protector=IdentifierProtector(b"k" * 32)
+                )
+                state = store.suppress(
+                    "sender", "critical_rule", until=None, reference=b"invalid"
+                )
+                action_id = store.schedule_action(
+                    "sender",
+                    reason="critical_rule",
+                    reference=b"invalid",
+                    execute_at=0,
+                    expected_revision=state.revision,
+                )
+                store.set_mode("protect")
+
+                await adapter._dialog_deletion_worker(action_id, 0)
+
+                self.assertEqual(store.statistics()["action_failures"], 1)
+                self.assertEqual(store.statistics()["pending_reviews"], 1)
+                adapter.client.delete_dialog.assert_not_awaited()
             finally:
                 store.close()
 

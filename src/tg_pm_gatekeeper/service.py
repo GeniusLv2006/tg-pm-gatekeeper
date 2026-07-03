@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from .crypto import IdentifierProtector
+from .dataset import TrainingStore
+from .policy import DetectionResult, PolicyEngine
 from .rules import MessageFacts, evaluate_hard_rules
 from .store import SenderState, StateStore
 
@@ -25,9 +27,7 @@ REPLY_REQUIRED_TEXT = (
     "↩️ Reply Required\n\nLong-press the verification message, choose Reply, and "
     "send only the answer. No attempt was used."
 )
-DIGITS_REQUIRED_TEXT = (
-    "🔢 Digits Only\n\nReply with digits only. No attempt was used."
-)
+DIGITS_REQUIRED_TEXT = "🔢 Digits Only\n\nReply with digits only. No attempt was used."
 VERIFICATION_PASSED_TEXT = (
     "✅ Verification Passed\n\nThis conversation has been restored."
 )
@@ -36,7 +36,8 @@ VERIFICATION_FAILED_TEXT = (
     "This conversation will be deleted in 10 seconds."
 )
 VERIFICATION_TIMEOUT_TEXT = (
-    "⛔ Verification Failed\n\nThis conversation remains archived and muted."
+    "⛔ Verification Failed\n\nThe verification window expired.\n\n"
+    "This conversation will be deleted in 10 seconds."
 )
 FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
@@ -63,7 +64,7 @@ class MessageActions(Protocol):
     def schedule_test_message_deletion(
         self, sender_key: str, since: int, delete_at: int
     ) -> None: ...
-    def schedule_dialog_deletion(self, sender_key: str, delete_at: int) -> None: ...
+    def schedule_dialog_deletion(self, action_id: int, delete_at: int) -> None: ...
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int
     ) -> None: ...
@@ -158,9 +159,7 @@ def challenge_prompt_formatting(prompt: str) -> tuple[TextStyleSpan, ...]:
         or not lines[5].startswith("Attempts allowed: ")
     ):
         return emphasized(prompt, lines[0]) if lines else ()
-    duration = (
-        lines[2].removeprefix("Reply to this message within ").removesuffix(".")
-    )
+    duration = lines[2].removeprefix("Reply to this message within ").removesuffix(".")
     expression = lines[4].removeprefix("Answer: ")
     attempts = lines[5].removeprefix("Attempts allowed: ")
     return emphasized(
@@ -210,6 +209,10 @@ class GatekeeperService:
         review_retention_days: int = 7,
         denylist: frozenset[str] = frozenset(),
         test_sender_id: int | None = None,
+        training_store: TrainingStore | None = None,
+        dataset_collection: bool = True,
+        dataset_retention_days: int = 30,
+        dataset_max_messages_per_sender: int = 3,
         challenge_factory=new_challenge,
         clock=lambda: int(time.time()),
     ) -> None:
@@ -224,6 +227,11 @@ class GatekeeperService:
         self.test_sender_key = (
             protector.sender_key(test_sender_id) if test_sender_id is not None else None
         )
+        self.training_store = training_store
+        self.dataset_collection = dataset_collection
+        self.dataset_retention_days = dataset_retention_days
+        self.dataset_max_messages_per_sender = dataset_max_messages_per_sender
+        self.policy = PolicyEngine()
         self.challenge_factory = challenge_factory
         self.clock = clock
         self.sender_locks = SenderLockPool()
@@ -250,6 +258,18 @@ class GatekeeperService:
             if is_test_sender and state.status == "allowed":
                 self.store.revoke(sender_key, now)
                 state = self.store.sender(sender_key)
+            if state.status == "suppressed":
+                if state.suppressed_until is not None and state.suppressed_until <= now:
+                    self.store.release_expired_suppression(sender_key, now)
+                    state = self.store.sender(sender_key)
+                elif not is_test_sender:
+                    if self.store.get_mode() == "monitor":
+                        outcome = "would_delete_suppressed"
+                        return outcome
+                    outcome = self._schedule_suppressed_delete(
+                        sender_key, state, message, actions, now
+                    )
+                    return outcome
             elif (
                 is_test_sender
                 and state.status in {"provisional", "quarantined"}
@@ -292,22 +312,38 @@ class GatekeeperService:
             if message.facts.has_link:
                 self.store.record_link_message(sender_key, now)
 
-            if decision.hard_spam and not is_test_sender:
+            detection = decision.detection_result()
+            policy = self.policy.decide(detection)
+            if state.status == "unknown" and not is_test_sender:
+                self._collect_sample(message, detection, policy.planned_action, now)
+
+            if decision.severity == "critical" and not is_test_sender:
                 for rule in decision.rule_codes:
                     self.store.audit(sender_key, rule, "matched", now)
-                if state.status == "challenged":
-                    self.store.quarantine(sender_key, now)
-                    actions.cancel_timeout(sender_key)
-                    self.store.audit(sender_key, "hard_rule", "already_archived", now)
-                    outcome = "quarantined"
-                else:
-                    outcome = await self._quarantine(
-                        sender_key, actions, now, "hard_rule"
-                    )
-                if outcome == "would_quarantine":
+                if self.store.get_mode() == "monitor":
+                    outcome = "would_delete"
                     self._enqueue_review(
                         sender_key, message, outcome, decision.rule_codes, now
                     )
+                    if self.training_store is not None:
+                        self._update_sample_outcome(
+                            message.sender_id,
+                            weak_label="spam_candidate",
+                            actual_action=outcome,
+                        )
+                else:
+                    outcome = self._schedule_critical_delete(
+                        sender_key, message, actions, now
+                    )
+                    if self.training_store is not None:
+                        self._update_sample_outcome(
+                            message.sender_id,
+                            weak_label="spam_candidate",
+                            actual_action=outcome,
+                        )
+                self._record_decision(
+                    sender_key, detection, policy.planned_action, outcome, now
+                )
                 return outcome
 
             if state.status == "provisional":
@@ -319,13 +355,31 @@ class GatekeeperService:
                 )
                 return outcome
 
-            if self.store.get_mode() == "observe" and not is_test_sender:
+            if self.store.get_mode() == "monitor" and not is_test_sender:
                 self.store.audit(sender_key, "CHALLENGE_REQUIRED", "observed", now)
                 outcome = "would_challenge"
                 self._enqueue_review(sender_key, message, outcome, (), now)
+                if self.training_store is not None:
+                    self._update_sample_outcome(
+                        message.sender_id,
+                        weak_label="uncertain",
+                        actual_action=outcome,
+                    )
+                self._record_decision(
+                    sender_key, detection, policy.planned_action, outcome, now
+                )
                 return outcome
 
             outcome = await self._issue_challenge(sender_key, message, actions, now)
+            if self.training_store is not None and not is_test_sender:
+                self._update_sample_outcome(
+                    message.sender_id,
+                    weak_label="uncertain",
+                    actual_action=outcome,
+                )
+            self._record_decision(
+                sender_key, detection, policy.planned_action, outcome, now
+            )
             return outcome
         except Exception:
             LOG.error("message_processing_failed")
@@ -333,6 +387,152 @@ class GatekeeperService:
             return "fail_safe"
         finally:
             self.store.finish_message(sender_key, message.message_id, outcome)
+
+    def _collect_sample(
+        self,
+        message: IncomingMessage,
+        detection: DetectionResult,
+        planned_action: str,
+        now: int,
+    ) -> None:
+        if (
+            self.training_store is None
+            or not self.dataset_collection
+            or not message.text.strip()
+        ):
+            return
+        facts = message.facts
+        payload: dict[str, object] = {
+            "text": message.text,
+            "features": {
+                "domain_count": min(len(set(facts.domains)), 2),
+                "forwarded": facts.is_forwarded,
+                "has_any_button": facts.has_any_button,
+                "has_link": facts.has_link,
+                "has_link_button": facts.has_link_button,
+                "link_button_count": min(facts.link_button_count, 3),
+                "url_count": min(len(set(facts.urls)), 2),
+                "via_bot": facts.via_bot,
+            },
+            "detector": detection.detector,
+            "signals": list(detection.signals),
+            "severity": detection.severity,
+            "score": detection.score,
+            "model_version": detection.model_version,
+            "planned_action": planned_action,
+            "actual_action": "pending",
+            "policy_version": "rules-v2",
+        }
+        try:
+            self.training_store.collect(
+                sender_id=message.sender_id,
+                message_id=message.message_id,
+                payload=payload,
+                weak_label="uncertain",
+                retention_days=self.dataset_retention_days,
+                max_per_sender=self.dataset_max_messages_per_sender,
+                now=now,
+            )
+        except Exception:
+            LOG.error("dataset_collection_failed")
+            self.store.audit(
+                self.protector.sender_key(message.sender_id),
+                "DATASET_COLLECTION",
+                "action_failed",
+                now,
+            )
+
+    def _update_sample_outcome(
+        self, sender_id: int, *, weak_label: str, actual_action: str
+    ) -> None:
+        if self.training_store is None:
+            return
+        try:
+            self.training_store.update_sender_outcome(
+                sender_id,
+                weak_label=weak_label,
+                actual_action=actual_action,
+            )
+        except Exception:
+            LOG.error("dataset_update_failed")
+
+    def _record_decision(
+        self,
+        sender_key: str,
+        detection: DetectionResult,
+        planned_action: str,
+        actual_action: str,
+        now: int,
+    ) -> None:
+        self.store.record_decision(
+            sender_key,
+            detector=detection.detector,
+            signals=json.dumps(detection.signals, separators=(",", ":")),
+            severity=detection.severity,
+            score=detection.score,
+            model_version=detection.model_version,
+            planned_action=planned_action,
+            actual_action=actual_action,
+            policy_version="rules-v2",
+            now=now,
+        )
+
+    def _schedule_critical_delete(
+        self,
+        sender_key: str,
+        message: IncomingMessage,
+        actions: MessageActions,
+        now: int,
+    ) -> str:
+        if message.review_reference is None:
+            self.store.audit(
+                sender_key, "CRITICAL_DELETE", "reference_unavailable", now
+            )
+            return "fail_safe"
+        state = self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            reference=message.review_reference,
+            now=now,
+        )
+        action_id = self.store.schedule_action(
+            sender_key,
+            reason="critical_rule",
+            reference=message.review_reference,
+            execute_at=now,
+            expected_revision=state.revision,
+            now=now,
+        )
+        actions.cancel_timeout(sender_key)
+        actions.schedule_dialog_deletion(action_id, now)
+        self.store.audit(sender_key, "CRITICAL_DELETE", "scheduled", now)
+        return "suppressed"
+
+    def _schedule_suppressed_delete(
+        self,
+        sender_key: str,
+        state: SenderState,
+        message: IncomingMessage,
+        actions: MessageActions,
+        now: int,
+    ) -> str:
+        reference = message.review_reference or state.challenge_action_reference
+        if reference is None:
+            self.store.audit(
+                sender_key, "SUPPRESSION_DELETE", "reference_unavailable", now
+            )
+            return "fail_safe"
+        action_id = self.store.schedule_action(
+            sender_key,
+            reason=state.suppression_reason or "suppressed_sender",
+            reference=reference,
+            execute_at=now,
+            expected_revision=state.revision,
+            now=now,
+        )
+        actions.schedule_dialog_deletion(action_id, now)
+        return "suppressed"
 
     async def _issue_challenge(
         self,
@@ -373,9 +573,7 @@ class GatekeeperService:
             )
             sent_at = self.clock()
             expires_at = sent_at + self.challenge_ttl_seconds
-            if not self.store.refresh_challenge_expiry(
-                sender_key, expires_at, sent_at
-            ):
+            if not self.store.refresh_challenge_expiry(sender_key, expires_at, sent_at):
                 await actions.delete_message(challenge_message_id)
                 self.store.reset_incomplete_challenge(sender_key, self.clock())
                 self.store.audit(sender_key, "CHALLENGE_EXPIRY", "state_changed", now)
@@ -436,9 +634,7 @@ class GatekeeperService:
             archived = False
         if archived:
             self.store.quarantine(sender_key, now)
-            self.store.audit(
-                sender_key, "CHALLENGE_UNAVAILABLE", "archived_muted", now
-            )
+            self.store.audit(sender_key, "CHALLENGE_UNAVAILABLE", "archived_muted", now)
             classification = "challenge_unavailable"
             outcome = "quarantined_rate_limited"
         else:
@@ -492,11 +688,17 @@ class GatekeeperService:
     ) -> str:
         expires_at = state.challenge_expires_at
         if not expires_at or message.sent_at > expires_at:
-            self.store.quarantine(sender_key, now)
+            self.store.expire_challenge(sender_key, expires_at or 0, now)
             self.store.audit(sender_key, "challenge_expired", "already_archived", now)
             actions.cancel_timeout(sender_key)
-            await self._finalize_test_failure(sender_key, state, actions, now)
-            return "quarantined"
+            await self._finalize_timeout_failure(
+                sender_key,
+                state,
+                actions,
+                now,
+                fallback_reference=message.review_reference,
+            )
+            return "suppressed"
 
         if message.reply_to_message_id != state.challenge_message_id:
             await self._send_guidance_once(
@@ -533,6 +735,12 @@ class GatekeeperService:
                 return "fail_safe"
             self.store.mark_provisional(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
+            if self.training_store is not None and sender_key != self.test_sender_key:
+                self._update_sample_outcome(
+                    message.sender_id,
+                    weak_label="legitimate_candidate",
+                    actual_action="provisional",
+                )
             actions.cancel_timeout(sender_key)
             passed_message_id = await self._send_notice(
                 sender_key,
@@ -543,7 +751,7 @@ class GatekeeperService:
                 formatting=notice_formatting(VERIFICATION_PASSED_TEXT),
             )
             verification_message_ids = set(
-                self.store.message_ids_between(
+                self.store.automated_message_ids_between(
                     sender_key,
                     state.challenge_message_id or message.message_id,
                     max(message.message_id, passed_message_id or message.message_id),
@@ -572,12 +780,7 @@ class GatekeeperService:
         attempts = self.store.increment_attempts(sender_key, now)
         self.store.audit(sender_key, "CHALLENGE_INCORRECT", "rejected", now)
         if attempts >= self.challenge_max_attempts:
-            self.store.quarantine(sender_key, now)
             actions.cancel_timeout(sender_key)
-            if sender_key == self.test_sender_key:
-                actions.schedule_test_state_reset(
-                    sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
-                )
             warning_message_id = await self._send_notice(
                 sender_key,
                 actions,
@@ -590,12 +793,52 @@ class GatekeeperService:
                 ),
             )
             if warning_message_id is None:
+                self.store.quarantine(sender_key, now)
+                self._enqueue_review(sender_key, message, "warning_failed", (), now)
                 self.store.audit(
                     sender_key, "attempts_exhausted", "warning_failed", now
                 )
                 return "quarantined"
+            reference = message.review_reference or state.challenge_action_reference
+            if reference is None:
+                self.store.quarantine(sender_key, now)
+                self.store.audit(
+                    sender_key, "attempts_exhausted", "reference_unavailable", now
+                )
+                return "quarantined"
+            if sender_key == self.test_sender_key:
+                self.store.quarantine(sender_key, now)
+                terminal = self.store.sender(sender_key)
+                actions.schedule_test_state_reset(
+                    sender_key,
+                    terminal.updated_at,
+                    now + TEST_STATE_RESET_DELAY_SECONDS,
+                )
+            else:
+                terminal = self.store.suppress(
+                    sender_key,
+                    "attempts_exhausted",
+                    until=now + 7 * 86400,
+                    reference=reference,
+                    now=now,
+                )
+                if self.training_store is not None:
+                    self._update_sample_outcome(
+                        message.sender_id,
+                        weak_label="spam_candidate",
+                        actual_action="suppressed",
+                    )
+            action_id = self.store.schedule_action(
+                sender_key,
+                reason="attempts_exhausted",
+                reference=reference,
+                execute_at=now + FAILED_DIALOG_DELETE_DELAY_SECONDS,
+                expected_revision=terminal.revision,
+                mode_independent=sender_key == self.test_sender_key,
+                now=now,
+            )
             actions.schedule_dialog_deletion(
-                sender_key, now + FAILED_DIALOG_DELETE_DELAY_SECONDS
+                action_id, now + FAILED_DIALOG_DELETE_DELAY_SECONDS
             )
             self.store.audit(
                 sender_key,
@@ -603,7 +846,7 @@ class GatekeeperService:
                 "dialog_deletion_scheduled",
                 now,
             )
-            return "quarantined"
+            return "suppressed" if sender_key != self.test_sender_key else "quarantined"
         remaining = self.challenge_max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
         incorrect_text = (
@@ -688,22 +931,53 @@ class GatekeeperService:
             self.outbound_limit_per_hour, now
         )
 
-    async def _finalize_test_failure(
+    async def _finalize_timeout_failure(
         self,
         sender_key: str,
         challenge_state: SenderState,
         actions: MessageActions,
         now: int,
+        *,
+        fallback_reference: bytes | None = None,
     ) -> None:
-        if sender_key != self.test_sender_key:
-            return
-        await self._send_notice(
+        notice_id = await self._send_notice(
             sender_key,
             actions,
             VERIFICATION_TIMEOUT_TEXT,
             now,
             formatting=notice_formatting(VERIFICATION_TIMEOUT_TEXT),
         )
+        if sender_key != self.test_sender_key:
+            terminal = self.store.sender(sender_key)
+            reference = terminal.challenge_action_reference or fallback_reference
+            if notice_id is None or reference is None:
+                if reference is not None:
+                    self.store.enqueue_review(
+                        sender_key,
+                        reference,
+                        "timeout_notice_failed",
+                        "[]",
+                        "{}",
+                        now + self.review_retention_days * 86400,
+                        now,
+                    )
+                self.store.quarantine(sender_key, now)
+                self.store.audit(
+                    sender_key, "CHALLENGE_TIMEOUT_DELETE", "not_scheduled", now
+                )
+                return
+            action_id = self.store.schedule_action(
+                sender_key,
+                reason="challenge_timeout",
+                reference=reference,
+                execute_at=now + FAILED_DIALOG_DELETE_DELAY_SECONDS,
+                expected_revision=terminal.revision,
+                now=now,
+            )
+            actions.schedule_dialog_deletion(
+                action_id, now + FAILED_DIALOG_DELETE_DELAY_SECONDS
+            )
+            return
         challenge_started_at = (
             challenge_state.challenge_expires_at - self.challenge_ttl_seconds
             if challenge_state.challenge_expires_at is not None
@@ -735,7 +1009,7 @@ class GatekeeperService:
                     sender_key, "CHALLENGE_TIMEOUT", "already_archived", timestamp
                 )
                 if actions is not None:
-                    await self._finalize_test_failure(
+                    await self._finalize_timeout_failure(
                         sender_key, state, actions, timestamp
                     )
             return expired
@@ -846,7 +1120,7 @@ class GatekeeperService:
     async def _quarantine(
         self, sender_key: str, actions: MessageActions, now: int, reason: str
     ) -> str:
-        if self.store.get_mode() == "observe":
+        if self.store.get_mode() == "monitor":
             self.store.audit(sender_key, reason, "observed", now)
             return "would_quarantine"
         success = await actions.archive_and_mute()

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from tg_pm_gatekeeper.crypto import IdentifierProtector
+from tg_pm_gatekeeper.dataset import DatasetProtector, TrainingStore
 from tg_pm_gatekeeper.rules import MessageFacts
 from tg_pm_gatekeeper.service import (
     DIGITS_REQUIRED_TEXT,
@@ -44,7 +46,7 @@ class FakeActions:
         self.deleted_messages: list[int] = []
         self.deleted_message_batches: list[tuple[int, ...]] = []
         self.deleted_dialogs = 0
-        self.dialog_deletions: list[tuple[str, int]] = []
+        self.dialog_deletions: list[tuple[int, int]] = []
         self.resets: list[tuple[str, int, int]] = []
         self.restores = 0
         self.archive_success = archive_success
@@ -96,8 +98,8 @@ class FakeActions:
         self.deleted_dialogs += 1
         return True
 
-    def schedule_dialog_deletion(self, sender_key: str, delete_at: int) -> None:
-        self.dialog_deletions.append((sender_key, delete_at))
+    def schedule_dialog_deletion(self, action_id: int, delete_at: int) -> None:
+        self.dialog_deletions.append((action_id, delete_at))
 
     def schedule_timeout(
         self, sender_key: str, expires_at: int, *, grace_seconds: int = 5
@@ -161,7 +163,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service = self.make_service()
 
     def make_service(
-        self, *, outbound_limit: int = 10, test_sender_id: int | None = None
+        self,
+        *,
+        outbound_limit: int = 10,
+        test_sender_id: int | None = None,
+        training_store: TrainingStore | None = None,
+        dataset_collection: bool = True,
     ) -> GatekeeperService:
         return GatekeeperService(
             self.store,
@@ -170,9 +177,26 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             challenge_max_attempts=2,
             outbound_limit_per_hour=outbound_limit,
             test_sender_id=test_sender_id,
+            training_store=training_store,
+            dataset_collection=dataset_collection,
             challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
             clock=lambda: self.now,
         )
+
+    async def test_disabled_collection_does_not_add_samples(self) -> None:
+        training_store = TrainingStore(
+            Path(self.temp.name) / "training.sqlite3",
+            DatasetProtector(b"d" * 32),
+        )
+        self.addCleanup(training_store.close)
+        service = self.make_service(
+            training_store=training_store,
+            dataset_collection=False,
+        )
+
+        await service.handle(self.message(1), FakeActions())
+
+        self.assertEqual(training_store.statistics()["total"], 0)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -191,6 +215,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         is_contact: bool = False,
         review_reference: bytes | None = None,
     ) -> IncomingMessage:
+        if review_reference is None:
+            review_reference = self.protector.seal_review_reference(
+                sender_id, 987654321, message_id
+            )
         return IncomingMessage(
             sender_id=sender_id,
             message_id=message_id,
@@ -255,7 +283,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(challenge.expression, expression)
                 self.assertEqual(challenge.answer, answer)
 
-    async def test_observe_mode_never_sends_or_quarantines(self) -> None:
+    async def test_monitor_mode_never_sends_or_deletes(self) -> None:
         actions = FakeActions()
         outcome = await self.service.handle(
             self.message(
@@ -269,15 +297,39 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             actions,
         )
-        self.assertEqual(outcome, "would_quarantine")
+        self.assertEqual(outcome, "would_delete")
         self.assertEqual(actions.sent, [])
         self.assertEqual(actions.quarantines, 0)
         self.assertNotIn(b"private-message-canary", self.database_path.read_bytes())
 
-    async def test_promotional_webpage_preview_is_quarantined_in_enforce_mode(
+    async def test_monitor_collects_encrypted_unknown_sample_but_excludes_test_sender(
         self,
     ) -> None:
-        self.store.set_mode("enforce")
+        self.now = int(time.time())
+        training_path = Path(self.temp.name) / "training.sqlite3"
+        training = TrainingStore(training_path, DatasetProtector(b"d" * 32))
+        self.addCleanup(training.close)
+        service = self.make_service(
+            test_sender_id=TEST_SENDER_ID, training_store=training
+        )
+        self.assertEqual(
+            await service.handle(
+                self.message(10, "dataset-private-canary"), FakeActions()
+            ),
+            "would_challenge",
+        )
+        self.assertEqual(training.statistics()["total"], 1)
+        self.assertNotIn(b"dataset-private-canary", training_path.read_bytes())
+        await service.handle(
+            self.message(11, "test-private-canary", sender_id=TEST_SENDER_ID),
+            FakeActions(),
+        )
+        self.assertEqual(training.statistics()["total"], 1)
+
+    async def test_promotional_webpage_preview_is_challenged_in_protect_mode(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
         actions = FakeActions()
         outcome = await self.service.handle(
             self.message(
@@ -292,13 +344,49 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             actions,
         )
-        self.assertEqual(outcome, "quarantined")
+        self.assertEqual(outcome, "challenged")
         self.assertEqual(actions.quarantines, 1)
         sender_key = self.protector.sender_key(123456789)
-        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+        self.assertEqual(self.store.sender(sender_key).status, "challenged")
 
-    async def test_challenge_prompt_requires_reply_and_passes_to_provisional(self) -> None:
-        self.store.set_mode("enforce")
+    async def test_critical_rule_schedules_silent_persistent_delete(self) -> None:
+        self.store.set_mode("protect")
+        actions = FakeActions()
+        outcome = await self.service.handle(
+            self.message(
+                1,
+                facts=MessageFacts(has_link_button=True, link_button_count=2),
+            ),
+            actions,
+        )
+        sender_key = self.protector.sender_key(123456789)
+        self.assertEqual(outcome, "suppressed")
+        self.assertEqual(
+            self.store.sender(sender_key).suppression_reason, "critical_rule"
+        )
+        self.assertEqual(actions.sent, [])
+        self.assertEqual(actions.dialog_deletions, [(1, self.now)])
+        self.assertEqual(len(self.store.pending_actions()), 1)
+
+    async def test_expired_suppression_returns_sender_to_challenge(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.suppress(
+            sender_key,
+            "challenge_timeout",
+            until=self.now + 10,
+            reference=self.protector.seal_review_reference(123456789, 987654321, 1),
+            now=self.now,
+        )
+        self.store.set_mode("protect")
+        self.now += 11
+        outcome = await self.service.handle(self.message(2), FakeActions())
+        self.assertEqual(outcome, "challenged")
+        self.assertEqual(self.store.sender(sender_key).status, "challenged")
+
+    async def test_challenge_prompt_requires_reply_and_passes_to_provisional(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
         actions = FakeActions()
         self.assertEqual(
             await self.service.handle(self.message(1), actions), "challenged"
@@ -329,7 +417,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("conversation has been restored", actions.sent[-1][0])
 
     async def test_challenge_ttl_starts_after_prompt_delivery(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         actions = FakeActions()
         actions.after_send = lambda: setattr(self, "now", 1_010)
         self.assertEqual(
@@ -376,9 +464,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.protector.sender_key(TEST_SENDER_ID)
         self.assertEqual(actions.resets, [(sender_key, self.now, self.now + 60)])
         self.now += 60
-        self.assertTrue(
-            await service.reset_test_sender(sender_key, self.now - 60)
-        )
+        self.assertTrue(await service.reset_test_sender(sender_key, self.now - 60))
         self.assertEqual(self.store.sender(sender_key).status, "unknown")
         self.assertEqual(
             await service.handle(
@@ -423,21 +509,22 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             actions.sent[-1][0],
         )
         self.assertEqual(actions.deleted_dialogs, 0)
-        self.assertEqual(actions.dialog_deletions, [(sender_key, self.now + 10)])
+        self.assertEqual(actions.dialog_deletions, [(1, self.now + 10)])
+        self.assertTrue(self.store.pending_actions()[0].mode_independent)
         self.assertEqual(actions.deletions, [])
         self.assertEqual(actions.resets, [(sender_key, self.now, self.now + 60)])
 
     async def test_dedicated_test_sender_bypasses_outbound_limit(self) -> None:
-        service = self.make_service(
-            outbound_limit=1, test_sender_id=TEST_SENDER_ID
-        )
+        service = self.make_service(outbound_limit=1, test_sender_id=TEST_SENDER_ID)
         self.store.claim_outbound_slot(1, self.now)
         outcome = await service.handle(
             self.message(1, sender_id=TEST_SENDER_ID), FakeActions()
         )
         self.assertEqual(outcome, "challenged")
 
-    async def test_standalone_answer_does_not_consume_attempt_and_guides_once(self) -> None:
+    async def test_standalone_answer_does_not_consume_attempt_and_guides_once(
+        self,
+    ) -> None:
         sender_key = self.set_active_challenge()
         actions = FakeActions()
         for message_id in (2, 3):
@@ -454,9 +541,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         actions = FakeActions()
         for message_id in (2, 3):
             outcome = await self.service.handle(
-                self.message(
-                    message_id, "not an answer", reply_to_message_id=100
-                ),
+                self.message(message_id, "not an answer", reply_to_message_id=100),
                 actions,
             )
             self.assertEqual(outcome, "challenge_pending")
@@ -498,7 +583,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "provisional",
         )
-        self.assertEqual(actions.deleted_message_batches, [(100, 101, 102, 103)])
+        self.assertEqual(actions.deleted_message_batches, [(100, 102, 103)])
         self.assertEqual(actions.deleted_dialogs, 0)
 
     async def test_signed_number_is_format_error_without_attempt(self) -> None:
@@ -518,15 +603,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         second = await self.service.handle(
             self.message(3, "10", reply_to_message_id=100), actions
         )
-        self.assertEqual((first, second), ("challenge_incorrect", "quarantined"))
-        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+        self.assertEqual((first, second), ("challenge_incorrect", "suppressed"))
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
         self.assertEqual(actions.quarantines, 0)
         self.assertEqual(actions.deleted_dialogs, 0)
-        self.assertEqual(actions.dialog_deletions, [(sender_key, self.now + 10)])
+        self.assertEqual(actions.dialog_deletions, [(1, self.now + 10)])
         self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
         self.assertIn("1 attempt remaining", actions.sent[0][0])
 
-    async def test_failed_warning_does_not_schedule_silent_dialog_deletion(self) -> None:
+    async def test_failed_warning_does_not_schedule_silent_dialog_deletion(
+        self,
+    ) -> None:
         sender_key = self.set_active_challenge()
         actions = FakeActions(send_success=False)
         await self.service.handle(
@@ -539,29 +626,29 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "quarantined")
         self.assertEqual(actions.dialog_deletions, [])
 
-    async def test_message_sent_before_deadline_can_pass_after_processing_delay(self) -> None:
+    async def test_message_sent_before_deadline_can_pass_after_processing_delay(
+        self,
+    ) -> None:
         sender_key = self.set_active_challenge()
         self.now = 1_100
         outcome = await self.service.handle(
-            self.message(
-                2, "12", sent_at=1_059, reply_to_message_id=100
-            ),
+            self.message(2, "12", sent_at=1_059, reply_to_message_id=100),
             FakeActions(),
         )
         self.assertEqual(outcome, "provisional")
         self.assertEqual(self.store.sender(sender_key).status, "provisional")
 
-    async def test_message_sent_after_deadline_is_quarantined(self) -> None:
+    async def test_message_sent_after_deadline_is_suppressed(self) -> None:
         sender_key = self.set_active_challenge()
         outcome = await self.service.handle(
             self.message(2, "12", sent_at=1_061, reply_to_message_id=100),
             FakeActions(),
         )
-        self.assertEqual(outcome, "quarantined")
-        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+        self.assertEqual(outcome, "suppressed")
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
 
     async def test_archive_failure_rolls_challenge_back(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         sender_key = self.protector.sender_key(123456789)
         actions = FakeActions(archive_success=False)
         outcome = await self.service.handle(self.message(1), actions)
@@ -573,7 +660,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions.deleted_messages, [100])
 
     async def test_activation_error_restores_archive_before_reset(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         sender_key = self.protector.sender_key(123456789)
         actions = FakeActions()
         with patch.object(
@@ -587,7 +674,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_activation_error_keeps_recoverable_state_if_restore_fails(
         self,
     ) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         sender_key = self.protector.sender_key(123456789)
         actions = FakeActions(restore_success=False)
         with patch.object(
@@ -596,12 +683,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             outcome = await self.service.handle(self.message(1), actions)
         self.assertEqual(outcome, "fail_safe")
         self.assertEqual(actions.restores, 3)
-        self.assertEqual(
-            self.store.sender(sender_key).status, "challenge_archiving"
-        )
+        self.assertEqual(self.store.sender(sender_key).status, "challenge_archiving")
 
     async def test_send_failure_rolls_challenge_back(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         sender_key = self.protector.sender_key(123456789)
         outcome = await self.service.handle(
             self.message(1), FakeActions(send_success=False)
@@ -610,7 +695,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "unknown")
 
     async def test_rate_limit_fallback_archives_and_enqueues_review(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         service = self.make_service(outbound_limit=1)
         self.store.claim_outbound_slot(1, self.now)
         reference = self.protector.seal_review_reference(123456789, 456, 1)
@@ -621,10 +706,15 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.protector.sender_key(123456789)
         self.assertEqual(outcome, "quarantined_rate_limited")
         self.assertEqual(self.store.sender(sender_key).status, "quarantined")
-        self.assertEqual(self.store.review_items()[0].classification, "challenge_unavailable")
+        self.assertEqual(
+            self.store.review_items(now=self.now)[0].classification,
+            "challenge_unavailable",
+        )
 
-    async def test_rate_limit_archive_failure_stays_unknown_and_enqueues_review(self) -> None:
-        self.store.set_mode("enforce")
+    async def test_rate_limit_archive_failure_stays_unknown_and_enqueues_review(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
         service = self.make_service(outbound_limit=1)
         self.store.claim_outbound_slot(1, self.now)
         reference = self.protector.seal_review_reference(123456789, 456, 1)
@@ -636,14 +726,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "fail_safe")
         self.assertEqual(self.store.sender(sender_key).status, "unknown")
         self.assertEqual(
-            self.store.review_items()[0].classification,
+            self.store.review_items(now=self.now)[0].classification,
             "challenge_unavailable_action_failed",
         )
 
     async def test_provisional_sender_is_still_screened(self) -> None:
         sender_key = self.protector.sender_key(123456789)
         self.store.mark_provisional(sender_key, self.now)
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         outcome = await self.service.handle(
             self.message(
                 1,
@@ -651,7 +741,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             FakeActions(),
         )
-        self.assertEqual(outcome, "quarantined")
+        self.assertEqual(outcome, "suppressed")
 
     async def test_owner_reply_promotes_provisional_sender(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -663,7 +753,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "allowed")
 
     async def test_same_sender_concurrency_issues_only_one_challenge(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         actions = FakeActions()
         actions.send_started = asyncio.Event()
         actions.release_send = asyncio.Event()
@@ -682,7 +772,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes[1], "challenge_pending")
 
     async def test_different_senders_can_issue_challenges_in_parallel(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         barrier = SendBarrier(2)
         first_actions = BarrierActions(barrier)
         second_actions = BarrierActions(barrier)
@@ -695,7 +785,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outcomes, ["challenged", "challenged"])
 
-    async def test_concurrent_correct_and_wrong_answers_cannot_requarantine(self) -> None:
+    async def test_concurrent_correct_and_wrong_answers_cannot_requarantine(
+        self,
+    ) -> None:
         sender_key = self.set_active_challenge()
         actions = FakeActions()
         outcomes = await asyncio.gather(
@@ -709,15 +801,15 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes, ["provisional", "provisional"])
         self.assertEqual(self.store.sender(sender_key).status, "provisional")
 
-    async def test_timeout_finalizes_even_after_mode_switch_to_observe(self) -> None:
+    async def test_timeout_cancels_delete_after_mode_switch_to_monitor(self) -> None:
         sender_key = self.set_active_challenge()
-        self.store.set_mode("observe")
+        self.store.set_mode("monitor")
         self.assertTrue(
             await self.service.expire_challenge(
                 sender_key, self.now + 60, now=self.now + 65
             )
         )
-        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
 
     async def test_dedicated_test_sender_timeout_uses_failure_cleanup(self) -> None:
         service = self.make_service(test_sender_id=TEST_SENDER_ID)
@@ -732,12 +824,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(actions.sent[-1][0], VERIFICATION_TIMEOUT_TEXT)
-        self.assertEqual(
-            actions.deletions, [(sender_key, self.now, self.now + 75)]
-        )
-        self.assertEqual(
-            actions.resets, [(sender_key, self.now + 65, self.now + 125)]
-        )
+        self.assertEqual(actions.deletions, [(sender_key, self.now, self.now + 75)])
+        self.assertEqual(actions.resets, [(sender_key, self.now + 65, self.now + 125)])
 
     async def test_incomplete_challenge_recovery_activates_and_schedules(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -817,7 +905,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "fail_safe")
         self.assertEqual(self.store.sender(sender_key).status, "challenged")
         self.assertEqual(
-            self.store.review_items()[0].classification, "restore_failed"
+            self.store.review_items(now=self.now)[0].classification, "restore_failed"
         )
         self.assertEqual(actions.restores, 3)
 
@@ -838,7 +926,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([text for text, _ in actions.sent], [REPLY_REQUIRED_TEXT])
 
     async def test_duplicate_message_has_no_second_action(self) -> None:
-        self.store.set_mode("enforce")
+        self.store.set_mode("protect")
         actions = FakeActions()
         await self.service.handle(self.message(1), actions)
         self.assertEqual(

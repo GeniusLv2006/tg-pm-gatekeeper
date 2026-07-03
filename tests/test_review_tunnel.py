@@ -48,9 +48,7 @@ class ReviewTunnelTests(unittest.TestCase):
         self.assertIn("1 to 65535", result.stderr)
 
     def test_remote_socket_must_be_absolute(self) -> None:
-        result = self.run_script(
-            "-s", "relative/review.sock", "user@server.example"
-        )
+        result = self.run_script("-s", "relative/review.sock", "user@server.example")
         self.assertEqual(result.returncode, 2)
         self.assertIn("absolute path", result.stderr)
 
@@ -63,6 +61,8 @@ class ReviewTunnelTests(unittest.TestCase):
             fake_curl = root / "curl"
             fake_ssh.write_text(
                 "#!/bin/sh\n"
+                'case "$*" in *"cat /var/lib/tg-pm-gatekeeper/review.access-token"*) '
+                "echo test-access-token; exit 0;; esac\n"
                 'echo $$ > "$FAKE_SSH_PID"\n'
                 "trap 'echo yes > \"$FAKE_SSH_TERMINATED\"; exit 0' TERM INT\n"
                 "while :; do sleep 0.1; done\n",

@@ -18,10 +18,10 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
-    def test_default_mode_is_observe(self) -> None:
-        self.assertEqual(self.store.get_mode(), "observe")
-        self.store.set_mode("enforce")
-        self.assertEqual(self.store.get_mode(), "enforce")
+    def test_default_mode_is_monitor(self) -> None:
+        self.assertEqual(self.store.get_mode(), "monitor")
+        self.store.set_mode("protect")
+        self.assertEqual(self.store.get_mode(), "protect")
 
     def test_message_claim_is_idempotent(self) -> None:
         self.assertTrue(self.store.claim_message("sender", 1, 100))
@@ -47,11 +47,11 @@ class StoreTests(unittest.TestCase):
         self.store.claim_message("sender", 11, 101)
         self.store.finish_message("sender", 11, "challenge_incorrect")
         self.store.record_automated_message("sender", 14, 104)
-        self.assertEqual(
-            self.store.message_ids_between("sender", 10, 12), [10, 11, 12]
-        )
+        self.assertEqual(self.store.message_ids_between("sender", 10, 12), [10, 11, 12])
 
-    def test_latest_challenge_terminal_event_distinguishes_wrong_from_timeout(self) -> None:
+    def test_latest_challenge_terminal_event_distinguishes_wrong_from_timeout(
+        self,
+    ) -> None:
         self.store.audit("sender", "CHALLENGE_TIMEOUT", "already_archived", 100)
         self.store.audit("sender", "attempts_exhausted", "scheduled", 200)
         self.assertEqual(
@@ -75,7 +75,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(state.status, "challenged")
         self.assertEqual(state.challenge_message_id, 42)
         self.assertIsNone(state.challenge_prompt)
-        self.assertIsNone(state.challenge_action_reference)
+        self.assertEqual(state.challenge_action_reference, b"reference")
 
     def test_automated_message_index_is_pruned_with_audit_retention(self) -> None:
         self.store.record_automated_message("sender", 42, 100)
@@ -103,6 +103,91 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(statistics["challenge_sent_7d"], 1)
         self.assertEqual(statistics["challenge_correct_7d"], 1)
         self.assertNotIn("sender", str(statistics))
+
+    def test_monitor_cancels_pending_delete_and_stale_revision_blocks_claim(
+        self,
+    ) -> None:
+        state = self.store.suppress(
+            "sender", "attempts_exhausted", until=700, reference=b"reference", now=100
+        )
+        action_id = self.store.schedule_action(
+            "sender",
+            reason="attempts_exhausted",
+            reference=b"reference",
+            execute_at=110,
+            expected_revision=state.revision,
+            now=100,
+        )
+        self.store.set_mode("protect")
+        self.assertIsNotNone(self.store.claim_action(action_id))
+        self.store.set_mode("monitor")
+        self.assertEqual(self.store.pending_actions(), [])
+        self.assertEqual(self.store.statistics()["pending_reviews"], 1)
+
+        other = self.store.suppress(
+            "other", "critical_rule", until=None, reference=b"other", now=200
+        )
+        other_action = self.store.schedule_action(
+            "other",
+            reason="critical_rule",
+            reference=b"other",
+            execute_at=210,
+            expected_revision=other.revision,
+            now=200,
+        )
+        self.store.set_mode("protect")
+        self.store.allow("other", 205)
+        self.assertIsNone(self.store.claim_action(other_action))
+
+    def test_monitor_preserves_mode_independent_test_action(self) -> None:
+        self.store.quarantine("test-sender", 100)
+        state = self.store.sender("test-sender")
+        action_id = self.store.schedule_action(
+            "test-sender",
+            reason="attempts_exhausted",
+            reference=b"test-reference",
+            execute_at=110,
+            expected_revision=state.revision,
+            mode_independent=True,
+            now=100,
+        )
+
+        self.store.set_mode("monitor")
+
+        action = self.store.claim_action(action_id)
+        self.assertIsNotNone(action)
+        assert action is not None
+        self.assertEqual(action.sender_key, "test-sender")
+        self.assertEqual(self.store.statistics()["pending_reviews"], 0)
+
+    def test_protect_preflight_rejects_stale_pending_action(self) -> None:
+        self.store.heartbeat()
+        state = self.store.suppress(
+            "sender", "critical_rule", until=None, reference=b"reference", now=100
+        )
+        self.store.schedule_action(
+            "sender",
+            reason="critical_rule",
+            reference=b"reference",
+            execute_at=100,
+            expected_revision=state.revision,
+            now=100,
+        )
+        self.store.allow("sender", 101)
+        # Recreate an intentionally stale row to exercise the preflight guard.
+        self.store.schedule_action(
+            "sender",
+            reason="critical_rule",
+            reference=b"reference",
+            execute_at=102,
+            expected_revision=state.revision,
+            now=102,
+        )
+
+        self.assertIn(
+            "stale pending actions require review",
+            self.store.protect_preflight(),
+        )
 
     def test_review_decision_erases_reversible_reference(self) -> None:
         review_id = self.store.enqueue_review(
@@ -185,9 +270,9 @@ class StoreMigrationTests(unittest.TestCase):
         store = StateStore(self.path)
         try:
             self.assertEqual(store.sender("sender").status, "allowed")
-            self.assertEqual(store.get_mode(), "observe")
+            self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 1)
+            self.assertEqual(version, 2)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -224,10 +309,44 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                1,
+                2,
             )
         finally:
             reopened.close()
+
+    def test_v1_mode_and_sender_schema_migrate_to_v2(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.executescript(
+            """
+            CREATE TABLE sender_state (
+                sender_key TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK (status IN (
+                    'unknown','challenge_issuing','challenge_archiving','challenged',
+                    'provisional','allowed','quarantined')),
+                challenge_id TEXT, answer_digest TEXT,
+                challenge_expires_at INTEGER, challenge_message_id INTEGER,
+                challenge_prompt TEXT, challenge_action_reference BLOB,
+                guidance_sent INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO settings VALUES ('mode','enforce');
+            INSERT INTO sender_state(sender_key,status,updated_at)
+                VALUES ('sender','allowed',100);
+            PRAGMA user_version=1;
+            """
+        )
+        connection.close()
+        store = StateStore(self.path)
+        try:
+            self.assertEqual(store.get_mode(), "protect")
+            self.assertEqual(store.sender("sender").status, "allowed")
+            self.assertEqual(store.sender("sender").revision, 0)
+            self.assertEqual(
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 2
+            )
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
