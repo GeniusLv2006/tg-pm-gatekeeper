@@ -17,7 +17,9 @@ The project is pre-release and tracks the latest commit on `main`. The implement
   queue through an SSH-forwarded, owner-only Unix socket;
 - can be explicitly switched to `enforce` mode to challenge ordinary unknown senders and archive
   and mute high-confidence spam; and
-- does not delete, block, report, call an AI service, or expose a public administration port.
+- deletes only verification-flow messages after a pass or a failed sender's private dialog after
+  exhausted attempts; it does not block, report, call an AI service, or expose a public
+  administration port.
 
 ## Runtime flow
 
@@ -31,9 +33,11 @@ incoming private message
       observe: enqueue a simulated challenge for review
       enforce: send one randomized addition, subtraction, or multiplication check
           -> archive and mute while pending
-          -> direct Reply with the correct answer: restore dialog and keep screening
+          -> direct Reply with the correct answer: restore dialog, clear verification messages,
+             and keep screening
           -> account owner replies later: allow sender permanently
-          -> two incorrect numeric answers or timeout: remain archived and muted
+          -> two incorrect numeric answers: delete the private conversation for both sides
+          -> timeout: remain archived and muted
           -> challenge send limit reached: archive, mute, and queue for manual review
 ```
 
@@ -126,10 +130,11 @@ CLI cannot restore Telegram state; resolve those senders as **Legitimate** in th
 For repeated arithmetic-flow testing, `TG_TEST_SENDER_ID` may name one dedicated Telegram account.
 That account always follows the real challenge path, even in observation mode or when it is a
 contact with prior outgoing history, and its test notices do not consume the global outbound quota.
-After a pass, its sender state resets to unknown after 60 seconds. After final failure or timeout,
-Gatekeeper sends a failure notice, keeps the dialog archived and muted, deletes only the messages
-recorded for that challenge after 10 seconds, and resets the sender state after 60 seconds. Leave the
-setting empty in normal deployments.
+After a pass, Gatekeeper clears the verification exchange and resets the test sender state to
+unknown after 60 seconds. Exhausting the numeric attempts deletes the entire private conversation
+for both sides and schedules the same state reset. A timeout still sends a failure notice, keeps the
+dialog archived and muted, deletes only the messages recorded for that timed-out challenge after 10
+seconds, and resets the sender state after 60 seconds. Leave the setting empty in normal deployments.
 
 The status response includes seven-day aggregate challenge counters for prompts sent, correct
 answers, wrong Reply targets, non-numeric replies, timeouts, exhausted attempts, and restoration

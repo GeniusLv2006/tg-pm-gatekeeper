@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from telethon import functions, types
 
@@ -12,7 +13,7 @@ from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.service import TextStyleSpan
-from tg_pm_gatekeeper.store import StateStore
+from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
     TelegramAdapter,
     TelegramActions,
@@ -271,6 +272,39 @@ class TelegramActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(restored.silent)
         self.assertEqual(restored.mute_until, original_mute)
         self.assertIsNone(store.snapshot)
+
+
+class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_messages_uses_one_revoked_batch(self) -> None:
+        client = SimpleNamespace(delete_messages=AsyncMock())
+        adapter = SimpleNamespace(client=client)
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
+        actions = TelegramActions(adapter, peer, "sender")
+
+        self.assertTrue(await actions.delete_messages((10, 11, 12)))
+
+        client.delete_messages.assert_awaited_once_with(
+            peer, [10, 11, 12], revoke=True
+        )
+
+    async def test_delete_dialog_revokes_history_and_clears_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                store.save_dialog_snapshot(
+                    "sender", DialogSnapshot(folder_id=0, silent=False, mute_until=None)
+                )
+                client = SimpleNamespace(delete_dialog=AsyncMock())
+                adapter = SimpleNamespace(client=client, store=store)
+                peer = types.InputPeerUser(user_id=123, access_hash=456)
+                actions = TelegramActions(adapter, peer, "sender")
+
+                self.assertTrue(await actions.delete_dialog())
+
+                client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
+                self.assertIsNone(store.dialog_snapshot("sender"))
+            finally:
+                store.close()
 
 
 class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):

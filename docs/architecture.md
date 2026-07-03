@@ -36,8 +36,9 @@ later manual reply from the account owner, an explicit review, or a safe operato
 4. In observation mode, record the simulated result for operator review and take no Telegram action.
 5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender and
    bind it to the outgoing Telegram message ID.
-6. Accept only a direct Reply to that message. Restore a correct sender as `provisional`; quarantine
-   after two incorrect numeric answers or timeout.
+6. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
+   the verification exchange. After two incorrect numeric answers, revoke and delete the entire
+   private conversation. A timeout leaves the dialog quarantined.
 
 In enforcement mode the challenge is written in English and defaults to 60 seconds. Its title is
 `⚠️ Verification Required`; Telegram-native bold entities emphasize the title, deadline, expression,
@@ -46,9 +47,12 @@ window starts only after Telegram confirms prompt delivery. The dialog is archiv
 the challenge becomes active. Replies to another message, standalone answers, and non-numeric replies
 do not consume an attempt or extend the deadline. At most one corrective hint is sent per challenge.
 Numeric input is NFKC-normalized before comparison. A correct answer restores the dialog and its
-previous archive, silent, and mute settings while keeping hard-rule screening active. Restoration is
-retried three times; persistent failure creates a manual review item instead of silently treating a
-correct sender as spam. Timeout or two incorrect numeric answers leave the dialog archived and muted.
+previous archive, silent, and mute settings while keeping hard-rule screening active, then deletes
+the challenge prompt, replies, corrective notices, and success notice in one Telegram request.
+Restoration is retried three times; persistent failure creates a manual review item instead of
+silently treating a correct sender as spam. A timeout leaves the dialog archived and muted. Two
+incorrect numeric answers delete the private conversation for both sides; if deletion fails, the
+already archived and muted dialog remains quarantined.
 The arithmetic is interaction friction rather than a CAPTCHA and is not treated as proof of humanity.
 Each challenge independently selects addition, non-negative subtraction, or basic multiplication;
 operands are bounded so answers remain suitable for quick mental arithmetic.
@@ -57,9 +61,9 @@ An optional single-account test path is enabled only when `TG_TEST_SENDER_ID` is
 bypasses contact, prior-history, hard-rule, observation-mode, and outbound-quota shortcuts so
 repeated tests exercise the actual arithmetic flow. Successful and terminal-failure states are
 conditionally reset to `unknown` after 60 seconds; the conditional update prevents an older timer
-from resetting a newer challenge. A terminal failure first sends a failure notice, then deletes only
-message IDs recorded during that challenge after 10 seconds. Delayed deletion and reset are
-reconstructed after restart.
+from resetting a newer challenge. Exhausted attempts use the normal whole-dialog deletion policy.
+A timeout sends a failure notice, then deletes only message IDs recorded during that challenge after
+10 seconds. Delayed timeout deletion and state reset are reconstructed after restart.
 
 Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
 with a simulated challenge or quarantine. Further messages from that sender update the same item and
@@ -107,9 +111,9 @@ verdicts may remain for the normal audit retention period.
 | Manual legitimate review | Allow sender | Allow sender |
 | Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
 
-Deletion, blocking, reporting, AI classification, and general conversation cleanup are not
-implemented. The only deletion path is the explicitly configured dedicated test account described
-above, scoped to message IDs recorded during its failed challenge.
+Deletion is limited to verification cleanup after success, whole-dialog deletion after exhausted
+numeric attempts, and the dedicated test account's timed-out challenge cleanup described above.
+Blocking, reporting, AI classification, and unrelated conversation cleanup are not implemented.
 
 ## Data boundaries
 

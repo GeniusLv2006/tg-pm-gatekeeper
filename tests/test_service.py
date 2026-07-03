@@ -41,6 +41,8 @@ class FakeActions:
         self.cancelled: list[str] = []
         self.deletions: list[tuple[str, int, int]] = []
         self.deleted_messages: list[int] = []
+        self.deleted_message_batches: list[tuple[int, ...]] = []
+        self.deleted_dialogs = 0
         self.resets: list[tuple[str, int, int]] = []
         self.restores = 0
         self.archive_success = archive_success
@@ -82,6 +84,14 @@ class FakeActions:
 
     async def delete_message(self, message_id: int) -> bool:
         self.deleted_messages.append(message_id)
+        return True
+
+    async def delete_messages(self, message_ids: tuple[int, ...]) -> bool:
+        self.deleted_message_batches.append(message_ids)
+        return True
+
+    async def delete_dialog(self) -> bool:
+        self.deleted_dialogs += 1
         return True
 
     def schedule_timeout(
@@ -372,7 +382,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "challenged",
         )
 
-    async def test_dedicated_test_sender_failure_notifies_deletes_and_resets(
+    async def test_dedicated_test_sender_wrong_answer_deletes_dialog_and_resets(
         self,
     ) -> None:
         service = self.make_service(test_sender_id=TEST_SENDER_ID)
@@ -402,8 +412,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "quarantined",
         )
-        self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
-        self.assertEqual(actions.deletions, [(sender_key, self.now, self.now + 10)])
+        self.assertEqual(actions.deleted_dialogs, 1)
+        self.assertEqual(actions.deletions, [])
         self.assertEqual(actions.resets, [(sender_key, self.now, self.now + 60)])
 
     async def test_dedicated_test_sender_bypasses_outbound_limit(self) -> None:
@@ -460,6 +470,26 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "provisional")
         self.assertEqual(self.store.sender(sender_key).status, "provisional")
 
+    async def test_correct_answer_deletes_the_complete_verification_flow(self) -> None:
+        sender_key = self.set_active_challenge()
+        self.store.record_automated_message(sender_key, 100, self.now)
+        actions = FakeActions()
+        actions.next_message_id = 102
+        self.assertEqual(
+            await self.service.handle(
+                self.message(101, "11", reply_to_message_id=100), actions
+            ),
+            "challenge_incorrect",
+        )
+        self.assertEqual(
+            await self.service.handle(
+                self.message(103, "12", reply_to_message_id=100), actions
+            ),
+            "provisional",
+        )
+        self.assertEqual(actions.deleted_message_batches, [(100, 101, 102, 103)])
+        self.assertEqual(actions.deleted_dialogs, 0)
+
     async def test_signed_number_is_format_error_without_attempt(self) -> None:
         sender_key = self.set_active_challenge()
         outcome = await self.service.handle(
@@ -480,6 +510,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((first, second), ("challenge_incorrect", "quarantined"))
         self.assertEqual(self.store.sender(sender_key).status, "quarantined")
         self.assertEqual(actions.quarantines, 0)
+        self.assertEqual(actions.deleted_dialogs, 1)
         self.assertIn("1 attempt remaining", actions.sent[0][0])
 
     async def test_message_sent_before_deadline_can_pass_after_processing_delay(self) -> None:
