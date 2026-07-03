@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 from __future__ import annotations
 
 import os
@@ -27,6 +31,21 @@ class InitializeTests(unittest.TestCase):
         self.assertIn("TG_DATASET_COLLECTION=off", config)
         self.assertIn("TG_TEST_SENDER_ID=\n", config)
         self.assertNotIn("REPLACE_WITH_", config)
+
+    def test_public_example_matches_generated_config_keys(self) -> None:
+        generated = render_config(1, "TEST_API_HASH_DO_NOT_USE").decode("ascii")
+        example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(
+            encoding="utf-8"
+        )
+
+        def keys(value: str) -> set[str]:
+            return {
+                line.partition("=")[0]
+                for line in value.splitlines()
+                if line and not line.startswith("#") and "=" in line
+            }
+
+        self.assertEqual(keys(example), keys(generated))
 
     def test_challenge_configuration_is_bounded(self) -> None:
         with patch.dict("os.environ", {"TG_CHALLENGE_TTL_SECONDS": "10"}, clear=True):

@@ -30,7 +30,10 @@ If a secret is committed, removing it in a later commit is insufficient. Revoke 
 - Challenge delivery, timeout, and review transitions must be serialized per derived sender key;
   outbound-rate exhaustion must not bypass screening.
 - Whole-dialog deletion must be represented by a persistent action with an expected state revision.
-  It may execute only in `protect` mode; switching to `monitor` cancels pending destructive jobs.
+  Normal deletions execute only in `protect`; switching to `monitor` cancels those pending jobs.
+  The sole exception is an explicitly configured `TG_TEST_SENDER_ID`: exhausted attempts can delete
+  that dedicated test dialog in either mode so repeated end-to-end testing exercises the real path.
+  Never assign this setting to a real correspondent.
 - The application must not expose a listening port or mount the Docker socket.
 - Root compromise of the host is considered compromise of the Telegram account. Container isolation
   does not protect a session from the host administrator.
