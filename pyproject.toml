@@ -7,6 +7,7 @@ name = "tg-pm-gatekeeper"
 version = "0.1.0"
 description = "Safety-first Telegram private-message gatekeeper"
 requires-python = ">=3.14,<3.15"
+license = "MPL-2.0"
 dependencies = [
   "cryptography==49.0.0",
   "cffi==2.0.0",

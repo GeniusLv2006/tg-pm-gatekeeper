@@ -7,15 +7,29 @@
 - Keep Telegram credentials and private message data out of source control.
 - Explain every automated decision through a minimal audit record.
 
+## Terms
+
+- **Unknown**: no local trust decision exists for the sender.
+- **Provisional**: the sender passed the arithmetic check; critical rules still apply.
+- **Allowed**: the owner, CLI, or review workflow explicitly trusted the sender.
+- **Quarantined**: Gatekeeper archived and muted the dialog while it awaits or follows review.
+- **Suppressed**: incoming messages are scheduled for deletion until a temporary suppression expires,
+  or indefinitely after a critical rule.
+- **Review item**: one sender-level pending decision with a count and one encrypted Telegram reference,
+  not a stored conversation transcript.
+
 ## Sender states
 
 ```text
 unknown -> challenge_issuing -> challenge_archiving -> challenged
                                                      -> provisional -> allowed
-                                                     -> suppressed
+                                                     -> suppressed (timeout or failed attempts)
 
 unknown -> suppressed (critical deterministic rule)
 provisional -> suppressed (critical deterministic rule)
+unknown -> quarantined (challenge outbound limit or manual spam review)
+challenged -> quarantined (manual spam review or warning failure)
+unknown/provisional/challenged/quarantined/suppressed -> allowed (legitimate review)
 allowed -> unknown (manual revoke)
 ```
 
@@ -35,7 +49,8 @@ later manual reply from the account owner, an explicit review, or a safe operato
    metadata, and links are kept separate from quoted text and links so quoted content cannot trigger
    generic promotion or link-count rules. The dedicated quoted crypto-service rule still inspects
    quote text in memory.
-4. In monitor mode, record the simulated result for operator review and take no Telegram action.
+4. In monitor mode, record the simulated result for operator review and take no Telegram action,
+   except for the explicitly configured dedicated test sender.
 5. In protect mode, persist and silently delete critical-rule dialogs; send one expiring challenge
    to ordinary and high-risk unknown senders and bind it to the outgoing Telegram message ID.
 6. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
@@ -75,8 +90,9 @@ with a simulated challenge or quarantine. Further messages from that sender upda
 increment its message counter. The retained reference normally follows the newest message. If a row
 already represents a simulated quarantine, a later lower-risk message increments the counter without
 replacing that higher-severity classification or its referenced message. Monitor mode sends no
-challenges and changes no Telegram dialog.
-Protection must be enabled with `mode protect`; `mode monitor` cancels pending destructive jobs.
+challenges and changes no Telegram dialog unless `TG_TEST_SENDER_ID` explicitly selects that sender.
+Protection must be enabled with `mode protect`; `mode monitor` cancels pending non-test destructive
+jobs.
 
 ## Post-event review
 
@@ -117,10 +133,13 @@ verdicts may remain for the normal audit retention period.
 | Challenge send limit reached | Not applicable | Archive, mute, and queue review |
 | Manual legitimate review | Allow sender | Allow sender |
 | Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
+| Dedicated test sender | Run the real challenge flow | Run the real challenge flow |
 
 Whole-dialog deletion is used for critical deterministic rules and warned challenge failure. Pending
 deletions persist across restart and execute only when mode, sender status, and state revision still
-match. Blocking, reporting, model inference, and unrelated conversation cleanup are not implemented.
+match. Dedicated-test-sender deletions are intentionally mode-independent; other destructive jobs are
+cancelled by `mode monitor`. Blocking, reporting, model inference, and unrelated conversation cleanup
+are not implemented.
 
 ## Data boundaries
 
@@ -174,5 +193,5 @@ a model.
   instead of claiming that the sender is unconfined.
 - Exhausted outbound capacity archives the unknown dialog and creates a manual review item instead
   of allowing challenge delivery to fail open.
-- Pending deletion jobs include an expected state revision. Switching to monitor cancels them and
-  creates exception reviews; restart recovery cannot execute stale work.
+- Pending deletion jobs include an expected state revision. Switching to monitor cancels non-test
+  jobs and creates exception reviews; restart recovery cannot execute stale work.

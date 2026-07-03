@@ -28,6 +28,7 @@ A pull request is required when any change affects or could affect:
 - networking, Unix sockets, SSH behavior, Docker isolation, or host permissions;
 - executable files under `scripts/` or `deploy/`;
 - dependencies, pinned images, GitHub Actions, build configuration, or deployment commands;
+- the project license, source-file license notices, or contribution licensing terms;
 - `SECURITY.md` or a documented security/privacy guarantee.
 
 When classification is uncertain, use a pull request.
@@ -78,17 +79,20 @@ signal quality, and maintenance cost are the relevant measures.
 
 ## 4. Decide whether deployment is required
 
-No service deployment is required for changes limited to documentation, tests, `.gitignore`, or
-repository metadata. Synchronizing the server checkout is optional and must not restart the healthy
-container.
+No service deployment is required for changes limited to documentation, tests, license text or
+source notices, `.gitignore`, or repository metadata such as the `pyproject.toml` license expression.
+Synchronizing the server checkout is optional and must not restart the healthy container.
 
 Deploy when the merged commit changes runtime code, configuration consumed by the service, Docker
 or dependency inputs, database behavior, or an operator workflow that must exist on the host.
 
-Rebuild the image when any of these change:
+Rebuild the image when executable, build, or dependency content in any of these changes:
 
 - `src/`, `Dockerfile`, `compose.yaml`, `pyproject.toml`;
 - `requirements.txt` or `requirements-build.txt`.
+
+Comments, license notices, and metadata-only edits in those files do not by themselves require a
+rebuild.
 
 Host-only scripts and documentation may require a repository pull but not an image rebuild.
 
