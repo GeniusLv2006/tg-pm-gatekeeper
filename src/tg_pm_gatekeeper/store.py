@@ -773,6 +773,19 @@ class StateStore:
         value = row["started_at"] if row else None
         return int(value) if value is not None else None
 
+    def latest_challenge_terminal_event(
+        self, sender_key: str, since: int
+    ) -> tuple[str, str] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT rule_code, outcome FROM audit "
+                "WHERE sender_key=? AND created_at>=? "
+                "AND rule_code IN ('attempts_exhausted', 'CHALLENGE_TIMEOUT') "
+                "ORDER BY id DESC LIMIT 1",
+                (sender_key, since),
+            ).fetchone()
+        return (str(row["rule_code"]), str(row["outcome"])) if row else None
+
     def is_automated_message(self, sender_key: str, message_id: int) -> bool:
         with self._lock:
             row = self._connection.execute(

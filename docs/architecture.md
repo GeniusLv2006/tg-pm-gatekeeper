@@ -37,8 +37,9 @@ later manual reply from the account owner, an explicit review, or a safe operato
 5. In enforcement mode, send one expiring challenge to an otherwise ordinary unknown sender and
    bind it to the outgoing Telegram message ID.
 6. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
-   the verification exchange. After two incorrect numeric answers, revoke and delete the entire
-   private conversation. A timeout leaves the dialog quarantined.
+   the verification exchange. After two incorrect numeric answers, warn that deletion is pending,
+   wait 10 seconds, then revoke and delete the entire private conversation. A timeout leaves the
+   dialog quarantined.
 
 In enforcement mode the challenge is written in English and defaults to 60 seconds. Its title is
 `⚠️ Verification Required`; Telegram-native bold entities emphasize the title, deadline, expression,
@@ -51,8 +52,9 @@ previous archive, silent, and mute settings while keeping hard-rule screening ac
 the challenge prompt, replies, corrective notices, and success notice in one Telegram request.
 Restoration is retried three times; persistent failure creates a manual review item instead of
 silently treating a correct sender as spam. A timeout leaves the dialog archived and muted. Two
-incorrect numeric answers delete the private conversation for both sides; if deletion fails, the
-already archived and muted dialog remains quarantined.
+incorrect numeric answers send a failure notice with a 10-second countdown, then delete the private
+conversation for both sides. If the warning cannot be delivered, deletion is not scheduled; if the
+eventual deletion fails, the already archived and muted dialog remains quarantined.
 The arithmetic is interaction friction rather than a CAPTCHA and is not treated as proof of humanity.
 Each challenge independently selects addition, non-negative subtraction, or basic multiplication;
 operands are bounded so answers remain suitable for quick mental arithmetic.
@@ -61,9 +63,10 @@ An optional single-account test path is enabled only when `TG_TEST_SENDER_ID` is
 bypasses contact, prior-history, hard-rule, observation-mode, and outbound-quota shortcuts so
 repeated tests exercise the actual arithmetic flow. Successful and terminal-failure states are
 conditionally reset to `unknown` after 60 seconds; the conditional update prevents an older timer
-from resetting a newer challenge. Exhausted attempts use the normal whole-dialog deletion policy.
-A timeout sends a failure notice, then deletes only message IDs recorded during that challenge after
-10 seconds. Delayed timeout deletion and state reset are reconstructed after restart.
+from resetting a newer challenge. Exhausted attempts use the normal warning plus delayed
+whole-dialog deletion policy. A timeout sends a failure notice, then deletes only message IDs
+recorded during that challenge after 10 seconds. Delayed test-account cleanup and state reset are
+reconstructed after restart.
 
 Observation mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
 with a simulated challenge or quarantine. Further messages from that sender update the same item and
@@ -111,8 +114,8 @@ verdicts may remain for the normal audit retention period.
 | Manual legitimate review | Allow sender | Allow sender |
 | Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
 
-Deletion is limited to verification cleanup after success, whole-dialog deletion after exhausted
-numeric attempts, and the dedicated test account's timed-out challenge cleanup described above.
+Deletion is limited to verification cleanup after success, warned and delayed whole-dialog deletion
+after exhausted numeric attempts, and the dedicated test account's timed-out challenge cleanup.
 Blocking, reporting, AI classification, and unrelated conversation cleanup are not implemented.
 
 ## Data boundaries

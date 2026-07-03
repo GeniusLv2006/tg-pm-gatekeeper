@@ -32,8 +32,13 @@ VERIFICATION_PASSED_TEXT = (
     "✅ Verification Passed\n\nThis conversation has been restored."
 )
 VERIFICATION_FAILED_TEXT = (
+    "⛔ Verification Failed\n\nThis conversation remains archived and muted.\n\n"
+    "This conversation will be deleted in 10 seconds."
+)
+VERIFICATION_TIMEOUT_TEXT = (
     "⛔ Verification Failed\n\nThis conversation remains archived and muted."
 )
+FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
 
@@ -58,6 +63,7 @@ class MessageActions(Protocol):
     def schedule_test_message_deletion(
         self, sender_key: str, since: int, delete_at: int
     ) -> None: ...
+    def schedule_dialog_deletion(self, sender_key: str, delete_at: int) -> None: ...
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int
     ) -> None: ...
@@ -568,17 +574,35 @@ class GatekeeperService:
         if attempts >= self.challenge_max_attempts:
             self.store.quarantine(sender_key, now)
             actions.cancel_timeout(sender_key)
-            dialog_deleted = await actions.delete_dialog()
-            self.store.audit(
-                sender_key,
-                "attempts_exhausted",
-                "dialog_deleted" if dialog_deleted else "action_failed",
-                now,
-            )
             if sender_key == self.test_sender_key:
                 actions.schedule_test_state_reset(
                     sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
                 )
+            warning_message_id = await self._send_notice(
+                sender_key,
+                actions,
+                VERIFICATION_FAILED_TEXT,
+                now,
+                formatting=emphasized(
+                    VERIFICATION_FAILED_TEXT,
+                    "⛔ Verification Failed",
+                    "10 seconds",
+                ),
+            )
+            if warning_message_id is None:
+                self.store.audit(
+                    sender_key, "attempts_exhausted", "warning_failed", now
+                )
+                return "quarantined"
+            actions.schedule_dialog_deletion(
+                sender_key, now + FAILED_DIALOG_DELETE_DELAY_SECONDS
+            )
+            self.store.audit(
+                sender_key,
+                "attempts_exhausted",
+                "dialog_deletion_scheduled",
+                now,
+            )
             return "quarantined"
         remaining = self.challenge_max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
@@ -676,9 +700,9 @@ class GatekeeperService:
         await self._send_notice(
             sender_key,
             actions,
-            VERIFICATION_FAILED_TEXT,
+            VERIFICATION_TIMEOUT_TEXT,
             now,
-            formatting=notice_formatting(VERIFICATION_FAILED_TEXT),
+            formatting=notice_formatting(VERIFICATION_TIMEOUT_TEXT),
         )
         challenge_started_at = (
             challenge_state.challenge_expires_at - self.challenge_ttl_seconds
