@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from .crypto import IdentifierProtector
-from .dataset import TrainingStore
+from .dataset import DatasetProtector, TrainingStore
 from .policy import DetectionResult, PolicyEngine
 from .rules import MessageFacts, evaluate_hard_rules
 from .store import SenderState, StateStore
@@ -37,11 +36,12 @@ VERIFICATION_PASSED_TEXT = (
 )
 VERIFICATION_FAILED_TEXT = (
     "⛔ Verification Failed\n\nThis conversation remains archived and muted.\n\n"
-    "This conversation will be deleted in 10 seconds."
+    "This conversation will be deleted in 10 seconds. New messages will be removed "
+    "for 7 days."
 )
 VERIFICATION_TIMEOUT_TEXT = (
     "⛔ Verification Failed\n\nThe verification window expired.\n\n"
-    "This conversation will be deleted in 10 seconds."
+    "This conversation will be deleted in 10 seconds. Try again in 24 hours."
 )
 FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
@@ -214,6 +214,7 @@ class GatekeeperService:
         denylist: frozenset[str] = frozenset(),
         test_sender_id: int | None = None,
         training_store: TrainingStore | None = None,
+        review_content_protector: DatasetProtector | None = None,
         dataset_collection: bool = True,
         dataset_retention_days: int = 30,
         dataset_max_messages_per_sender: int = 3,
@@ -232,6 +233,7 @@ class GatekeeperService:
             protector.sender_key(test_sender_id) if test_sender_id is not None else None
         )
         self.training_store = training_store
+        self.review_content_protector = review_content_protector
         self.dataset_collection = dataset_collection
         self.dataset_retention_days = dataset_retention_days
         self.dataset_max_messages_per_sender = dataset_max_messages_per_sender
@@ -336,6 +338,13 @@ class GatekeeperService:
                             actual_action=outcome,
                         )
                 else:
+                    self._capture_enforcement_review(
+                        sender_key,
+                        message,
+                        reason="critical_rule",
+                        rule_codes=decision.rule_codes,
+                        now=now,
+                    )
                     outcome = self._schedule_critical_delete(
                         sender_key, message, actions, now
                     )
@@ -402,18 +411,21 @@ class GatekeeperService:
         if (
             self.training_store is None
             or not self.dataset_collection
-            or not message.text.strip()
+            or not (message.text.strip() or message.facts.quote_text.strip())
         ):
             return
         facts = message.facts
         payload: dict[str, object] = {
+            "schema_version": 2,
             "text": message.text,
+            "quote_text": facts.quote_text,
             "features": {
                 "domain_count": min(len(set(facts.domains)), 2),
                 "forwarded": facts.is_forwarded,
                 "has_any_button": facts.has_any_button,
                 "has_link": facts.has_link,
                 "has_link_button": facts.has_link_button,
+                "has_quote": bool(facts.quote_text),
                 "link_button_count": min(facts.link_button_count, 3),
                 "url_count": min(len(set(facts.urls)), 2),
                 "via_bot": facts.via_bot,
@@ -445,6 +457,83 @@ class GatekeeperService:
                 "action_failed",
                 now,
             )
+
+    def _capture_enforcement_review(
+        self,
+        sender_key: str,
+        message: IncomingMessage,
+        *,
+        reason: str,
+        rule_codes: tuple[str, ...] = (),
+        now: int,
+    ) -> None:
+        if (
+            self.review_content_protector is None
+            or sender_key == self.test_sender_key
+        ):
+            return
+        facts = message.facts
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "text": message.text,
+            "quote_text": facts.quote_text,
+            "rule_codes": list(rule_codes),
+            "features": {
+                "domain_count": min(len(set(facts.domains)), 2),
+                "forwarded": facts.is_forwarded,
+                "has_any_button": facts.has_any_button,
+                "has_link": facts.has_link,
+                "has_link_button": facts.has_link_button,
+                "has_quote": bool(facts.quote_text),
+                "link_button_count": min(facts.link_button_count, 3),
+                "quote_url_count": min(len(set(facts.quote_urls)), 2),
+                "url_count": min(len(set(facts.urls)), 2),
+                "via_bot": facts.via_bot,
+            },
+        }
+        try:
+            envelope = self.review_content_protector.seal_enforcement(payload)
+            self.store.save_enforcement_review(
+                sender_key,
+                reference=message.review_reference,
+                envelope=envelope,
+                reason=reason,
+                expires_at=now + self.review_retention_days * 86400,
+                now=now,
+            )
+        except Exception:
+            LOG.error("enforcement_review_capture_failed")
+            try:
+                self.store.audit(
+                    sender_key, "ENFORCEMENT_REVIEW", "action_failed", now
+                )
+            except Exception:
+                pass
+
+    def _activate_enforcement_review(
+        self,
+        sender_key: str,
+        reason: str,
+        now: int,
+        *,
+        reference: bytes | None = None,
+    ) -> None:
+        try:
+            self.store.activate_enforcement_review(
+                sender_key,
+                reason,
+                now + self.review_retention_days * 86400,
+                reference=reference,
+                now=now,
+            )
+        except Exception:
+            LOG.error("enforcement_review_activation_failed")
+            try:
+                self.store.audit(
+                    sender_key, "ENFORCEMENT_REVIEW", "action_failed", now
+                )
+            except Exception:
+                pass
 
     def _update_sample_outcome(
         self, sender_id: int, *, weak_label: str, actual_action: str
@@ -489,6 +578,7 @@ class GatekeeperService:
         now: int,
     ) -> str:
         if message.review_reference is None:
+            self.store.delete_enforcement_review(sender_key)
             self.store.audit(
                 sender_key, "CRITICAL_DELETE", "reference_unavailable", now
             )
@@ -499,6 +589,12 @@ class GatekeeperService:
             until=None,
             reference=message.review_reference,
             now=now,
+        )
+        self._activate_enforcement_review(
+            sender_key,
+            "critical_rule",
+            now,
+            reference=message.review_reference,
         )
         action_id = self.store.schedule_action(
             sender_key,
@@ -545,6 +641,9 @@ class GatekeeperService:
         actions: MessageActions,
         now: int,
     ) -> str:
+        self._capture_enforcement_review(
+            sender_key, message, reason="challenge_pending", now=now
+        )
         if not self._claim_outbound_slot(sender_key, now):
             return await self._rate_limit_fallback(sender_key, message, actions, now)
 
@@ -638,10 +737,17 @@ class GatekeeperService:
             archived = False
         if archived:
             self.store.quarantine(sender_key, now)
+            self._activate_enforcement_review(
+                sender_key,
+                "challenge_unavailable",
+                now,
+                reference=message.review_reference,
+            )
             self.store.audit(sender_key, "CHALLENGE_UNAVAILABLE", "archived_muted", now)
             classification = "challenge_unavailable"
             outcome = "quarantined_rate_limited"
         else:
+            self.store.delete_enforcement_review(sender_key)
             self.store.audit(sender_key, "CHALLENGE_UNAVAILABLE", "action_failed", now)
             classification = "challenge_unavailable_action_failed"
             outcome = "fail_safe"
@@ -798,6 +904,12 @@ class GatekeeperService:
             )
             if warning_message_id is None:
                 self.store.quarantine(sender_key, now)
+                self._activate_enforcement_review(
+                    sender_key,
+                    "warning_failed",
+                    now,
+                    reference=message.review_reference,
+                )
                 self._enqueue_review(sender_key, message, "warning_failed", (), now)
                 self.store.audit(
                     sender_key, "attempts_exhausted", "warning_failed", now
@@ -806,6 +918,9 @@ class GatekeeperService:
             reference = message.review_reference or state.challenge_action_reference
             if reference is None:
                 self.store.quarantine(sender_key, now)
+                self._activate_enforcement_review(
+                    sender_key, "reference_unavailable", now
+                )
                 self.store.audit(
                     sender_key, "attempts_exhausted", "reference_unavailable", now
                 )
@@ -825,6 +940,12 @@ class GatekeeperService:
                     until=now + 7 * 86400,
                     reference=reference,
                     now=now,
+                )
+                self._activate_enforcement_review(
+                    sender_key,
+                    "attempts_exhausted",
+                    now,
+                    reference=reference,
                 )
                 if self.training_store is not None:
                     self._update_sample_outcome(
@@ -966,10 +1087,22 @@ class GatekeeperService:
                         now,
                     )
                 self.store.quarantine(sender_key, now)
+                self._activate_enforcement_review(
+                    sender_key,
+                    "timeout_notice_failed",
+                    now,
+                    reference=reference,
+                )
                 self.store.audit(
                     sender_key, "CHALLENGE_TIMEOUT_DELETE", "not_scheduled", now
                 )
                 return
+            self._activate_enforcement_review(
+                sender_key,
+                "challenge_timeout",
+                now,
+                reference=reference,
+            )
             action_id = self.store.schedule_action(
                 sender_key,
                 reason="challenge_timeout",
@@ -1009,6 +1142,13 @@ class GatekeeperService:
             state = self.store.sender(sender_key)
             expired = self.store.expire_challenge(sender_key, expires_at, timestamp)
             if expired:
+                if sender_key != self.test_sender_key:
+                    self._activate_enforcement_review(
+                        sender_key,
+                        "challenge_timeout",
+                        timestamp,
+                        reference=state.challenge_action_reference,
+                    )
                 self.store.audit(
                     sender_key, "CHALLENGE_TIMEOUT", "already_archived", timestamp
                 )

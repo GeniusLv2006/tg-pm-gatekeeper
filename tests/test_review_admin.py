@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -60,7 +59,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.store = StateStore(Path(self.temp.name) / "state.sqlite3")
         self.protector = IdentifierProtector(b"k" * 32)
-        self.service = GatekeeperService(self.store, self.protector)
+        self.review_protector = DatasetProtector(b"r" * 32)
+        self.service = GatekeeperService(
+            self.store,
+            self.protector,
+            review_content_protector=self.review_protector,
+        )
         self.client = FakeTelegramClient()
         self.cancelled: list[str] = []
         self.server = ReviewAdminServer(
@@ -194,7 +198,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         sample_id = training.collect(
             sender_id=123,
             message_id=1,
-            payload={"text": "dataset-private-canary", "features": {}},
+            payload={
+                "schema_version": 2,
+                "text": "dataset-private-canary",
+                "quote_text": "quoted-dataset-canary",
+                "features": {"has_quote": True},
+            },
             weak_label="uncertain",
             retention_days=30,
             max_per_sender=3,
@@ -214,6 +223,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn(b"dataset-private-canary", detail)
+        self.assertIn(b"quoted-dataset-canary", detail)
+        self.assertIn(b"Quoted context", detail)
         body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
         status, _, _ = self.server._dispatch_dataset(
             "POST", f"/dataset/{sample_id}", body
@@ -221,6 +232,87 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 303)
         self.assertEqual(training.sample(sample_id).manual_label, "spam")
         self.assertFalse(self.server.socket_path.exists())
+
+    async def test_active_enforcement_shows_encrypted_content_and_allows_sender(
+        self,
+    ) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        reference = self.protector.seal_review_reference(
+            123456789, -987654321, 42
+        )
+        envelope = self.review_protector.seal_enforcement(
+            {
+                "schema_version": 1,
+                "text": "enforcement-private-canary",
+                "quote_text": "quoted-enforcement-canary",
+                "rule_codes": ["HR-06_DENIED_DOMAIN"],
+                "features": {"has_quote": True},
+            }
+        )
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=reference,
+            envelope=envelope,
+            reason="attempts_exhausted",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.suppress(
+            sender_key,
+            "attempts_exhausted",
+            until=int(time.time()) + 700,
+            reference=reference,
+        )
+        index = await self.server._enforcement_index_page()
+        self.assertIn(b"Active enforcement", index)
+        self.assertIn(b"Test Sender (@testsender)", index)
+        self.assertNotIn(b"enforcement-private-canary", index)
+        status, _, detail = await self.server._dispatch_enforcement(
+            "GET", f"/enforcement/{sender_key}", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"enforcement-private-canary", detail)
+        self.assertIn(b"quoted-enforcement-canary", detail)
+        self.assertIn(b"Quoted context", detail)
+
+        keep_body = urlencode(
+            {"token": self.server._csrf_token, "action": "keep"}
+        ).encode()
+        status, _, _ = await self.server._dispatch_enforcement(
+            "POST", f"/enforcement/{sender_key}", keep_body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
+        self.assertIsNotNone(self.store.enforcement_review(sender_key))
+
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "allow"}
+        ).encode()
+        status, headers, _ = await self.server._dispatch_enforcement(
+            "POST", f"/enforcement/{sender_key}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/enforcement")
+        self.assertEqual(self.store.sender(sender_key).status, "allowed")
+        self.assertIsNone(self.store.enforcement_review(sender_key))
+
+    async def test_active_enforcement_disables_allow_without_identity(self) -> None:
+        sender_key = self.protector.sender_key(987654321)
+        envelope = self.review_protector.seal_enforcement(
+            {"schema_version": 1, "text": "private-canary", "quote_text": ""}
+        )
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=None,
+            envelope=envelope,
+            reason="reference_unavailable",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.quarantine(sender_key)
+        item = self.store.enforcement_review(sender_key)
+        status, _, detail = await self.server._show_enforcement(item)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Allow unavailable", detail)
+        self.assertIn(b"disabled", detail)
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
         body = urlencode(
@@ -247,6 +339,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.client.requests[1], functions.folders.EditPeerFoldersRequest
         )
         self.assertEqual(self.store.sender("sender").status, "quarantined")
+        item = self.store.enforcement_review("sender")
+        self.assertIsNotNone(item)
+        self.assertEqual(item.reason, "manual_spam")
+        payload = self.review_protector.open_enforcement(item.envelope)
+        self.assertEqual(payload["text"], "transient-canary")
+        self.assertIsNotNone(self.store.dialog_snapshot("sender"))
         self.assertEqual(self.cancelled, ["sender"])
 
     async def test_spam_decision_does_not_repeat_existing_quarantine(self) -> None:
@@ -277,6 +375,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             [1, 0],
         )
         self.assertEqual(self.store.sender("sender").status, "unknown")
+        self.assertIsNone(self.store.enforcement_review("sender"))
         self.assertEqual(self.store.review_item(self.review_id).status, "pending")
 
     async def test_legitimate_decision_restores_gatekeeper_quarantine(self) -> None:

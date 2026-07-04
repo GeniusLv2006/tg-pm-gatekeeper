@@ -27,6 +27,11 @@ normal deployment.
 
 The arithmetic check is interaction friction, not a CAPTCHA or proof that a sender is human.
 
+`quarantined` and `suppressed` are local enforcement states, not Telegram blocks. Quarantine means
+the dialog is archived and muted for manual review. Suppression additionally discards later messages
+and may delete the whole dialog; it lasts 24 hours after a timeout, seven days after exhausted
+attempts, or indefinitely after a critical rule.
+
 ## Safe quick start
 
 These steps assume a trusted workstation with Git, SSH, `curl`, and Python 3.14, plus a dedicated
@@ -100,14 +105,14 @@ trusted workstation through the supplied SSH tunnel:
 scripts/review-tunnel.sh root@server.example
 ```
 
-The queue is sender-centric, not a conversation archive:
+The pending queue is sender-centric, not a conversation archive:
 
 - one pending row represents one sender;
 - `Messages observed` is the number of messages consolidated into that row;
 - the Telegram ID comes from the encrypted pending reference;
 - names and usernames are resolved live and cached only in process memory;
 - opening a row fetches exactly one referenced message from Telegram; and
-- message bodies and profile data are not written to the state database or application logs.
+- this pending-review path does not persist the fetched message body or profile data.
 
 A newer message normally becomes the retained reference. An earlier simulated quarantine remains
 representative when a later message has lower severity.
@@ -121,6 +126,13 @@ Review decisions apply to all pending entries for that sender:
 Every decision immediately erases the encrypted Telegram reference. Pending references expire after
 at most seven days. See [docs/deployment.md](docs/deployment.md#review-dashboard) for tunnel options
 and operational details.
+
+The **Active enforcement** page covers current quarantines and suppressions. For up to seven days it
+can decrypt the original triggering text/caption, Telegram-provided quoted context, matched rules,
+and a short-lived peer reference. **Allow now** restores the saved archive and notification state
+before allowing the sender; **Keep current restriction** changes nothing. Successful verification,
+manual allowance, suppression expiry, and rollback erase the encrypted snapshot immediately. Media
+is never copied into the snapshot, and the project does not call Telegram's block API.
 
 ## Deterministic rules
 
@@ -174,10 +186,13 @@ then resets the state. Never configure a real correspondent as the test sender.
 
 ## Optional encrypted dataset
 
-Dataset collection is off by default. When enabled, Gatekeeper retains authored text or captions from
-at most the first three messages per unknown sender for 30 days by default. Samples use AES-256-GCM
-under an independent key. Media, quoted text, names, usernames, raw IDs, access hashes, and the
-dedicated test sender are excluded.
+Dataset collection is off by default. When enabled, Gatekeeper retains message text/captions and
+Telegram-provided quoted text from at most three unexpired messages per unknown sender for 30 days by
+default. This is a cap, not a rolling “latest three”: after a sender reaches it, later messages are
+ignored until a sample expires or is deleted. Monitor mode can gradually reach the cap; protect mode
+normally collects only the first message before the sender enters a challenge or enforcement state.
+Samples use AES-256-GCM under an independent key. Media, profile data, raw IDs, access hashes, hidden
+URL entity targets, and the dedicated test sender are excluded.
 
 ```shell
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples status

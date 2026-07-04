@@ -52,8 +52,9 @@ them:
 - `deny-domains.txt`: one normalized denied domain per line.
 
 The files initially use mode `0600`. Never print, commit, or share their contents. The dataset key is
-required at startup even while collection is disabled, so that enabling collection never reuses the
-state HMAC key. See [the example denylist](../deny-domains.example.txt) for the accepted format.
+required at startup even while collection is disabled. It protects optional training samples and
+derives a separate enforcement-review content key; neither purpose reuses the state HMAC key. See
+[the example denylist](../deny-domains.example.txt) for the accepted format.
 
 ### Prepare the host
 
@@ -161,7 +162,7 @@ dataset, and denylist; host files remain under `/etc/tg-pm-gatekeeper` and
 | `TG_MUTE_DAYS` | `3650` | Positive quarantine mute duration |
 | `TG_DATASET_COLLECTION` | `off` | `on` or `off` |
 | `TG_DATASET_RETENTION_DAYS` | `30` | 1–90 days |
-| `TG_DATASET_MAX_MESSAGES_PER_SENDER` | `3` | 1–10 samples |
+| `TG_DATASET_MAX_MESSAGES_PER_SENDER` | `3` | 1–10 unexpired samples; not a rolling window |
 | `TG_TEST_SENDER_ID` | empty | Positive ID of a dedicated test account only |
 
 Changing private configuration requires recreating the container. Invalid bounded settings stop
@@ -183,8 +184,8 @@ correspondent. Remove the value when testing is complete.
 
 ### Optional encrypted dataset
 
-Collection is disabled by default. To retain at most three authored texts or captions per unknown
-sender for 30 days:
+Collection is disabled by default. To retain text/captions and Telegram-provided quoted context from
+at most three unexpired messages per anonymous unknown sender for 30 days:
 
 ```shell
 TG_DATASET_COLLECTION=on
@@ -192,8 +193,11 @@ TG_DATASET_RETENTION_DAYS=30
 TG_DATASET_MAX_MESSAGES_PER_SENDER=3
 ```
 
-The Dataset dashboard decrypts text only on a sample detail page. It supports Spam, Legitimate, and
-Uncertain labels plus individual deletion. It does not train a model.
+After the cap is reached, later samples are ignored until one expires or is deleted; existing rows
+are not rotated to keep the newest three. Monitor mode can gradually fill the cap, while protect mode
+normally collects only the initial message before the sender changes state. The Dataset dashboard
+decrypts text and quoted context only on a sample detail page. It supports Spam, Legitimate, and
+Uncertain labels plus individual deletion. It does not train a model or store media.
 
 Use `samples export` only for a temporary owner-only plaintext JSONL, transfer it immediately to a
 trusted workstation, and remove the server copy. `samples purge --confirm DELETE-ALL-SAMPLES`
@@ -243,6 +247,14 @@ If the outbound challenge limit caused a quarantine, Legitimate restores the dia
 the existing quarantine without repeating Telegram actions, and Dismiss leaves it unchanged. Every
 decision erases all pending references for that sender. Stop the tunnel after review; never publish
 the socket through Docker or a reverse proxy.
+
+The **Active enforcement** page lists current quarantines and suppressions with reason and remaining
+duration. Opening a row decrypts the original triggering text/caption and quoted context from the
+short-lived local snapshot; it does not depend on the Telegram message still existing after dialog
+deletion. **Allow now** restores the saved folder and notification settings before allowing the
+sender, while **Keep current restriction** is a no-op. Missing or expired identity references prevent
+safe allowance. Snapshots expire after at most seven days and are erased earlier after success,
+rollback, allowance, or suppression expiry. Telegram block is not used.
 
 ## Verify the boundary
 

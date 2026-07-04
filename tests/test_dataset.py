@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -72,6 +71,19 @@ class DatasetTests(unittest.TestCase):
         self.store._connection.commit()
         with self.assertRaises(ValueError):
             self.store.sample(sample_id)
+
+    def test_enforcement_content_uses_an_independent_authenticated_envelope(self) -> None:
+        payload = {"text": "review-canary", "quote_text": "quoted-canary"}
+        envelope = self.protector.seal_enforcement(payload)
+        self.assertEqual(self.protector.open_enforcement(envelope), payload)
+        with self.assertRaises(ValueError):
+            self.protector.open(envelope)
+        with self.assertRaises(ValueError):
+            DatasetProtector(b"w" * 32).open_enforcement(envelope)
+        with self.assertRaises(ValueError):
+            self.protector.open_enforcement(
+                envelope[:-1] + bytes([envelope[-1] ^ 1])
+            )
 
     def test_unknown_schema_version_is_rejected(self) -> None:
         alternate = Path(self.temp.name) / "future.sqlite3"

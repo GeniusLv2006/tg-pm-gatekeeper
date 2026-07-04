@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -163,6 +162,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.database_path = Path(self.temp.name) / "state.sqlite3"
         self.store = StateStore(self.database_path)
         self.protector = IdentifierProtector(b"k" * 32)
+        self.review_protector = DatasetProtector(b"r" * 32)
         self.now = 1_000
         self.service = self.make_service()
 
@@ -182,6 +182,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             outbound_limit_per_hour=outbound_limit,
             test_sender_id=test_sender_id,
             training_store=training_store,
+            review_content_protector=self.review_protector,
             dataset_collection=dataset_collection,
             challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
             clock=lambda: self.now,
@@ -318,17 +319,90 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             await service.handle(
-                self.message(10, "dataset-private-canary"), FakeActions()
+                self.message(
+                    10,
+                    "dataset-private-canary",
+                    facts=MessageFacts(
+                        text="dataset-private-canary",
+                        quote_text="quoted-private-canary",
+                    ),
+                ),
+                FakeActions(),
             ),
             "would_challenge",
         )
         self.assertEqual(training.statistics()["total"], 1)
+        sample = training.samples()[0]
+        self.assertEqual(sample.payload["schema_version"], 2)
+        self.assertEqual(sample.payload["quote_text"], "quoted-private-canary")
+        self.assertTrue(sample.payload["features"]["has_quote"])
         self.assertNotIn(b"dataset-private-canary", training_path.read_bytes())
         await service.handle(
             self.message(11, "test-private-canary", sender_id=TEST_SENDER_ID),
             FakeActions(),
         )
         self.assertEqual(training.statistics()["total"], 1)
+        self.assertEqual(
+            self.store._connection.execute(
+                "SELECT COUNT(*) FROM enforcement_reviews"
+            ).fetchone()[0],
+            0,
+        )
+
+    async def test_suppressed_sender_retains_encrypted_original_review_snapshot(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
+        facts = MessageFacts(text="original-private-canary", quote_text="quoted-private-canary")
+        actions = FakeActions()
+        self.assertEqual(
+            await self.service.handle(
+                self.message(1, "original-private-canary", facts=facts), actions
+            ),
+            "challenged",
+        )
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, "11", reply_to_message_id=100), actions
+            ),
+            "challenge_incorrect",
+        )
+        self.assertEqual(
+            await self.service.handle(
+                self.message(3, "10", reply_to_message_id=100), actions
+            ),
+            "suppressed",
+        )
+        sender_key = self.protector.sender_key(123456789)
+        item = self.store.enforcement_review(sender_key, now=self.now)
+        self.assertIsNotNone(item)
+        payload = self.review_protector.open_enforcement(item.envelope)
+        self.assertEqual(payload["text"], "original-private-canary")
+        self.assertEqual(payload["quote_text"], "quoted-private-canary")
+        database = self.database_path.read_bytes()
+        self.assertNotIn(b"original-private-canary", database)
+        self.assertNotIn(b"quoted-private-canary", database)
+
+    async def test_successful_verification_erases_review_snapshot(self) -> None:
+        self.store.set_mode("protect")
+        actions = FakeActions()
+        await self.service.handle(self.message(1, "private-canary"), actions)
+        sender_key = self.protector.sender_key(123456789)
+        raw_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM enforcement_reviews"
+        ).fetchone()[0]
+        self.assertEqual(raw_count, 1)
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, "12", reply_to_message_id=100), actions
+            ),
+            "provisional",
+        )
+        self.assertIsNone(self.store.enforcement_review(sender_key, now=self.now))
+        raw_count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM enforcement_reviews"
+        ).fetchone()[0]
+        self.assertEqual(raw_count, 0)
 
     async def test_promotional_webpage_preview_is_challenged_in_protect_mode(
         self,

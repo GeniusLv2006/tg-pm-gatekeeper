@@ -21,11 +21,17 @@ If a secret is committed, removing it in a later commit is insufficient. Revoke 
 
 - The Telegram StringSession is stored only as a mode `0600` file owned by the service UID.
 - The runtime database contains HMAC-derived sender keys, Telegram message IDs, generated challenge
-  text during incomplete delivery, and authenticated encrypted short-lived action references. It
-  does not contain raw user IDs, private message content, usernames, or profile names.
-- Optional training samples are stored only in a separate owner-only database. Authored text and
-  structural features are AES-256-GCM encrypted under an independent dataset key; media, quoted
-  text, profile data, raw IDs, access hashes, and the dedicated test sender are excluded.
+  text during incomplete delivery, and authenticated encrypted short-lived action references. For
+  active quarantines and suppressions it may also contain an AES-256-GCM envelope with the original
+  text/caption, Telegram-provided quoted text, rules, and structural features for at most seven days.
+  Raw user IDs, usernames, profile names, and message content are never stored in plaintext.
+- Optional training samples are stored only in a separate owner-only database. Message text/captions,
+  Telegram-provided quoted text, and structural features are AES-256-GCM encrypted under an
+  independent dataset key. The same root key derives a separate enforcement-review subkey through
+  HKDF; the two purposes use different authenticated-data domains and tables. Media, profile data,
+  raw IDs, access hashes, hidden URL entity targets, and the dedicated test sender are excluded.
+  Dataset collection is capped at three unexpired samples per anonymous sender, not a rolling latest
+  three; retention defaults to 30 days and is bounded to 90.
 - Arithmetic verification is an interaction check, not a CAPTCHA or proof that a sender is human.
 - Challenge delivery, timeout, and review transitions must be serialized per derived sender key;
   outbound-rate exhaustion must not bypass screening.
@@ -40,6 +46,8 @@ If a secret is committed, removing it in a later commit is insufficient. Revoke 
 - Two-step verification is required, but it does not invalidate an already stolen session.
 - Plaintext dataset exports are sensitive message data. Transfer them only to a trusted workstation
   and remove the server-side export immediately.
+- Dashboard responses use `Cache-Control: no-store`, but decrypted text remains visible to the owner
+  and can still be captured by browser memory, screenshots, or a compromised workstation.
 
 ## Incident response
 

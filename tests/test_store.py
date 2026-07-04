@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -98,6 +97,31 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.dialog_snapshot("sender"), snapshot)
         self.store.clear_dialog_snapshot("sender")
         self.assertIsNone(self.store.dialog_snapshot("sender"))
+
+    def test_enforcement_review_is_visible_only_for_active_restriction(self) -> None:
+        self.store.save_enforcement_review(
+            "sender",
+            reference=b"sealed-reference",
+            envelope=b"encrypted-content",
+            reason="challenge_pending",
+            expires_at=800,
+            now=100,
+        )
+        self.assertIsNone(self.store.enforcement_review("sender", now=101))
+        self.store.suppress(
+            "sender", "attempts_exhausted", until=700, reference=b"ref", now=200
+        )
+        self.assertTrue(
+            self.store.activate_enforcement_review(
+                "sender", "attempts_exhausted", 800, now=200
+            )
+        )
+        item = self.store.enforcement_review("sender", now=201)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.reason, "attempts_exhausted")
+        self.assertEqual(item.status, "suppressed")
+        self.store.allow("sender", 300)
+        self.assertIsNone(self.store.enforcement_review("sender", now=301))
 
     def test_statistics_include_privacy_safe_challenge_funnel(self) -> None:
         now = int(time.time())
@@ -276,7 +300,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 2)
+            self.assertEqual(version, 3)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -290,6 +314,7 @@ class StoreMigrationTests(unittest.TestCase):
                 )
             }
             self.assertIn("automated_messages", tables)
+            self.assertIn("enforcement_reviews", tables)
         finally:
             store.close()
 
@@ -313,7 +338,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                2,
+                3,
             )
         finally:
             reopened.close()
@@ -347,10 +372,30 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.sender("sender").revision, 0)
             self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 2
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 3
             )
         finally:
             store.close()
+
+    def test_v2_database_adds_enforcement_reviews(self) -> None:
+        store = StateStore(self.path)
+        store._connection.execute("DROP TABLE enforcement_reviews")
+        store._connection.execute("PRAGMA user_version=2")
+        store._connection.commit()
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            table = reopened._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='enforcement_reviews'"
+            ).fetchone()
+            self.assertIsNotNone(table)
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 3
+            )
+        finally:
+            reopened.close()
 
 
 if __name__ == "__main__":

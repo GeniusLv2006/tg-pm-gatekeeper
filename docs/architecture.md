@@ -12,9 +12,10 @@
 - **Unknown**: no local trust decision exists for the sender.
 - **Provisional**: the sender passed the arithmetic check; critical rules still apply.
 - **Allowed**: the owner, CLI, or review workflow explicitly trusted the sender.
-- **Quarantined**: Gatekeeper archived and muted the dialog while it awaits or follows review.
-- **Suppressed**: incoming messages are scheduled for deletion until a temporary suppression expires,
-  or indefinitely after a critical rule.
+- **Quarantined**: Gatekeeper archived and muted the dialog for manual review; automatic
+  whole-dialog deletion has not been scheduled.
+- **Suppressed**: later messages are discarded and whole-dialog deletion may be scheduled until a
+  temporary suppression expires, or indefinitely after a critical rule. This is not Telegram block.
 - **Review item**: one sender-level pending decision with a count and one encrypted Telegram reference,
   not a stored conversation transcript.
 
@@ -120,6 +121,14 @@ and therefore leaves a rate-limit fallback quarantine in place. A decision immed
 encrypted reference. Pending references expire after no more than seven days, while non-reversible
 verdicts may remain for the normal audit retention period.
 
+Protect-mode terminal states have a separate **Active enforcement** surface. The service captures
+the original triggering text/caption and Telegram-provided quote before a challenge begins, encrypts
+it with the enforcement-review key, and exposes it only after the sender becomes quarantined or
+suppressed. A correct answer, challenge rollback, manual allowance, or suppression expiry erases the
+snapshot. Other snapshots expire after the configured review retention, capped at seven days.
+Allowing a sender first restores the saved Telegram folder and notification settings; failure leaves
+both policy state and snapshot unchanged. Keeping the restriction is an explicit no-op.
+
 ## Implemented action policy
 
 | Input | Monitor mode | Protect mode |
@@ -147,16 +156,16 @@ The persistent store contains sender state, challenge metadata, generated challe
 delivery is incomplete, rule identifiers, timestamps, action outcomes, structural review features,
 automated outgoing message IDs, encrypted short-lived Telegram references, and the prior archive and
 notification settings needed to reverse a Gatekeeper action, pending action jobs, suppression state,
-and privacy-safe detector decisions. The core state database does not store private message bodies or
-profile data. Peer references remain encrypted until a challenge reaches its terminal action.
+privacy-safe detector decisions, and short-lived encrypted enforcement-review envelopes. The state
+database does not store message bodies, quoted text, raw identities, or profile data in plaintext.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
 Sender state, processed-message, review, and challenge records use an HMAC-SHA-256 derivation of the
 Telegram user ID. The server-local HMAC key must remain outside general backups. Audit records
 contain only the derived sender key, rule code, outcome, and timestamp and default to 30-day
-retention. Message bodies, usernames, phone numbers, media, raw URLs, and raw user IDs are not
-persisted. Telegram message IDs are stored only with derived sender keys for idempotency, direct
+retention. Usernames, phone numbers, media, hidden URL entity targets, raw URLs, and raw user IDs are
+not persisted. Telegram message IDs are stored only with derived sender keys for idempotency, direct
 Reply binding, and identification of automated Gatekeeper messages. Names and usernames may exist
 briefly in the review process's bounded memory cache, and
 raw user IDs are rendered from authenticated encrypted references without being added to the
@@ -172,12 +181,19 @@ including these envelopes, must not be included in general backups.
 The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
 authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.
 
-Optional training samples live in a separate owner-only `training.sqlite3`. Authored text/captions
-and structural features are encrypted with AES-256-GCM under an independent dataset key. Dataset-key
-derived HMAC tokens enforce per-sender and per-message limits without storing raw identities. Media,
-quoted text, names, usernames, raw IDs, access hashes, and the dedicated test sender are excluded.
-Samples expire after 30 days by default and no later than 90 days. This release does not train or run
-a model.
+Optional training samples live in a separate owner-only `training.sqlite3`. Text/captions,
+Telegram-provided quoted text, and structural features are encrypted with AES-256-GCM under an
+independent dataset key. Dataset-key-derived HMAC tokens enforce per-sender and per-message limits
+without storing raw identities. The limit is three unexpired independent samples by default, not a
+rolling latest-three window. Media, names, usernames, raw IDs, access hashes, hidden URL entity
+targets, and the dedicated test sender are excluded. Samples expire after 30 days by default and no
+later than 90 days. New payloads declare schema version 2; old payloads without quote fields remain
+readable as version 1. This release does not train or run a model.
+
+The dataset secret also derives a distinct `enforcement-review-content` AES-256-GCM key through HKDF.
+Training and enforcement envelopes use separate keys, authenticated-data strings, lifetimes, and
+tables. An enforcement snapshot includes the original trigger and quoted context, but never
+verification answers or media.
 
 ## Failure behavior
 
