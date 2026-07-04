@@ -209,10 +209,6 @@ class ReviewAdminServer:
                 self._cookie_value(cookie, "gatekeeper_session"), self._session_token
             ):
                 return 404, {}, self._page("Not found")
-            if method == "POST":
-                origin = request_headers.get("origin")
-                if origin is not None and origin != f"http://{host}":
-                    return 400, {}, self._page("Invalid origin")
         if path == "/" and method == "GET":
             return 200, {}, await self._index_page()
         if path == "/dataset" and method == "GET":
