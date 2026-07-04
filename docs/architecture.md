@@ -120,6 +120,9 @@ spam is archived and muted unless the sender is already quarantined. Dismiss per
 and therefore leaves a rate-limit fallback quarantine in place. A decision immediately removes the
 encrypted reference. Pending references expire after no more than seven days, while non-reversible
 verdicts may remain for the normal audit retention period.
+Deleting a conversation in Telegram does not itself update the local queue. If the referenced
+message is no longer available, the detail page still exposes a resolve-only action that dismisses
+the local review and erases its reference without changing sender state.
 
 Protect-mode terminal states have a separate **Active enforcement** surface. The service captures
 the original triggering text/caption and Telegram-provided quote before a challenge begins, encrypts
@@ -128,6 +131,9 @@ suppressed. A correct answer, challenge rollback, manual allowance, or suppressi
 snapshot. Other snapshots expire after the configured review retention, capped at seven days.
 Allowing a sender first restores the saved Telegram folder and notification settings; failure leaves
 both policy state and snapshot unchanged. Keeping the restriction is an explicit no-op.
+Summary metrics count all active local states, while the case table includes only unexpired encrypted
+snapshots. Older states without snapshots remain visible as an unavailable count and derive a reason
+from historical verdicts when possible.
 
 ## Implemented action policy
 

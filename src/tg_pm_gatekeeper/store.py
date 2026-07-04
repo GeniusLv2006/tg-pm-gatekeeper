@@ -903,21 +903,39 @@ class StateStore:
             )
         return cursor.rowcount == 1
 
-    def enforcement_statistics(self) -> dict[str, int]:
+    def enforcement_statistics(self, *, now: int | None = None) -> dict[str, int]:
+        timestamp = int(time.time()) if now is None else now
         with self._lock:
             rows = self._connection.execute(
                 "SELECT status,COUNT(*) AS count FROM sender_state "
                 "WHERE status IN ('quarantined','suppressed') GROUP BY status"
             ).fetchall()
             reasons = self._connection.execute(
-                "SELECT COALESCE(sender.suppression_reason,review.reason,'quarantined') "
+                "SELECT COALESCE(sender.suppression_reason,review.reason,"
+                "CASE WHEN EXISTS (SELECT 1 FROM review_queue AS verdict "
+                "WHERE verdict.sender_key=sender.sender_key AND verdict.status='spam') "
+                "THEN 'manual_spam' ELSE 'reason_unavailable' END) "
                 "AS reason,COUNT(*) AS count FROM sender_state AS sender "
                 "LEFT JOIN enforcement_reviews AS review "
-                "ON review.sender_key=sender.sender_key "
+                "ON review.sender_key=sender.sender_key AND review.expires_at>? "
                 "WHERE sender.status IN ('quarantined','suppressed') GROUP BY reason"
+                ,
+                (timestamp,),
             ).fetchall()
-        result = {"quarantined": 0, "suppressed": 0}
+            reviewable = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM enforcement_reviews AS review "
+                    "JOIN sender_state AS sender ON sender.sender_key=review.sender_key "
+                    "WHERE review.expires_at>? "
+                    "AND sender.status IN ('quarantined','suppressed')",
+                    (timestamp,),
+                ).fetchone()[0]
+            )
+        result = {"quarantined": 0, "suppressed": 0, "reviewable": reviewable}
         result.update({str(row["status"]): int(row["count"]) for row in rows})
+        result["unreviewable"] = (
+            result["quarantined"] + result["suppressed"] - reviewable
+        )
         result.update(
             {f"reason:{row['reason']}": int(row["count"]) for row in reasons}
         )

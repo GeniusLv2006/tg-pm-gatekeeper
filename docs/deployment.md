@@ -248,6 +248,11 @@ the existing quarantine without repeating Telegram actions, and Dismiss leaves i
 decision erases all pending references for that sender. Stop the tunnel after review; never publish
 the socket through Docker or a reverse proxy.
 
+Manual Telegram deletion does not dismiss the corresponding local pending row. When its referenced
+message no longer exists, open the row and choose **Resolve deleted conversation**. This records a
+dismissed review and erases the encrypted reference without changing sender trust or enforcement
+state.
+
 The **Active enforcement** page lists current quarantines and suppressions with reason and remaining
 duration. Opening a row decrypts the original triggering text/caption and quoted context from the
 short-lived local snapshot; it does not depend on the Telegram message still existing after dialog
@@ -255,6 +260,9 @@ deletion. **Allow now** restores the saved folder and notification settings befo
 sender, while **Keep current restriction** is a no-op. Missing or expired identity references prevent
 safe allowance. Snapshots expire after at most seven days and are erased earlier after success,
 rollback, allowance, or suppression expiry. Telegram block is not used.
+The summary reports total local quarantined/suppressed states separately from reviewable snapshots.
+Legacy states without a snapshot remain in the totals, use the best available historical reason, and
+are explicitly reported as unavailable for detail review.
 
 ## Verify the boundary
 

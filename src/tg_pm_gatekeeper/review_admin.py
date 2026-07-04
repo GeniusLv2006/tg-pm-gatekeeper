@@ -492,8 +492,17 @@ class ReviewAdminServer:
             if key.startswith("reason:")
         )
         reasons = " · ".join(
-            f"{html.escape(reason)} {count}" for reason, count in reason_counts
+            f"{html.escape(self._reason_label(reason))} {count}"
+            for reason, count in reason_counts
         ) or "No active reasons"
+        snapshot_note = (
+            f"{stats['unreviewable']} active restriction"
+            f"{'s' if stats['unreviewable'] != 1 else ''} "
+            f"{'have' if stats['unreviewable'] != 1 else 'has'} no encrypted snapshot "
+            "and cannot be opened here. Such states may predate snapshot collection."
+            if stats["unreviewable"]
+            else "Every active restriction currently has a reviewable snapshot."
+        )
         content = (
             self._masthead("Active enforcement", f"{len(items)} reviewable")
             + "<p class='back'><a href='/'>← Review queue</a> · <a href='/dataset'>Dataset</a></p>"
@@ -503,7 +512,8 @@ class ReviewAdminServer:
             + "<dl class='metric-grid'>"
             + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
             + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
-            + f"<div><dt>Reasons</dt><dd>{reasons}</dd></div></dl></section>"
+            + f"<div><dt>Reviewable snapshots</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
+            + f"<p class='refresh-note'><strong>State reasons:</strong> {reasons}. {snapshot_note}</p></section>"
             + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Updated</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div></main>"
         )
@@ -624,8 +634,6 @@ class ReviewAdminServer:
         peer = types.InputPeerUser(user_id=user_id, access_hash=access_hash)
         message = await self.telegram_client.get_messages(peer, ids=message_id)
         sender = await self.telegram_client.get_entity(peer)
-        if message is None:
-            return 404, {}, self._page("The Telegram message is no longer available")
         name, username = self._sender_name(sender)
         self._cache_identity(
             item.sender_key,
@@ -634,12 +642,39 @@ class ReviewAdminServer:
             IDENTITY_CACHE_SECONDS,
         )
         identity = name + (f" (@{username})" if username else "")
-        text = message.message or f"[Non-text message: {type(message.media).__name__}]"
         rules = ", ".join(json.loads(item.rule_codes)) or "ordinary unknown sender"
         features = json.dumps(json.loads(item.features), indent=2, sort_keys=True)
         observed_at = datetime.fromtimestamp(item.updated_at, timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
         )
+        if message is None:
+            content = f"""
+            {self._masthead("Review item", f"Review #{item.id}")}
+            <p class="back"><a href="/">← Back to pending queue</a></p>
+            <main class="review-grid">
+              <section class="message-panel">
+                <p class="eyebrow">Telegram message unavailable</p>
+                <h2>{html.escape(identity)}</h2>
+                <div class="empty-state"><strong>The referenced message no longer exists.</strong>
+                <p>The conversation may have been deleted in Telegram. This pending row is local
+                review state and is not removed automatically.</p></div>
+              </section>
+              <aside class="case-file"><p class="eyebrow">Review details</p>
+                <dl><dt>Simulated decision</dt><dd><span class="badge">{html.escape(item.classification)}</span></dd>
+                <dt>Rules</dt><dd>{html.escape(rules)}</dd>
+                <dt>Messages observed</dt><dd>{item.message_count}</dd>
+                <dt>Last observed</dt><dd>{observed_at}</dd></dl>
+              </aside>
+            </main>
+            <section class="decision-panel"><p class="eyebrow">Resolve local record</p>
+              <h2>Remove this sender's pending review without changing Telegram or trust state.</h2>
+              <div class="actions one">
+                {self._action_form(item.id, "dismiss", "Resolve deleted conversation")}
+              </div>
+            </section>
+            """
+            return 200, {}, self._page(content, raw=True)
+        text = message.message or f"[Non-text message: {type(message.media).__name__}]"
         content = f"""
         {self._masthead("Review item", f"Review #{item.id}")}
         <p class="back"><a href="/">← Back to pending queue</a></p>
@@ -772,6 +807,8 @@ class ReviewAdminServer:
             "<h2>Review pending senders</h2>"
             "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
             "Message content is fetched only when a review item is opened.</p>"
+            "<p>Deleting a conversation in Telegram does not remove its local pending review. "
+            "Open the row and resolve it when the referenced message is unavailable.</p>"
             "<p class='refresh-note'>This page checks the connection every 10 seconds and shows "
             "an error when the SSH tunnel is unavailable.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Simulation</th>"
@@ -978,6 +1015,10 @@ class ReviewAdminServer:
             return f"{max(1, seconds // 3600)}h remaining"
         return f"{max(1, seconds // 86400)}d remaining"
 
+    @staticmethod
+    def _reason_label(reason: str) -> str:
+        return reason.replace("_", " ")
+
     @classmethod
     def _page(
         cls, content: str, *, raw: bool = False, refresh_seconds: int | None = None
@@ -1040,6 +1081,7 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
 .actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
 .actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.actions.one{{grid-template-columns:minmax(0,24rem)}}.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-card>p:not(.eyebrow){{max-width:54ch;color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
 @media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")

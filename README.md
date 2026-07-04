@@ -117,6 +117,11 @@ The pending queue is sender-centric, not a conversation archive:
 A newer message normally becomes the retained reference. An earlier simulated quarantine remains
 representative when a later message has lower severity.
 
+Deleting a conversation in Telegram does not automatically remove its pending local review. If the
+referenced message is gone, opening the row shows an unavailable-message state with **Resolve deleted
+conversation**. Resolving removes the pending review and encrypted reference without allowing,
+quarantining, or otherwise changing the sender.
+
 Review decisions apply to all pending entries for that sender:
 
 - **Legitimate** restores a Gatekeeper-archived dialog when necessary and allows the sender.
@@ -133,6 +138,9 @@ and a short-lived peer reference. **Allow now** restores the saved archive and n
 before allowing the sender; **Keep current restriction** changes nothing. Successful verification,
 manual allowance, suppression expiry, and rollback erase the encrypted snapshot immediately. Media
 is never copied into the snapshot, and the project does not call Telegram's block API.
+Its summary separates total local restriction states from reviewable encrypted snapshots. Older
+states without snapshots remain counted, show their best available historical reason, and are
+explicitly identified as unavailable for detail review.
 
 ## Deterministic rules
 

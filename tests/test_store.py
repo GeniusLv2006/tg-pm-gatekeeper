@@ -123,6 +123,25 @@ class StoreTests(unittest.TestCase):
         self.store.allow("sender", 300)
         self.assertIsNone(self.store.enforcement_review("sender", now=301))
 
+    def test_enforcement_statistics_distinguish_legacy_manual_spam(self) -> None:
+        review_id = self.store.enqueue_review(
+            "legacy",
+            b"sealed-reference",
+            "would_quarantine",
+            "[]",
+            "{}",
+            800,
+            100,
+        )
+        self.store.quarantine("legacy", 200)
+        self.assertTrue(self.store.decide_review(review_id, "spam", 200))
+
+        stats = self.store.enforcement_statistics(now=300)
+        self.assertEqual(stats["quarantined"], 1)
+        self.assertEqual(stats["reviewable"], 0)
+        self.assertEqual(stats["unreviewable"], 1)
+        self.assertEqual(stats["reason:manual_spam"], 1)
+
     def test_statistics_include_privacy_safe_challenge_funnel(self) -> None:
         now = int(time.time())
         self.store.audit("sender", "CHALLENGE_SENT", "archived_muted", now)

@@ -25,9 +25,12 @@ class FakeTelegramClient:
         self.requests: list[object] = []
         self.entity_requests = 0
         self.fail_next_mute = False
+        self.message = SimpleNamespace(
+            message="transient-canary", media=None, reply_to=None
+        )
 
     async def get_messages(self, peer, ids):
-        return SimpleNamespace(message="transient-canary", media=None)
+        return self.message
 
     async def get_entity(self, peer):
         self.entity_requests += 1
@@ -105,6 +108,47 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"Test Sender", database)
         self.assertNotIn(b"testsender", database)
         self.assertNotIn(b"123456789", database)
+
+    async def test_deleted_telegram_message_can_resolve_local_review(self) -> None:
+        self.client.message = None
+        status, _, response = await self.server._dispatch(
+            "GET", f"/review/{self.review_id}", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"Telegram message unavailable", response)
+        self.assertIn(b"Resolve deleted conversation", response)
+        self.assertIn(b"without changing Telegram or trust state", response)
+
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "dismiss"}
+        ).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST", f"/review/{self.review_id}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/")
+        item = self.store.review_item(self.review_id)
+        self.assertEqual(item.status, "dismissed")
+        self.assertIsNone(item.reference)
+
+    async def test_deleted_review_resolves_through_authenticated_post(self) -> None:
+        self.client.message = None
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "dismiss"}
+        ).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST",
+            f"/review/{self.review_id}",
+            body,
+            request_headers={
+                "host": "127.0.0.1:8765",
+                "origin": "http://127.0.0.1:8765",
+                "cookie": f"gatekeeper_session={self.server._session_token}",
+            },
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
         response = await self.server._index_page()
@@ -265,6 +309,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         index = await self.server._enforcement_index_page()
         self.assertIn(b"Active enforcement", index)
         self.assertIn(b"Test Sender (@testsender)", index)
+        self.assertIn(b"Reviewable snapshots", index)
+        self.assertIn(b"State reasons:", index)
+        self.assertIn(b"Every active restriction currently has a reviewable snapshot", index)
+        self.assertNotIn(b"<dt>Reasons</dt>", index)
         self.assertNotIn(b"enforcement-private-canary", index)
         status, _, detail = await self.server._dispatch_enforcement(
             "GET", f"/enforcement/{sender_key}", b""
@@ -313,6 +361,26 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Allow unavailable", detail)
         self.assertIn(b"disabled", detail)
+
+    async def test_active_enforcement_explains_legacy_state_without_snapshot(
+        self,
+    ) -> None:
+        self.store.quarantine("legacy-sender")
+        review_id = self.store.enqueue_review(
+            "legacy-sender",
+            b"sealed-reference",
+            "would_quarantine",
+            "[]",
+            "{}",
+            int(time.time()) + 700,
+        )
+        self.assertTrue(self.store.decide_review(review_id, "spam"))
+
+        page = await self.server._enforcement_index_page()
+        self.assertIn(b"manual spam 1", page)
+        self.assertIn(b"1 active restriction", page)
+        self.assertIn(b"has no encrypted snapshot", page)
+        self.assertIn(b"No reviewable active restrictions", page)
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
         body = urlencode(
