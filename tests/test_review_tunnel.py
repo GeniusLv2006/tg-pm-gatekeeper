@@ -38,7 +38,62 @@ class ReviewTunnelTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("SSH_TARGET", result.stdout)
         self.assertIn("TG_REVIEW_HOST", result.stdout)
+        self.assertIn("-o", result.stdout)
         self.assertNotIn("bv", result.stdout)
+
+    def test_open_option_launches_default_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_file = root / "ssh.pid"
+            opened_file = root / "opened.url"
+            fake_ssh = root / "ssh"
+            fake_curl = root / "curl"
+            fake_open = root / "open"
+            fake_ssh.write_text(
+                "#!/bin/sh\n"
+                'case "$*" in *"cat /var/lib/tg-pm-gatekeeper/review.access-token"*) '
+                "echo test-access-token; exit 0;; esac\n"
+                'echo $$ > "$FAKE_SSH_PID"\n'
+                "sleep 0.3\n",
+                encoding="utf-8",
+            )
+            fake_curl.write_text(
+                "#!/bin/sh\n"
+                '[ -r "$FAKE_SSH_PID" ] || exit 1\n'
+                'pid="$(cat "$FAKE_SSH_PID")"\n'
+                'kill -0 "$pid" 2>/dev/null\n',
+                encoding="utf-8",
+            )
+            fake_open.write_text(
+                "#!/bin/sh\n"
+                'printf "%s" "$1" > "$FAKE_OPENED_URL"\n',
+                encoding="utf-8",
+            )
+            for executable in (fake_ssh, fake_curl, fake_open):
+                executable.chmod(0o700)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{root}:{environment['PATH']}",
+                    "FAKE_SSH_PID": str(pid_file),
+                    "FAKE_OPENED_URL": str(opened_file),
+                }
+            )
+            result = subprocess.run(
+                [str(SCRIPT), "-o", "user@server.example"],
+                text=True,
+                capture_output=True,
+                env=environment,
+                check=False,
+                timeout=5,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Dashboard opened", result.stdout)
+            self.assertEqual(
+                opened_file.read_text(encoding="utf-8"),
+                "http://127.0.0.1:8765/login?token=test-access-token",
+            )
 
     def test_ssh_target_is_required(self) -> None:
         result = self.run_script()

@@ -15,6 +15,7 @@ Arguments:
                          TG_REVIEW_HOST is set.
 
 Options:
+  -o                     Open the dashboard in the default browser after connecting
   -p PORT                Local TCP port (default: TG_REVIEW_PORT or 8765)
   -s REMOTE_SOCKET       Remote Unix socket path
   -t REMOTE_TOKEN        Remote access-token path
@@ -34,13 +35,15 @@ port="${TG_REVIEW_PORT:-8765}"
 remote_socket="${TG_REVIEW_SOCKET:-/var/lib/tg-pm-gatekeeper/review.sock}"
 remote_token="${TG_REVIEW_TOKEN:-/var/lib/tg-pm-gatekeeper/review.access-token}"
 ssh_config="${TG_REVIEW_SSH_CONFIG:-}"
+open_on_connect=false
 
-while getopts "hp:s:t:F:" option; do
+while getopts "hop:s:t:F:" option; do
     case "$option" in
         h)
             usage
             exit 0
             ;;
+        o) open_on_connect=true ;;
         p) port="$OPTARG" ;;
         s) remote_socket="$OPTARG" ;;
         t) remote_token="$OPTARG" ;;
@@ -177,6 +180,18 @@ open_tunnel() {
         "$host"
 }
 
+open_dashboard() {
+    if command -v open >/dev/null 2>&1; then
+        open "$login_url" >/dev/null 2>&1
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$login_url" >/dev/null 2>&1
+    elif command -v gio >/dev/null 2>&1; then
+        gio open "$login_url" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 access_token="$(read_access_token)" || {
     echo "Could not read the remote dashboard access token." >&2
     exit 1
@@ -213,7 +228,24 @@ if [ "$connected" != true ]; then
     exit 1
 fi
 
-echo "Connected: ${url}login?token=${access_token}"
+login_url="${url}login?token=${access_token}"
+echo "Connected: ${login_url}"
+if [ "$open_on_connect" = true ]; then
+    if open_dashboard; then
+        echo "Dashboard opened in the default browser."
+    else
+        echo "Could not open a browser automatically; use the Connected URL above." >&2
+    fi
+elif [ -t 0 ]; then
+    printf "Press Enter to open the dashboard, or Ctrl+C to close the tunnel: "
+    if IFS= read -r _; then
+        if open_dashboard; then
+            echo "Dashboard opened in the default browser."
+        else
+            echo "Could not open a browser automatically; use the Connected URL above." >&2
+        fi
+    fi
+fi
 echo "Keep this terminal open. Press Ctrl+C to close the tunnel."
 
 wait "$tunnel_pid"

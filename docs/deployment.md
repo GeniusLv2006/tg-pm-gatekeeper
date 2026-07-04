@@ -213,7 +213,9 @@ scripts/review-tunnel.sh "$DEPLOY_HOST"
 
 The helper requires `ssh` and `curl`. It reads the short-lived owner-only `review.access-token`,
 starts a dedicated local forward with SSH connection sharing disabled, and prints a one-time login URL
-only after the authenticated dashboard responds. Keep the terminal open; `Ctrl+C` closes the tunnel.
+only after the authenticated dashboard responds. In an interactive terminal, press Enter to open that
+URL in the default browser. Use `-o` to open it immediately. Keep the terminal open; `Ctrl+C` closes
+the tunnel.
 
 The SSH target can be an alias or `user@host` and must be able to read the token and reach the remote
 socket. Defaults may come from environment variables or flags:
