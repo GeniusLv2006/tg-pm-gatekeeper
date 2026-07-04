@@ -1038,12 +1038,13 @@ class ReviewAdminServer:
             body = (
                 cls._masthead("Error", "Request not completed")
                 + "<main class='error-layout'><section class='error-card'>"
+                + "<div class='error-content'>"
                 + "<p class='eyebrow'>Dashboard error</p>"
                 + f"<h1>{html.escape(content)}</h1>"
                 + f"<p>{html.escape(guidance)}</p>"
                 + "<p class='error-command'><code>scripts/review-tunnel.sh SSH_TARGET</code></p>"
                 + "<a class='button-link' href='/'>Return to dashboard</a>"
-                + "</section></main>"
+                + "</div></section></main>"
             )
         refresh = (
             f'<meta http-equiv="refresh" content="{refresh_seconds}">'
@@ -1078,6 +1079,6 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
 .actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .actions.one{{grid-template-columns:minmax(0,24rem)}}.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
-.error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,620px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink);text-align:center}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-card>p:not(.eyebrow){{max-width:46ch;margin-left:auto;margin-right:auto;color:var(--muted)}}.error-command{{margin:1.5rem auto}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
+.error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,620px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{max-width:46ch;margin:0 auto;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
 @media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")

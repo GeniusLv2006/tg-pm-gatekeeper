@@ -248,8 +248,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"has already been used", response)
         self.assertIn(b"scripts/review-tunnel.sh SSH_TARGET", response)
         self.assertIn(b"width:min(100%,620px)", response)
-        self.assertIn(b"text-align:center", response)
-        self.assertIn(b"margin-left:auto;margin-right:auto", response)
+        self.assertIn(b"class='error-content'", response)
+        self.assertIn(b"max-width:46ch;margin:0 auto;text-align:left", response)
+        self.assertNotIn(
+            b".error-content{max-width:46ch;margin:0 auto;text-align:center",
+            response,
+        )
         self.assertNotIn(b"<body><h1>", response)
 
     async def test_admin_server_uses_owner_only_unix_socket(self) -> None:
