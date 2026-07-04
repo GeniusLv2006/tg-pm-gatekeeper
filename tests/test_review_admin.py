@@ -150,6 +150,48 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Location"], "/")
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
+    async def test_authenticated_post_accepts_missing_origin(self) -> None:
+        self.client.message = None
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "dismiss"}
+        ).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST",
+            f"/review/{self.review_id}",
+            body,
+            request_headers={
+                "host": "127.0.0.1:8765",
+                "cookie": f"gatekeeper_session={self.server._session_token}",
+            },
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
+
+    async def test_authenticated_post_rejects_untrusted_origin(self) -> None:
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "dismiss"}
+        ).encode()
+        for origin in ("https://example.com", "null"):
+            with self.subTest(origin=origin):
+                status, _, response = await self.server._dispatch(
+                    "POST",
+                    f"/review/{self.review_id}",
+                    body,
+                    request_headers={
+                        "host": "127.0.0.1:8765",
+                        "origin": origin,
+                        "cookie": (
+                            f"gatekeeper_session={self.server._session_token}"
+                        ),
+                    },
+                )
+                self.assertEqual(status, 400)
+                self.assertIn(b"Invalid origin", response)
+                self.assertEqual(
+                    self.store.review_item(self.review_id).status, "pending"
+                )
+
     async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
         response = await self.server._index_page()
         self.assertIn(b'http-equiv="refresh" content="10"', response)

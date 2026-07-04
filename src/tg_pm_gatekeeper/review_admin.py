@@ -210,8 +210,8 @@ class ReviewAdminServer:
             ):
                 return 404, {}, self._page("Not found")
             if method == "POST":
-                origin = request_headers.get("origin", "")
-                if origin not in {f"http://{host}"}:
+                origin = request_headers.get("origin")
+                if origin is not None and origin != f"http://{host}":
                     return 400, {}, self._page("Invalid origin")
         if path == "/" and method == "GET":
             return 200, {}, await self._index_page()
