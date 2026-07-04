@@ -247,7 +247,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"class='error-card'", response)
         self.assertIn(b"has already been used", response)
         self.assertIn(b"scripts/review-tunnel.sh SSH_TARGET", response)
-        self.assertIn(b"width:min(100%,620px)", response)
+        self.assertIn(b"width:min(100%,680px)", response)
         self.assertIn(b"class='error-content'", response)
         self.assertIn(b"max-width:46ch;margin:0 auto;text-align:left", response)
         self.assertNotIn(
