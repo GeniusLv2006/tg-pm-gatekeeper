@@ -16,8 +16,9 @@ convenience. Keep changes small, reviewable, and safe to publish.
 
 The project is licensed under the [Mozilla Public License 2.0](LICENSE). By submitting a contribution,
 you agree to license it under MPL-2.0. Preserve existing license notices and add the standard MPL
-source notice to new Python and shell files. Do not add the Exhibit B “Incompatible With Secondary
-Licenses” notice.
+SPDX identifier plus `Copyright (c) 2026 GeniusLv2006 and contributors` to new Python and shell
+files. Keep a shell or Python shebang on the first line. Do not add the Exhibit B “Incompatible With
+Secondary Licenses” notice.
 
 ## Commit format
 

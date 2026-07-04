@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -133,6 +132,17 @@ CREATE TABLE IF NOT EXISTS decision_events (
 );
 CREATE INDEX IF NOT EXISTS decision_events_created_idx
     ON decision_events(created_at);
+CREATE TABLE IF NOT EXISTS enforcement_reviews (
+    sender_key TEXT PRIMARY KEY,
+    reference BLOB,
+    envelope BLOB NOT NULL,
+    reason TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS enforcement_reviews_expiry_idx
+    ON enforcement_reviews(expires_at);
 """
 
 
@@ -171,6 +181,19 @@ class ReviewItem:
     updated_at: int
     expires_at: int
     reviewed_at: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class EnforcementReview:
+    sender_key: str
+    reference: bytes | None
+    envelope: bytes
+    reason: str
+    created_at: int
+    updated_at: int
+    expires_at: int
+    status: str
+    suppressed_until: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +248,8 @@ class StateStore:
             version = SCHEMA_VERSION
         if version == 1:
             self._migrate_v1_to_v2()
+        elif version == 2:
+            self._migrate_v2_to_v3()
         elif version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
@@ -302,6 +327,27 @@ class StateStore:
                 "UPDATE settings SET value=CASE value "
                 "WHEN 'observe' THEN 'monitor' WHEN 'enforce' THEN 'protect' "
                 "ELSE value END WHERE key='mode'"
+            )
+            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _migrate_v2_to_v3(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                "CREATE TABLE enforcement_reviews ("
+                "sender_key TEXT PRIMARY KEY,reference BLOB,envelope BLOB NOT NULL,"
+                "reason TEXT NOT NULL,created_at INTEGER NOT NULL,"
+                "updated_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)"
+            )
+            self._connection.execute(
+                "CREATE INDEX enforcement_reviews_expiry_idx "
+                "ON enforcement_reviews(expires_at)"
             )
             self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         except Exception:
@@ -519,6 +565,7 @@ class StateStore:
     def allow(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "allowed", now=now)
         self.resolve_sender_actions(sender_key, now)
+        self.delete_enforcement_review(sender_key)
 
     def revoke(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "unknown", now=now)
@@ -549,7 +596,10 @@ class StateStore:
                 "AND status IN ('provisional', 'quarantined', 'suppressed')",
                 (timestamp, sender_key, expected_updated_at),
             )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 1:
+            self.delete_enforcement_review(sender_key)
+            return True
+        return False
 
     def quarantine(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "quarantined", now=now)
@@ -592,7 +642,10 @@ class StateStore:
                 "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
                 (timestamp, sender_key, timestamp),
             )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 1:
+            self.delete_enforcement_review(sender_key)
+            return True
+        return False
 
     def set_challenge(
         self,
@@ -699,10 +752,14 @@ class StateStore:
                 "('challenge_issuing', 'challenge_archiving')",
                 (timestamp, sender_key),
             )
-        return cursor.rowcount == 1
+        if cursor.rowcount == 1:
+            self.delete_enforcement_review(sender_key)
+            return True
+        return False
 
     def mark_provisional(self, sender_key: str, now: int | None = None) -> None:
         self._set_state(sender_key, "provisional", now=now)
+        self.delete_enforcement_review(sender_key)
 
     def mark_challenge_guidance_sent(self, sender_key: str) -> bool:
         with self._lock, self._connection:
@@ -760,6 +817,111 @@ class StateStore:
             self._connection.execute(
                 "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
             )
+
+    def save_enforcement_review(
+        self,
+        sender_key: str,
+        *,
+        reference: bytes | None,
+        envelope: bytes,
+        reason: str,
+        expires_at: int,
+        now: int | None = None,
+    ) -> None:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO enforcement_reviews(sender_key,reference,envelope,reason,"
+                "created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(sender_key) DO NOTHING",
+                (
+                    sender_key,
+                    reference,
+                    envelope,
+                    reason,
+                    timestamp,
+                    timestamp,
+                    expires_at,
+                ),
+            )
+
+    def activate_enforcement_review(
+        self,
+        sender_key: str,
+        reason: str,
+        expires_at: int,
+        *,
+        reference: bytes | None = None,
+        now: int | None = None,
+    ) -> bool:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE enforcement_reviews SET reference=COALESCE(reference,?),"
+                "reason=?,updated_at=?,expires_at=? WHERE sender_key=?",
+                (reference, reason, timestamp, expires_at, sender_key),
+            )
+        return cursor.rowcount == 1
+
+    def enforcement_review(
+        self, sender_key: str, *, now: int | None = None
+    ) -> EnforcementReview | None:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT review.sender_key,review.reference,review.envelope,review.reason,"
+                "review.created_at,review.updated_at,review.expires_at,sender.status,"
+                "sender.suppressed_until FROM enforcement_reviews AS review "
+                "JOIN sender_state AS sender ON sender.sender_key=review.sender_key "
+                "WHERE review.sender_key=? AND review.expires_at>? "
+                "AND sender.status IN ('quarantined','suppressed')",
+                (sender_key, timestamp),
+            ).fetchone()
+        return EnforcementReview(**dict(row)) if row else None
+
+    def enforcement_reviews(
+        self, *, limit: int = 100, now: int | None = None
+    ) -> list[EnforcementReview]:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT review.sender_key,review.reference,review.envelope,review.reason,"
+                "review.created_at,review.updated_at,review.expires_at,sender.status,"
+                "sender.suppressed_until FROM enforcement_reviews AS review "
+                "JOIN sender_state AS sender ON sender.sender_key=review.sender_key "
+                "WHERE review.expires_at>? "
+                "AND sender.status IN ('quarantined','suppressed') "
+                "ORDER BY review.updated_at DESC LIMIT ?",
+                (timestamp, limit),
+            ).fetchall()
+        return [EnforcementReview(**dict(row)) for row in rows]
+
+    def delete_enforcement_review(self, sender_key: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
+            )
+        return cursor.rowcount == 1
+
+    def enforcement_statistics(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT status,COUNT(*) AS count FROM sender_state "
+                "WHERE status IN ('quarantined','suppressed') GROUP BY status"
+            ).fetchall()
+            reasons = self._connection.execute(
+                "SELECT COALESCE(sender.suppression_reason,review.reason,'quarantined') "
+                "AS reason,COUNT(*) AS count FROM sender_state AS sender "
+                "LEFT JOIN enforcement_reviews AS review "
+                "ON review.sender_key=sender.sender_key "
+                "WHERE sender.status IN ('quarantined','suppressed') GROUP BY reason"
+            ).fetchall()
+        result = {"quarantined": 0, "suppressed": 0}
+        result.update({str(row["status"]): int(row["count"]) for row in rows})
+        result.update(
+            {f"reason:{row['reason']}": int(row["count"]) for row in reasons}
+        )
+        return result
 
     def expire_challenge(
         self, sender_key: str, expires_at: int, now: int | None = None
@@ -1234,6 +1396,9 @@ class StateStore:
                 "(status='pending' AND expires_at <= ?) OR "
                 "(status!='pending' AND reviewed_at < ?)",
                 (timestamp, cutoff),
+            )
+            self._connection.execute(
+                "DELETE FROM enforcement_reviews WHERE expires_at <= ?", (timestamp,)
             )
 
     def statistics(self) -> dict[str, int | str | None]:

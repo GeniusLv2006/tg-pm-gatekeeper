@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -41,6 +40,7 @@ class DatasetProtector:
         if len(key) < 32:
             raise ValueError("dataset key must contain at least 32 bytes")
         self._encryption_key = self._derive(key, b"dataset-content")
+        self._enforcement_key = self._derive(key, b"enforcement-review-content")
         self._sender_key = self._derive(key, b"dataset-sender")
         self._message_key = self._derive(key, b"dataset-message")
 
@@ -81,6 +81,32 @@ class DatasetProtector:
             raise ValueError("invalid dataset envelope") from exc
         if not isinstance(value, dict):
             raise ValueError("invalid dataset payload")
+        return value
+
+    def seal_enforcement(self, payload: dict[str, object]) -> bytes:
+        nonce = secrets.token_bytes(12)
+        plaintext = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        ciphertext = AESGCM(self._enforcement_key).encrypt(
+            nonce, plaintext, b"tg-pm-gatekeeper:enforcement-review:v1"
+        )
+        return b"\x01" + nonce + ciphertext
+
+    def open_enforcement(self, envelope: bytes) -> dict[str, object]:
+        if len(envelope) < 30 or envelope[0] != 1:
+            raise ValueError("invalid enforcement review envelope")
+        try:
+            plaintext = AESGCM(self._enforcement_key).decrypt(
+                envelope[1:13],
+                envelope[13:],
+                b"tg-pm-gatekeeper:enforcement-review:v1",
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("invalid enforcement review envelope") from exc
+        if not isinstance(value, dict):
+            raise ValueError("invalid enforcement review payload")
         return value
 
 

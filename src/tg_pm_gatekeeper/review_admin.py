@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from telethon import functions, types
 
 from .dataset import TrainingStore
 from .service import GatekeeperService
-from .store import DialogSnapshot, ReviewItem, StateStore
+from .store import DialogSnapshot, EnforcementReview, ReviewItem, StateStore
 
 
 LOG = logging.getLogger("gatekeeper.review")
@@ -224,6 +223,10 @@ class ReviewAdminServer:
             return 200, {}, self._dataset_index_page(page)
         if path.startswith("/dataset/"):
             return self._dispatch_dataset(method, path, body)
+        if path == "/enforcement" and method == "GET":
+            return 200, {}, await self._enforcement_index_page()
+        if path.startswith("/enforcement/"):
+            return await self._dispatch_enforcement(method, path, body)
         if not path.startswith("/review/"):
             return 404, {}, self._page("Not found")
         try:
@@ -262,9 +265,12 @@ class ReviewAdminServer:
                 self.cancel_timeout(item.sender_key)
                 self.store.decide_sender_reviews(item.sender_key, "legitimate")
             elif action == "spam":
+                peer = self._peer_from_item(item)
+                if state.status != "suppressed":
+                    await self._capture_manual_enforcement(item, peer)
                 if state.status not in {"challenged", "quarantined", "suppressed"}:
-                    peer = self._peer_from_item(item)
                     if not await self._archive_and_mute(peer, item.sender_key):
+                        self.store.delete_enforcement_review(item.sender_key)
                         return (
                             500,
                             {},
@@ -273,7 +279,12 @@ class ReviewAdminServer:
                     self.store.quarantine(item.sender_key)
                 elif state.status == "challenged":
                     self.store.quarantine(item.sender_key)
-                self.store.clear_dialog_snapshot(item.sender_key)
+                if self.store.sender(item.sender_key).status == "quarantined":
+                    self.store.activate_enforcement_review(
+                        item.sender_key,
+                        "manual_spam",
+                        int(time.time()) + self.service.review_retention_days * 86400,
+                    )
                 self.cancel_timeout(item.sender_key)
                 self.store.decide_sender_reviews(item.sender_key, "spam")
             elif action == "dismiss":
@@ -357,7 +368,7 @@ class ReviewAdminServer:
         )
         content = (
             self._masthead("Dataset", f"{stats.get('total', 0)} samples")
-            + "<p class='back'><a href='/'>← Review queue</a></p><main>"
+            + "<p class='back'><a href='/'>← Review queue</a> · <a href='/enforcement'>Active enforcement</a></p><main>"
             + "<section class='queue-intro'><p class='eyebrow'>Dataset status</p>"
             + "<h2>Dataset overview</h2>"
             + f"<p>Collection {'enabled' if self.dataset_collection else 'disabled'} · "
@@ -401,6 +412,7 @@ class ReviewAdminServer:
             return 405, {"Allow": "GET, POST"}, self._page("Method not allowed")
         payload = sample.payload
         text = str(payload.get("text", ""))
+        quote_text = str(payload.get("quote_text", ""))
         details = html.escape(json.dumps(payload, ensure_ascii=False, indent=2))
         actions = "".join(
             self._action_form(sample_id, label, label.title(), base="dataset")
@@ -411,10 +423,158 @@ class ReviewAdminServer:
         content = (
             self._masthead("Dataset sample", f"#{sample.id}")
             + "<p class='back'><a href='/dataset'>← Dataset</a></p>"
-            + f"<main><section class='message-panel'><pre class='message'>{html.escape(text)}</pre>"
+            + f"<main><section class='message-panel'><p class='eyebrow'>Message text or caption</p>"
+            + f"<pre class='message'>{html.escape(text)}</pre>"
+            + (f"<p class='eyebrow'>Quoted context</p><pre class='message quote'>"
+               f"{html.escape(quote_text)}</pre>" if quote_text else "")
             + f"<details><summary>Encrypted payload metadata</summary><pre>{details}</pre></details>"
             + f"<div class='actions'>{actions}</div></section></main>"
         )
+        return 200, {}, self._page(content, raw=True)
+
+    async def _dispatch_enforcement(
+        self, method: str, path: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        sender_key = path.removeprefix("/enforcement/")
+        if len(sender_key) != 64 or any(char not in "0123456789abcdef" for char in sender_key):
+            return 404, {}, self._page("Enforcement record not found")
+        item = self.store.enforcement_review(sender_key)
+        if item is None:
+            return 404, {}, self._page("Enforcement record not found")
+        if method == "GET":
+            return await self._show_enforcement(item)
+        if method != "POST":
+            return 405, {"Allow": "GET, POST"}, self._page("Method not allowed")
+        values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+        if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid action token")
+        action = values.get("action", [""])[0]
+        if action == "keep":
+            return 303, {"Location": "/enforcement"}, b""
+        if action != "allow":
+            return 400, {}, self._page("Unknown action")
+        async with self.service.sender_lock(sender_key):
+            item = self.store.enforcement_review(sender_key)
+            if item is None:
+                return 409, {}, self._page("This enforcement record has expired")
+            if item.reference is None:
+                return 409, {}, self._page("Telegram identity is unavailable")
+            try:
+                user_id, access_hash, _ = self.protector.open_review_reference(
+                    item.reference
+                )
+            except ValueError:
+                return 409, {}, self._page("Telegram identity is unavailable")
+            peer = types.InputPeerUser(user_id=user_id, access_hash=access_hash)
+            if not await self._restore(peer, sender_key):
+                return 500, {}, self._page("Telegram action failed; item was not changed")
+            self.store.allow(sender_key)
+            self.cancel_timeout(sender_key)
+            self._identity_cache.pop(sender_key, None)
+        return 303, {"Location": "/enforcement"}, b""
+
+    async def _enforcement_index_page(self) -> bytes:
+        items = self.store.enforcement_reviews()
+        identities = await self._live_enforcement_identities(items)
+        stats = self.store.enforcement_statistics()
+        rows = "".join(
+            f"<tr><td><a href='/enforcement/{item.sender_key}'>Open</a></td>"
+            f"<td>{self._identity_cell(identities.get(item.sender_key))}</td>"
+            f"<td><span class='badge'>{html.escape(item.status)}</span></td>"
+            f"<td>{html.escape(item.reason)}</td>"
+            f"<td>{html.escape(self._remaining(item))}</td>"
+            f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
+            for item in items
+        ) or "<tr><td colspan='6'>No reviewable active restrictions.</td></tr>"
+        reason_counts = sorted(
+            (key.removeprefix("reason:"), value)
+            for key, value in stats.items()
+            if key.startswith("reason:")
+        )
+        reasons = " · ".join(
+            f"{html.escape(reason)} {count}" for reason, count in reason_counts
+        ) or "No active reasons"
+        content = (
+            self._masthead("Active enforcement", f"{len(items)} reviewable")
+            + "<p class='back'><a href='/'>← Review queue</a> · <a href='/dataset'>Dataset</a></p>"
+            + "<main><section class='queue-intro'><p class='eyebrow'>Protect mode state</p>"
+            + "<h2>Review active restrictions</h2>"
+            + "<p>Encrypted snapshots preserve the original triggering message and quoted context for up to seven days. Telegram block is not used.</p>"
+            + "<dl class='metric-grid'>"
+            + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
+            + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
+            + f"<div><dt>Reasons</dt><dd>{reasons}</dd></div></dl></section>"
+            + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Updated</th></tr></thead>"
+            + f"<tbody>{rows}</tbody></table></div></main>"
+        )
+        return self._page(content, raw=True, refresh_seconds=10)
+
+    async def _show_enforcement(
+        self, item: EnforcementReview
+    ) -> tuple[int, dict[str, str], bytes]:
+        if self.service.review_content_protector is None:
+            return 500, {}, self._page("Encrypted review content is unavailable")
+        try:
+            payload = self.service.review_content_protector.open_enforcement(
+                item.envelope
+            )
+        except ValueError:
+            return 500, {}, self._page("Encrypted review content is unavailable")
+        identity = "Identity unavailable"
+        telegram_link = ""
+        user_id: int | None = None
+        if item.reference is not None:
+            try:
+                user_id, access_hash, _ = self.protector.open_review_reference(
+                    item.reference
+                )
+                sender = await self.telegram_client.get_entity(
+                    types.InputPeerUser(user_id=user_id, access_hash=access_hash)
+                )
+                name, username = self._sender_name(sender)
+                identity = name + (f" (@{username})" if username else "")
+                telegram_link = (
+                    f"<a class='telegram-link' href='tg://user?id={user_id}'>"
+                    "Open this conversation in Telegram ↗</a>"
+                )
+            except Exception:
+                pass
+        text = str(payload.get("text", "")) or "[No text or caption]"
+        quote_text = str(payload.get("quote_text", ""))
+        rules = ", ".join(str(value) for value in payload.get("rule_codes", [])) or "—"
+        features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
+        observed = datetime.fromtimestamp(item.created_at, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+        allow_action = (
+            self._action_form(
+                item.sender_key, "allow", "Allow now", base="enforcement"
+            )
+            if user_id is not None
+            else "<button type='button' disabled>Allow unavailable</button>"
+        )
+        content = f"""
+        {self._masthead("Active enforcement", item.status)}
+        <p class="back"><a href="/enforcement">← Active enforcement</a></p>
+        <main class="review-grid"><section class="message-panel">
+          <p class="eyebrow">Encrypted local review snapshot</p>
+          <h2>{html.escape(identity)}</h2>
+          <p class="content-label">Original message or caption</p>
+          <pre class="message">{html.escape(text)}</pre>
+          {f'<p class="content-label">Quoted context</p><pre class="message quote">{html.escape(quote_text)}</pre>' if quote_text else ''}
+          {telegram_link}
+        </section><aside class="case-file"><p class="eyebrow">Restriction details</p>
+          <dl><dt>Status</dt><dd><span class="badge">{html.escape(item.status)}</span></dd>
+          <dt>Reason</dt><dd>{html.escape(item.reason)}</dd><dt>Rules</dt><dd>{html.escape(rules)}</dd>
+          <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
+          <dt>Snapshot expires</dt><dd>{datetime.fromtimestamp(item.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd></dl>
+          <details><summary>Structural features</summary><pre>{html.escape(features)}</pre></details>
+        </aside></main><section class="decision-panel"><p class="eyebrow">Sender decision</p>
+          <h2>Allow restores the saved folder and notification state before changing policy.</h2>
+          <div class="actions two">
+            {allow_action}
+            {self._action_form(item.sender_key, "keep", "Keep current restriction", base="enforcement")}
+          </div></section>"""
         return 200, {}, self._page(content, raw=True)
 
     def _peer_from_item(self, item: ReviewItem) -> types.InputPeerUser:
@@ -422,6 +582,38 @@ class ReviewAdminServer:
             raise ValueError("review reference has expired")
         user_id, access_hash, _ = self.protector.open_review_reference(item.reference)
         return types.InputPeerUser(user_id=user_id, access_hash=access_hash)
+
+    async def _capture_manual_enforcement(
+        self, item: ReviewItem, peer: types.InputPeerUser
+    ) -> None:
+        if self.service.review_content_protector is None or item.reference is None:
+            return
+        try:
+            _, _, message_id = self.protector.open_review_reference(item.reference)
+            message = await self.telegram_client.get_messages(peer, ids=message_id)
+            if message is None:
+                return
+            reply_header = getattr(message, "reply_to", None)
+            payload: dict[str, object] = {
+                "schema_version": 1,
+                "text": getattr(message, "message", None) or "",
+                "quote_text": getattr(reply_header, "quote_text", None) or "",
+                "rule_codes": json.loads(item.rule_codes),
+                "features": json.loads(item.features),
+            }
+            now = int(time.time())
+            self.store.save_enforcement_review(
+                item.sender_key,
+                reference=item.reference,
+                envelope=self.service.review_content_protector.seal_enforcement(
+                    payload
+                ),
+                reason="manual_spam",
+                expires_at=now + self.service.review_retention_days * 86400,
+                now=now,
+            )
+        except Exception:
+            LOG.error("manual_enforcement_capture_failed")
 
     async def _show_review(self, item: ReviewItem) -> tuple[int, dict[str, str], bytes]:
         if item.status != "pending" or item.reference is None:
@@ -575,7 +767,7 @@ class ReviewAdminServer:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
             self._masthead("Review queue", f"{len(items)} pending")
-            + "<p class='back'><a href='/dataset'>Dataset →</a></p>"
+            + "<p class='back'><a href='/enforcement'>Active enforcement</a> · <a href='/dataset'>Dataset</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Pending reviews</p>"
             "<h2>Review pending senders</h2>"
             "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
@@ -653,6 +845,38 @@ class ReviewAdminServer:
                 )
         return identities
 
+    async def _live_enforcement_identities(
+        self, items: list[EnforcementReview]
+    ) -> dict[str, LiveIdentity]:
+        identities: dict[str, LiveIdentity] = {}
+        for item in items:
+            if item.reference is None:
+                continue
+            try:
+                user_id, access_hash, _ = self.protector.open_review_reference(
+                    item.reference
+                )
+                cached = self._identity_cache.get(item.sender_key)
+                if cached and cached[0] > time.monotonic():
+                    identities[item.sender_key] = LiveIdentity(
+                        user_id, cached[1], cached[2]
+                    )
+                    continue
+                sender = await asyncio.wait_for(
+                    self.telegram_client.get_entity(
+                        types.InputPeerUser(user_id=user_id, access_hash=access_hash)
+                    ),
+                    timeout=IDENTITY_FETCH_TIMEOUT_SECONDS,
+                )
+                name, username = self._sender_name(sender)
+                identities[item.sender_key] = LiveIdentity(user_id, name, username)
+                self._cache_identity(
+                    item.sender_key, name, username, IDENTITY_CACHE_SECONDS
+                )
+            except Exception:
+                continue
+        return identities
+
     def _cache_identity(
         self,
         sender_key: str,
@@ -715,7 +939,7 @@ class ReviewAdminServer:
 
     def _action_form(
         self,
-        review_id: int,
+        review_id: int | str,
         action: str,
         label: str,
         *,
@@ -738,6 +962,21 @@ class ReviewAdminServer:
         if seconds < 86400:
             return f"{seconds // 3600}h"
         return f"{seconds // 86400}d"
+
+    @staticmethod
+    def _remaining(item: EnforcementReview) -> str:
+        if item.status == "quarantined":
+            return "Manual review required"
+        if item.suppressed_until is None:
+            return "No automatic release"
+        seconds = item.suppressed_until - int(time.time())
+        if seconds <= 0:
+            return "Release pending"
+        if seconds < 3600:
+            return f"{max(1, seconds // 60)}m remaining"
+        if seconds < 86400:
+            return f"{max(1, seconds // 3600)}h remaining"
+        return f"{max(1, seconds // 86400)}d remaining"
 
     @classmethod
     def _page(
@@ -795,9 +1034,12 @@ th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical
 .back{{padding:1.25rem 1.25rem 0}}.review-grid{{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.75fr);gap:1.5rem;padding-bottom:2rem}}
 .message-panel,.case-file,.decision-panel{{min-width:0;border:1px solid var(--line);background:var(--panel);padding:clamp(1.25rem,4vw,2.4rem)}}.message-panel h2{{font-size:2rem;margin:.5rem 0 1.8rem;overflow-wrap:anywhere}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}pre.message{{min-height:180px;margin:0 0 1.5rem;padding:1.4rem;background:var(--ink);color:#f7f1df;font:1rem/1.65 var(--font-ui);border-left:5px solid var(--signal)}}
+.content-label{{margin:1.5rem 0 .55rem;color:var(--muted);font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}}pre.message.quote{{min-height:96px;background:#27332e;border-left-color:#b88836}}
 .telegram-link{{display:inline-block;max-width:100%;font-weight:800;overflow-wrap:anywhere}}dt{{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}dd{{margin:.2rem 0 1.2rem;overflow-wrap:anywhere}}.badge{{display:inline-block;max-width:100%;padding:.2rem .45rem;background:#f8e9d8;border:1px solid var(--signal);color:#9d3118;font-weight:800;overflow-wrap:anywhere}}
 details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:pointer;font-weight:800}}details pre{{font-size:.75rem;color:var(--muted)}}.decision-panel{{position:relative;width:calc(100% - 2.5rem);max-width:1080px;margin:0 auto 4rem;border-top:5px solid var(--ink)}}.decision-panel h2{{font-size:1.7rem;margin-bottom:0}}
 .actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
+.actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
+.actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-card>p:not(.eyebrow){{max-width:54ch;color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
 @media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")

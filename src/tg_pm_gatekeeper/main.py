@@ -1,6 +1,5 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -23,12 +22,10 @@ async def async_main() -> None:
         read_private_file(settings.hmac_key_file, minimum_bytes=32)
     )
     store = StateStore(settings.database_path)
-    training_store = TrainingStore(
-        settings.dataset_path,
-        DatasetProtector(
-            read_private_file(settings.dataset_key_file, minimum_bytes=32)
-        ),
+    dataset_protector = DatasetProtector(
+        read_private_file(settings.dataset_key_file, minimum_bytes=32)
     )
+    training_store = TrainingStore(settings.dataset_path, dataset_protector)
     service = GatekeeperService(
         store,
         protector,
@@ -39,6 +36,7 @@ async def async_main() -> None:
         denylist=load_denylist(settings.denylist_file),
         test_sender_id=settings.test_sender_id,
         training_store=training_store,
+        review_content_protector=dataset_protector,
         dataset_collection=settings.dataset_collection,
         dataset_retention_days=settings.dataset_retention_days,
         dataset_max_messages_per_sender=settings.dataset_max_messages_per_sender,
