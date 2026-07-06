@@ -18,7 +18,7 @@ from typing import Literal, Protocol
 from .crypto import IdentifierProtector
 from .dataset import DatasetProtector, TrainingStore
 from .policy import DetectionResult, PolicyEngine
-from .rules import MessageFacts, evaluate_hard_rules
+from .rules import MessageFacts, evaluate_hard_rules, url_shape
 from .store import SenderState, StateStore
 
 
@@ -320,8 +320,11 @@ class GatekeeperService:
 
             detection = decision.detection_result()
             policy = self.policy.decide(detection)
+            sample_id: int | None = None
             if state.status == "unknown" and not is_test_sender:
-                self._collect_sample(message, detection, policy.planned_action, now)
+                sample_id = self._collect_sample(
+                    message, detection, policy.planned_action, now
+                )
 
             if decision.severity == "critical" and not is_test_sender:
                 for rule in decision.rule_codes:
@@ -331,9 +334,9 @@ class GatekeeperService:
                     self._enqueue_review(
                         sender_key, message, outcome, decision.rule_codes, now
                     )
-                    if self.training_store is not None:
+                    if sample_id is not None:
                         self._update_sample_outcome(
-                            message.sender_id,
+                            sample_id,
                             weak_label="spam_candidate",
                             actual_action=outcome,
                         )
@@ -348,9 +351,9 @@ class GatekeeperService:
                     outcome = self._schedule_critical_delete(
                         sender_key, message, actions, now
                     )
-                    if self.training_store is not None:
+                    if sample_id is not None:
                         self._update_sample_outcome(
-                            message.sender_id,
+                            sample_id,
                             weak_label="spam_candidate",
                             actual_action=outcome,
                         )
@@ -372,9 +375,9 @@ class GatekeeperService:
                 self.store.audit(sender_key, "CHALLENGE_REQUIRED", "observed", now)
                 outcome = "would_challenge"
                 self._enqueue_review(sender_key, message, outcome, (), now)
-                if self.training_store is not None:
+                if sample_id is not None:
                     self._update_sample_outcome(
-                        message.sender_id,
+                        sample_id,
                         weak_label="uncertain",
                         actual_action=outcome,
                     )
@@ -384,9 +387,9 @@ class GatekeeperService:
                 return outcome
 
             outcome = await self._issue_challenge(sender_key, message, actions, now)
-            if self.training_store is not None and not is_test_sender:
+            if sample_id is not None:
                 self._update_sample_outcome(
-                    message.sender_id,
+                    sample_id,
                     weak_label="uncertain",
                     actual_action=outcome,
                 )
@@ -407,26 +410,46 @@ class GatekeeperService:
         detection: DetectionResult,
         planned_action: str,
         now: int,
-    ) -> None:
-        if (
-            self.training_store is None
-            or not self.dataset_collection
-            or not (message.text.strip() or message.facts.quote_text.strip())
-        ):
-            return
+    ) -> int | None:
+        if self.training_store is None or not self.dataset_collection:
+            return None
         facts = message.facts
+        has_content = bool(
+            message.text.strip()
+            or facts.quote_text.strip()
+            or facts.preview_text.strip()
+        )
+        if not has_content and not detection.signals:
+            try:
+                self.training_store.record_no_signal(now)
+            except Exception:
+                LOG.error("dataset_collection_failed")
+                self.store.audit(
+                    self.protector.sender_key(message.sender_id),
+                    "DATASET_COLLECTION",
+                    "action_failed",
+                    now,
+                )
+            return None
         payload: dict[str, object] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "text": message.text,
             "quote_text": facts.quote_text,
+            "preview_text": facts.preview_text,
+            "domains": list(sorted(set(facts.domains))[:3]),
+            "quote_domains": list(sorted(set(facts.quote_domains))[:3]),
+            "url_shape": url_shape(facts.urls),
+            "quote_url_shape": url_shape(facts.quote_urls),
             "features": {
                 "domain_count": min(len(set(facts.domains)), 2),
                 "forwarded": facts.is_forwarded,
                 "has_any_button": facts.has_any_button,
                 "has_link": facts.has_link,
                 "has_link_button": facts.has_link_button,
+                "has_preview_text": bool(facts.preview_text),
                 "has_quote": bool(facts.quote_text),
                 "link_button_count": min(facts.link_button_count, 3),
+                "quote_url_count": min(len(set(facts.quote_urls)), 2),
                 "url_count": min(len(set(facts.urls)), 2),
                 "via_bot": facts.via_bot,
             },
@@ -440,15 +463,17 @@ class GatekeeperService:
             "policy_version": "rules-v2",
         }
         try:
-            self.training_store.collect(
+            result = self.training_store.collect(
                 sender_id=message.sender_id,
                 message_id=message.message_id,
                 payload=payload,
                 weak_label="uncertain",
                 retention_days=self.dataset_retention_days,
                 max_per_sender=self.dataset_max_messages_per_sender,
+                sample_kind="content" if has_content else "structural",
                 now=now,
             )
+            return result.sample_id
         except Exception:
             LOG.error("dataset_collection_failed")
             self.store.audit(
@@ -457,6 +482,7 @@ class GatekeeperService:
                 "action_failed",
                 now,
             )
+            return None
 
     def _capture_enforcement_review(
         self,
@@ -536,12 +562,26 @@ class GatekeeperService:
                 pass
 
     def _update_sample_outcome(
+        self, sample_id: int, *, weak_label: str, actual_action: str
+    ) -> None:
+        if self.training_store is None:
+            return
+        try:
+            self.training_store.update_sample_outcome(
+                sample_id,
+                weak_label=weak_label,
+                actual_action=actual_action,
+            )
+        except Exception:
+            LOG.error("dataset_update_failed")
+
+    def _finalize_challenged_sample(
         self, sender_id: int, *, weak_label: str, actual_action: str
     ) -> None:
         if self.training_store is None:
             return
         try:
-            self.training_store.update_sender_outcome(
+            self.training_store.finalize_challenged_sample(
                 sender_id,
                 weak_label=weak_label,
                 actual_action=actual_action,
@@ -846,7 +886,7 @@ class GatekeeperService:
             self.store.mark_provisional(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
             if self.training_store is not None and sender_key != self.test_sender_key:
-                self._update_sample_outcome(
+                self._finalize_challenged_sample(
                     message.sender_id,
                     weak_label="legitimate_candidate",
                     actual_action="provisional",
@@ -948,7 +988,7 @@ class GatekeeperService:
                     reference=reference,
                 )
                 if self.training_store is not None:
-                    self._update_sample_outcome(
+                    self._finalize_challenged_sample(
                         message.sender_id,
                         weak_label="spam_candidate",
                         actual_action="suppressed",

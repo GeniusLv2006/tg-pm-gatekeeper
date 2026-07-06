@@ -10,10 +10,26 @@ from tg_pm_gatekeeper.rules import (
     evaluate_hard_rules,
     normalize_text,
     normalized_domain,
+    url_shape,
 )
 
 
 class RuleTests(unittest.TestCase):
+    def test_url_shape_excludes_path_and_query_values(self) -> None:
+        shape = url_shape(
+            ("http://example.invalid/private/path?token=secret#fragment",)
+        )
+        self.assertEqual(
+            shape,
+            {
+                "has_fragment": True,
+                "has_non_root_path": True,
+                "has_query": True,
+                "max_path_depth": 2,
+                "uses_plain_http": True,
+            },
+        )
+
     def test_single_link_button_is_not_a_hard_rule(self) -> None:
         decision = evaluate_hard_rules(MessageFacts(has_link_button=True))
         self.assertFalse(decision.hard_spam)

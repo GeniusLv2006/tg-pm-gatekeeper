@@ -194,13 +194,17 @@ then resets the state. Never configure a real correspondent as the test sender.
 
 ## Optional encrypted dataset
 
-Dataset collection is off by default. When enabled, Gatekeeper retains message text/captions and
-Telegram-provided quoted text from at most three unexpired messages per unknown sender for 30 days by
-default. This is a cap, not a rolling “latest three”: after a sender reaches it, later messages are
-ignored until a sample expires or is deleted. Monitor mode can gradually reach the cap; protect mode
-normally collects only the first message before the sender enters a challenge or enforcement state.
-Samples use AES-256-GCM under an independent key. Media, profile data, raw IDs, access hashes, hidden
-URL entity targets, and the dedicated test sender are excluded.
+Dataset collection is off by default. When enabled, Gatekeeper retains eligible unknown-sender
+messages containing text/captions, Telegram-provided quoted or webpage-preview text, or a detector
+signal. Encrypted samples also include up to three normalized message-side and quoted domains plus
+aggregate URL-shape features; full URLs, path text, query values, and fragment values are excluded.
+Collection
+is capped at three unexpired messages per sender for 30 days by default. This is not a rolling
+“latest three”: after a sender reaches the cap, later messages are ignored until a sample expires or
+is deleted. Monitor mode can gradually reach the cap; protect mode normally collects only the first
+message before the sender enters a challenge or enforcement state. Samples use AES-256-GCM under an
+independent key. Media, profile data, raw IDs, access hashes, and the dedicated test sender are
+excluded.
 
 ```shell
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples status
@@ -208,9 +212,10 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples export 
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples purge --confirm DELETE-ALL-SAMPLES
 ```
 
-The dashboard supports manual Spam, Legitimate, and Uncertain labels. Plaintext exports are sensitive
-and should be transferred to a trusted workstation and deleted from the host immediately. This
-release collects, labels, and exports samples; it does not train or run a model.
+The dashboard reports rolling collection and skip counts, explains structural-only samples, and
+supports manual Spam, Legitimate, and Uncertain labels. Plaintext exports are sensitive and should be
+transferred to a trusted workstation and deleted from the host immediately. This release collects,
+labels, and exports samples; it does not train or run a model.
 
 ## Documentation
 

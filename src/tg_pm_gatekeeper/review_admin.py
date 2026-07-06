@@ -319,7 +319,9 @@ class ReviewAdminServer:
     def _dataset_index_page(self, page: int = 1) -> bytes:
         if self.training_store is None:
             return self._page("Dataset collection is disabled")
-        stats = self.training_store.statistics()
+        stats = self.training_store.statistics(
+            retention_days=self.dataset_retention_days
+        )
         samples = self.training_store.summaries(limit=101, offset=(page - 1) * 100)
         has_next = len(samples) > 100
         groups: dict[str, str] = {}
@@ -362,6 +364,17 @@ class ReviewAdminServer:
             f"{stats.get('exportable_gold', 0)}</dd></div>"
             "</dl>"
         )
+        activity = (
+            "<h3>Collection activity</h3><p class='refresh-note'>"
+            f"UTC calendar-day totals within the current {self.dataset_retention_days}-day retention window.</p>"
+            "<dl class='metric-grid'>"
+            f"<div><dt>Content samples</dt><dd class='data-value'>{stats.get('collection_collected_content', 0)}</dd></div>"
+            f"<div><dt>Structural-only samples</dt><dd class='data-value'>{stats.get('collection_collected_structural', 0)}</dd></div>"
+            f"<div><dt>Skipped: no usable signal</dt><dd class='data-value'>{stats.get('collection_skipped_no_signal', 0)}</dd></div>"
+            f"<div><dt>Skipped: duplicate</dt><dd class='data-value'>{stats.get('collection_skipped_duplicate', 0)}</dd></div>"
+            f"<div><dt>Skipped: sender cap</dt><dd class='data-value'>{stats.get('collection_skipped_sender_cap', 0)}</dd></div>"
+            "</dl>"
+        )
         content = (
             self._masthead("Dataset", f"{stats.get('total', 0)} samples")
             + "<p class='back'><a href='/'>← Review queue</a> · <a href='/enforcement'>Active enforcement</a></p><main>"
@@ -370,7 +383,9 @@ class ReviewAdminServer:
             + f"<p>Collection {'enabled' if self.dataset_collection else 'disabled'} · "
             + f"{self.dataset_retention_days}-day retention · "
             + f"up to {self.dataset_max_messages_per_sender} messages per sender.</p>"
+            + "<p>Eligible unknown-sender messages contain text, quoted text, Telegram preview text, or a detector signal. Collection-disabled traffic is not counted.</p>"
             + overview
+            + activity
             + "</section>"
             + "<div class='table-shell'><table><thead><tr><th>Sample</th><th>Sender group</th>"
             + "<th>Weak label</th><th>Manual label</th><th>Age</th></tr></thead>"
@@ -409,6 +424,18 @@ class ReviewAdminServer:
         payload = sample.payload
         text = str(payload.get("text", ""))
         quote_text = str(payload.get("quote_text", ""))
+        preview_text = str(payload.get("preview_text", ""))
+        domains = ", ".join(str(value) for value in payload.get("domains", [])) or "—"
+        quote_domains = (
+            ", ".join(str(value) for value in payload.get("quote_domains", [])) or "—"
+        )
+        url_shape = json.dumps(payload.get("url_shape", {}), indent=2, sort_keys=True)
+        quote_url_shape = json.dumps(
+            payload.get("quote_url_shape", {}), indent=2, sort_keys=True
+        )
+        structural_only = not (
+            text.strip() or quote_text.strip() or preview_text.strip()
+        )
         details = html.escape(json.dumps(payload, ensure_ascii=False, indent=2))
         actions = "".join(
             self._action_form(sample_id, label, label.title(), base="dataset")
@@ -419,10 +446,29 @@ class ReviewAdminServer:
         content = (
             self._masthead("Dataset sample", f"#{sample.id}")
             + "<p class='back'><a href='/dataset'>← Dataset</a></p>"
-            + f"<main><section class='message-panel'><p class='eyebrow'>Message text or caption</p>"
-            + f"<pre class='message'>{html.escape(text)}</pre>"
-            + (f"<p class='eyebrow'>Quoted context</p><pre class='message quote'>"
-               f"{html.escape(quote_text)}</pre>" if quote_text else "")
+            + "<main><section class='message-panel'><p class='eyebrow'>Message text or caption</p>"
+            + (f"<pre class='message'>{html.escape(text)}</pre>" if text else "")
+            + (
+                f"<p class='eyebrow'>Quoted context</p><pre class='message quote'>"
+                f"{html.escape(quote_text)}</pre>"
+                if quote_text
+                else ""
+            )
+            + (
+                f"<p class='eyebrow'>Telegram webpage preview</p><pre class='message quote'>"
+                f"{html.escape(preview_text)}</pre>"
+                if preview_text
+                else ""
+            )
+            + (
+                "<div class='notice'><strong>Structural-only sample.</strong> No message, quoted, or preview text was retained. Review the detector signals and structural metadata; choose Uncertain when the evidence is insufficient.</div>"
+                if structural_only
+                else ""
+            )
+            + f"<p class='content-label'>Normalized domains</p><pre>{html.escape(domains)}</pre>"
+            + f"<p class='content-label'>Quoted-context domains</p><pre>{html.escape(quote_domains)}</pre>"
+            + f"<details><summary>Link shape</summary><pre>{html.escape(url_shape)}</pre></details>"
+            + f"<details><summary>Quoted-context link shape</summary><pre>{html.escape(quote_url_shape)}</pre></details>"
             + f"<details><summary>Encrypted payload metadata</summary><pre>{details}</pre></details>"
             + f"<div class='actions'>{actions}</div></section></main>"
         )
@@ -1078,7 +1124,7 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
 .actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
 .actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
-.actions.one{{grid-template-columns:minmax(0,24rem)}}.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
+.actions.one{{grid-template-columns:minmax(0,24rem)}}.notice,.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{width:100%;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
 @media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")

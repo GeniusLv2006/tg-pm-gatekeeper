@@ -107,6 +107,35 @@ def normalized_url_key(url: str) -> str | None:
     return f"{normalized_host}{port}{path}{query}"
 
 
+def url_shape(urls: tuple[str, ...]) -> dict[str, object]:
+    has_non_root_path = False
+    has_query = False
+    has_fragment = False
+    uses_plain_http = False
+    max_path_depth = 0
+    for url in urls:
+        candidate = url.strip().rstrip(TRAILING_URL_PUNCTUATION)
+        if "://" not in candidate:
+            candidate = "https://" + candidate
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            continue
+        path_parts = [part for part in parsed.path.split("/") if part]
+        has_non_root_path = has_non_root_path or bool(path_parts)
+        has_query = has_query or bool(parsed.query)
+        has_fragment = has_fragment or bool(parsed.fragment)
+        uses_plain_http = uses_plain_http or parsed.scheme.casefold() == "http"
+        max_path_depth = max(max_path_depth, min(len(path_parts), 3))
+    return {
+        "has_fragment": has_fragment,
+        "has_non_root_path": has_non_root_path,
+        "has_query": has_query,
+        "max_path_depth": max_path_depth,
+        "uses_plain_http": uses_plain_http,
+    }
+
+
 def domain_is_denied(domain: str, denylist: frozenset[str]) -> bool:
     return any(domain == denied or domain.endswith("." + denied) for denied in denylist)
 

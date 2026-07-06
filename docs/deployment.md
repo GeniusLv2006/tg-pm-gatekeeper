@@ -184,8 +184,9 @@ correspondent. Remove the value when testing is complete.
 
 ### Optional encrypted dataset
 
-Collection is disabled by default. To retain text/captions and Telegram-provided quoted context from
-at most three unexpired messages per anonymous unknown sender for 30 days:
+Collection is disabled by default. To retain eligible text/captions, Telegram-provided quoted or
+webpage-preview text, detector-signal-only structural samples, normalized domains, and aggregate
+URL-shape features from at most three unexpired messages per anonymous unknown sender for 30 days:
 
 ```shell
 TG_DATASET_COLLECTION=on
@@ -196,8 +197,15 @@ TG_DATASET_MAX_MESSAGES_PER_SENDER=3
 After the cap is reached, later samples are ignored until one expires or is deleted; existing rows
 are not rotated to keep the newest three. Monitor mode can gradually fill the cap, while protect mode
 normally collects only the initial message before the sender changes state. The Dataset dashboard
-decrypts text and quoted context only on a sample detail page. It supports Spam, Legitimate, and
-Uncertain labels plus individual deletion. It does not train a model or store media.
+decrypts text, quoted context, preview text, domains, and link-shape metadata only on a sample detail
+page. Full URLs, path text, query values, fragment values, and media are never retained. The dashboard also
+shows rolling collection/skip counts and supports Spam, Legitimate, and Uncertain labels plus
+individual deletion. Collection-disabled traffic is neither sampled nor counted. It does not train
+a model.
+
+On first startup after the Dataset schema upgrade, `training.sqlite3` migrates from version 1 to 2 by
+adding the aggregate collection-statistics table. Existing encrypted sample envelopes are not
+decrypted or rewritten.
 
 Use `samples export` only for a temporary owner-only plaintext JSONL, transfer it immediately to a
 trusted workstation, and remove the server copy. `samples purge --confirm DELETE-ALL-SAMPLES`
