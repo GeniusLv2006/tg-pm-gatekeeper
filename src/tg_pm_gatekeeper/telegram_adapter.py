@@ -439,7 +439,9 @@ class TelegramAdapter:
             if now >= next_prune:
                 self.store.prune(self.settings.audit_retention_days, now)
                 if self.training_store is not None:
-                    self.training_store.prune(now)
+                    self.training_store.prune(
+                        now, retention_days=self.settings.dataset_retention_days
+                    )
                 next_prune = now + PRUNE_INTERVAL_SECONDS
             await asyncio.sleep(60)
 

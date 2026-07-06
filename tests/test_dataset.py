@@ -40,7 +40,7 @@ class DatasetTests(unittest.TestCase):
             retention_days=30,
             max_per_sender=3,
             now=self.now,
-        )
+        ).sample_id
 
     def test_content_is_encrypted_and_file_is_private(self) -> None:
         sample_id = self.collect(1)
@@ -122,16 +122,117 @@ class DatasetTests(unittest.TestCase):
 
     def test_terminal_outcome_reencrypts_payload_and_updates_weak_label(self) -> None:
         sample_id = self.collect(1)
-        self.assertEqual(
-            self.store.update_sender_outcome(
-                123, weak_label="legitimate_candidate", actual_action="provisional"
-            ),
-            1,
+        self.assertTrue(
+            self.store.update_sample_outcome(
+                sample_id,
+                weak_label="legitimate_candidate",
+                actual_action="provisional",
+            )
         )
         sample = self.store.sample(sample_id)
         self.assertEqual(sample.weak_label, "legitimate_candidate")
         self.assertEqual(sample.payload["actual_action"], "provisional")
         self.assertNotIn(b"provisional", self.path.read_bytes())
+
+    def test_finalize_updates_only_latest_challenged_sample(self) -> None:
+        first = self.collect(1)
+        second = self.collect(2)
+        self.store.update_sample_outcome(
+            first, weak_label="uncertain", actual_action="would_challenge"
+        )
+        self.store.update_sample_outcome(
+            second, weak_label="uncertain", actual_action="challenged"
+        )
+
+        self.assertTrue(
+            self.store.finalize_challenged_sample(
+                123, weak_label="legitimate_candidate", actual_action="provisional"
+            )
+        )
+        self.assertEqual(
+            self.store.sample(first).payload["actual_action"], "would_challenge"
+        )
+        self.assertEqual(
+            self.store.sample(second).payload["actual_action"], "provisional"
+        )
+
+    def test_collection_statistics_are_rolling_and_pruned(self) -> None:
+        self.collect(1)
+        self.collect(1)
+        self.collect(2)
+        self.collect(3)
+        self.collect(4)
+        self.store.record_no_signal(self.now)
+        self.store.collect(
+            sender_id=456,
+            message_id=1,
+            payload={"schema_version": 3, "text": "", "signals": ["HR-02"]},
+            weak_label="uncertain",
+            retention_days=30,
+            max_per_sender=3,
+            sample_kind="structural",
+            now=self.now,
+        )
+
+        stats = self.store.statistics(retention_days=30, now=self.now)
+        self.assertEqual(stats["collection_collected_content"], 3)
+        self.assertEqual(stats["collection_collected_structural"], 1)
+        self.assertEqual(stats["collection_skipped_duplicate"], 1)
+        self.assertEqual(stats["collection_skipped_sender_cap"], 1)
+        self.assertEqual(stats["collection_skipped_no_signal"], 1)
+
+        later = self.now + 31 * 86400
+        self.store.prune(later, retention_days=30)
+        stats = self.store.statistics(retention_days=30, now=later)
+        self.assertEqual(stats["collection_collected_content"], 0)
+        self.assertEqual(
+            self.store._connection.execute(
+                "SELECT COUNT(*) FROM collection_stats"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_v1_database_migrates_without_rewriting_samples(self) -> None:
+        legacy_path = Path(self.temp.name) / "legacy.sqlite3"
+        envelope = self.protector.seal({"schema_version": 2, "text": "legacy"})
+        connection = sqlite3.connect(legacy_path)
+        connection.executescript(
+            """
+            CREATE TABLE samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_token TEXT NOT NULL,
+                message_token TEXT NOT NULL UNIQUE,
+                envelope BLOB NOT NULL,
+                weak_label TEXT NOT NULL,
+                manual_label TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            PRAGMA user_version=1;
+            """
+        )
+        connection.execute(
+            "INSERT INTO samples(sender_token,message_token,envelope,weak_label,created_at,expires_at) "
+            "VALUES (?,?,?,?,?,?)",
+            ("sender", "message", envelope, "uncertain", self.now, self.now + 86400),
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = TrainingStore(legacy_path, self.protector)
+        try:
+            self.assertEqual(
+                migrated._connection.execute("PRAGMA user_version").fetchone()[0], 2
+            )
+            self.assertEqual(migrated.sample(1).payload["text"], "legacy")
+            self.assertEqual(
+                migrated._connection.execute(
+                    "SELECT COUNT(*) FROM collection_stats"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            migrated.close()
 
 
 if __name__ == "__main__":

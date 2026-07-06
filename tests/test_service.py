@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -201,7 +202,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         await service.handle(self.message(1), FakeActions())
 
-        self.assertEqual(training_store.statistics()["total"], 0)
+        stats = training_store.statistics()
+        self.assertEqual(stats["total"], 0)
+        self.assertEqual(stats["collection_skipped_no_signal"], 0)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -333,7 +336,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(training.statistics()["total"], 1)
         sample = training.samples()[0]
-        self.assertEqual(sample.payload["schema_version"], 2)
+        self.assertEqual(sample.payload["schema_version"], 3)
         self.assertEqual(sample.payload["quote_text"], "quoted-private-canary")
         self.assertTrue(sample.payload["features"]["has_quote"])
         self.assertNotIn(b"dataset-private-canary", training_path.read_bytes())
@@ -348,6 +351,138 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()[0],
             0,
         )
+
+    async def test_monitor_collects_structural_rule_sample_without_text(self) -> None:
+        self.now = int(time.time())
+        training = TrainingStore(
+            Path(self.temp.name) / "training.sqlite3", DatasetProtector(b"d" * 32)
+        )
+        self.addCleanup(training.close)
+        service = self.make_service(training_store=training)
+
+        outcome = await service.handle(
+            self.message(
+                20,
+                "",
+                facts=MessageFacts(
+                    is_forwarded=True,
+                    has_any_button=True,
+                    has_link_button=True,
+                    link_button_count=1,
+                    urls=("https://spam.invalid/invite?token=private-canary",),
+                    domains=("spam.invalid",),
+                ),
+            ),
+            FakeActions(),
+        )
+
+        self.assertEqual(outcome, "would_delete")
+        sample = training.samples()[0]
+        self.assertEqual(sample.payload["text"], "")
+        self.assertEqual(sample.payload["signals"], ["HR-02_FORWARDED_LINK_BUTTON"])
+        self.assertEqual(sample.payload["domains"], ["spam.invalid"])
+        self.assertTrue(sample.payload["url_shape"]["has_query"])
+        serialized = json.dumps(sample.payload)
+        self.assertNotIn("private-canary", serialized)
+        self.assertNotIn("/invite", serialized)
+        self.assertEqual(training.statistics()["collection_collected_structural"], 1)
+
+    async def test_empty_message_without_signal_is_counted_but_not_collected(
+        self,
+    ) -> None:
+        self.now = int(time.time())
+        training = TrainingStore(
+            Path(self.temp.name) / "training.sqlite3", DatasetProtector(b"d" * 32)
+        )
+        self.addCleanup(training.close)
+        service = self.make_service(training_store=training)
+
+        self.assertEqual(
+            await service.handle(
+                self.message(21, "", facts=MessageFacts()), FakeActions()
+            ),
+            "would_challenge",
+        )
+        stats = training.statistics()
+        self.assertEqual(stats["total"], 0)
+        self.assertEqual(stats["collection_skipped_no_signal"], 1)
+
+    async def test_preview_and_safe_url_metadata_are_encrypted_without_raw_url(
+        self,
+    ) -> None:
+        self.now = int(time.time())
+        training_path = Path(self.temp.name) / "training.sqlite3"
+        training = TrainingStore(training_path, DatasetProtector(b"d" * 32))
+        self.addCleanup(training.close)
+        service = self.make_service(training_store=training)
+        raw_url = (
+            "http://promo.invalid/private/path?token=private-query#private-fragment"
+        )
+
+        await service.handle(
+            self.message(
+                22,
+                "",
+                facts=MessageFacts(
+                    preview_text="Guaranteed return private-preview",
+                    urls=(raw_url,),
+                    domains=("promo.invalid",),
+                    quote_urls=("https://quote.invalid/secret?user=private-user",),
+                    quote_domains=("quote.invalid",),
+                ),
+            ),
+            FakeActions(),
+        )
+
+        payload = training.samples()[0].payload
+        self.assertEqual(payload["preview_text"], "Guaranteed return private-preview")
+        self.assertEqual(payload["domains"], ["promo.invalid"])
+        self.assertEqual(payload["quote_domains"], ["quote.invalid"])
+        self.assertEqual(payload["url_shape"]["max_path_depth"], 2)
+        self.assertTrue(payload["url_shape"]["has_fragment"])
+        self.assertTrue(payload["url_shape"]["uses_plain_http"])
+        serialized = json.dumps(payload)
+        self.assertNotIn("private-query", serialized)
+        self.assertNotIn("private-fragment", serialized)
+        self.assertNotIn("private-user", serialized)
+        database = training_path.read_bytes()
+        self.assertNotIn(b"private-preview", database)
+        self.assertNotIn(b"promo.invalid", database)
+
+    async def test_monitor_outcome_updates_only_current_sample(self) -> None:
+        self.now = int(time.time())
+        training = TrainingStore(
+            Path(self.temp.name) / "training.sqlite3", DatasetProtector(b"d" * 32)
+        )
+        self.addCleanup(training.close)
+        service = self.make_service(training_store=training)
+        actions = FakeActions()
+
+        self.assertEqual(
+            await service.handle(self.message(30, "hello"), actions),
+            "would_challenge",
+        )
+        self.assertEqual(
+            await service.handle(
+                self.message(
+                    31,
+                    "forwarded",
+                    facts=MessageFacts(
+                        text="forwarded",
+                        is_forwarded=True,
+                        has_link_button=True,
+                        link_button_count=1,
+                    ),
+                ),
+                actions,
+            ),
+            "would_delete",
+        )
+        samples = sorted(training.samples(), key=lambda item: item.id)
+        self.assertEqual(samples[0].weak_label, "uncertain")
+        self.assertEqual(samples[0].payload["actual_action"], "would_challenge")
+        self.assertEqual(samples[1].weak_label, "spam_candidate")
+        self.assertEqual(samples[1].payload["actual_action"], "would_delete")
 
     async def test_suppressed_sender_retains_encrypted_original_review_snapshot(
         self,

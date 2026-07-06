@@ -187,14 +187,18 @@ including these envelopes, must not be included in general backups.
 The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
 authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.
 
-Optional training samples live in a separate owner-only `training.sqlite3`. Text/captions,
-Telegram-provided quoted text, and structural features are encrypted with AES-256-GCM under an
-independent dataset key. Dataset-key-derived HMAC tokens enforce per-sender and per-message limits
-without storing raw identities. The limit is three unexpired independent samples by default, not a
-rolling latest-three window. Media, names, usernames, raw IDs, access hashes, hidden URL entity
-targets, and the dedicated test sender are excluded. Samples expire after 30 days by default and no
-later than 90 days. New payloads declare schema version 2; old payloads without quote fields remain
-readable as version 1. This release does not train or run a model.
+Optional training samples live in a separate owner-only `training.sqlite3`. Eligible unknown-sender
+messages contain text/captions, Telegram-provided quoted or webpage-preview text, or a detector
+signal. Those values, up to three normalized message-side and quoted domains, aggregate URL-shape
+features, and structural features are encrypted with AES-256-GCM under an independent dataset key.
+Full URLs, paths, query values, fragments, media, names, usernames, raw IDs, access hashes, and the
+dedicated test sender are excluded. Dataset-key-derived HMAC tokens enforce per-sender and
+per-message limits without storing raw identities. The limit is three unexpired independent samples
+by default, not a rolling latest-three window. Samples expire after 30 days by default and no later
+than 90 days. New payloads declare schema version 3; old version 1 and 2 payloads remain readable.
+The database schema version 2 also stores UTC-day collection outcome counts without sender or
+message identifiers and prunes them on the configured sample-retention window. This release does
+not train or run a model.
 
 The dataset secret also derives a distinct `enforcement-review-content` AES-256-GCM key through HKDF.
 Training and enforcement envelopes use separate keys, authenticated-data strings, lifetimes, and

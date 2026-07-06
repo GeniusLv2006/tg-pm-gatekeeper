@@ -64,7 +64,9 @@ def run(argv: list[str] | None = None) -> int:
             training = TrainingStore(settings.dataset_path, DatasetProtector(key))
             try:
                 if args.sample_command == "status":
-                    payload = training.statistics()
+                    payload = training.statistics(
+                        retention_days=settings.dataset_retention_days
+                    )
                     payload["collection_enabled"] = settings.dataset_collection
                     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
                     return 0

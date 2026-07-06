@@ -317,7 +317,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             weak_label="uncertain",
             retention_days=30,
             max_per_sender=3,
-        )
+        ).sample_id
         self.server.training_store = training
         index = self.server._dataset_index_page()
         self.assertNotIn(b"dataset-private-canary", index)
@@ -325,6 +325,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Weak spam / legitimate / uncertain", index)
         self.assertIn(b"Expiring within 24 hours", index)
         self.assertIn(b"Dataset overview", index)
+        self.assertIn(b"Collection activity", index)
+        self.assertIn(b"Eligible unknown-sender messages", index)
         self.assertIn(b"Exportable manual labels", index)
         self.assertNotIn(b"gold labels ready", index)
         self.assertIn(b'font-feature-settings:"tnum" 1,"zero" 1', index)
@@ -342,6 +344,44 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 303)
         self.assertEqual(training.sample(sample_id).manual_label, "spam")
         self.assertFalse(self.server.socket_path.exists())
+
+    async def test_dataset_structural_sample_explains_missing_content(self) -> None:
+        training = TrainingStore(
+            Path(self.temp.name) / "structural.sqlite3",
+            DatasetProtector(b"d" * 32),
+        )
+        self.addCleanup(training.close)
+        sample_id = training.collect(
+            sender_id=123,
+            message_id=2,
+            payload={
+                "schema_version": 3,
+                "text": "",
+                "quote_text": "",
+                "preview_text": "",
+                "domains": ["spam.invalid"],
+                "quote_domains": [],
+                "url_shape": {"has_query": True},
+                "quote_url_shape": {},
+                "features": {"forwarded": True, "has_link_button": True},
+                "signals": ["HR-02_FORWARDED_LINK_BUTTON"],
+            },
+            weak_label="spam_candidate",
+            retention_days=30,
+            max_per_sender=3,
+            sample_kind="structural",
+        ).sample_id
+        self.server.training_store = training
+
+        status, _, detail = self.server._dispatch_dataset(
+            "GET", f"/dataset/{sample_id}", b""
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"Structural-only sample", detail)
+        self.assertIn(b"spam.invalid", detail)
+        self.assertIn(b"choose Uncertain", detail)
+        self.assertIn(b"Link shape", detail)
 
     async def test_active_enforcement_shows_encrypted_content_and_allows_sender(
         self,
