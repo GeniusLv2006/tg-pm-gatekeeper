@@ -155,6 +155,25 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(
             self.store.sample(second).payload["actual_action"], "provisional"
         )
+        self.assertFalse(
+            self.store.finalize_challenged_sample(
+                123, weak_label="spam_candidate", actual_action="suppressed"
+            )
+        )
+
+        expired = self.collect(3)
+        self.store.update_sample_outcome(
+            expired, weak_label="uncertain", actual_action="challenged"
+        )
+        self.store._connection.execute(
+            "UPDATE samples SET expires_at=0 WHERE id=?", (expired,)
+        )
+        self.store._connection.commit()
+        self.assertFalse(
+            self.store.finalize_challenged_sample(
+                123, weak_label="spam_candidate", actual_action="suppressed"
+            )
+        )
 
     def test_collection_statistics_are_rolling_and_pruned(self) -> None:
         self.collect(1)
@@ -225,6 +244,13 @@ class DatasetTests(unittest.TestCase):
                 migrated._connection.execute("PRAGMA user_version").fetchone()[0], 2
             )
             self.assertEqual(migrated.sample(1).payload["text"], "legacy")
+            self.assertTrue(migrated.label(1, "legitimate"))
+            export_path = Path(self.temp.name) / "legacy.jsonl"
+            self.assertEqual(migrated.export(export_path), 1)
+            self.assertEqual(
+                json.loads(export_path.read_text(encoding="utf-8"))["schema_version"],
+                2,
+            )
             self.assertEqual(
                 migrated._connection.execute(
                     "SELECT COUNT(*) FROM collection_stats"

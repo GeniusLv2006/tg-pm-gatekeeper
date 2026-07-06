@@ -27,9 +27,9 @@ If a secret is committed, removing it in a later commit is insufficient. Revoke 
   Raw user IDs, usernames, profile names, and message content are never stored in plaintext.
 - Optional training samples are stored only in a separate owner-only database. Message text/captions,
   Telegram-provided quoted and webpage-preview text, normalized domains, and aggregate URL-shape and
-  structural features are AES-256-GCM encrypted under an independent dataset key. Full URLs, paths,
-  query values, fragments, media, profile data, raw IDs, access hashes, and the dedicated test sender
-  are excluded. The same root key derives a separate enforcement-review subkey through HKDF; the two
+  structural features are AES-256-GCM encrypted under an independent dataset key. Full URLs, path
+  text, query values, fragment values, media, profile data, raw IDs, access hashes, and the dedicated
+  test sender are excluded. The same root key derives a separate enforcement-review subkey through HKDF; the two
   purposes use different authenticated-data domains and tables. Daily collection statistics contain
   counts only and never sender or message identifiers.
   Dataset collection is capped at three unexpired samples per anonymous sender, not a rolling latest

@@ -198,7 +198,7 @@ After the cap is reached, later samples are ignored until one expires or is dele
 are not rotated to keep the newest three. Monitor mode can gradually fill the cap, while protect mode
 normally collects only the initial message before the sender changes state. The Dataset dashboard
 decrypts text, quoted context, preview text, domains, and link-shape metadata only on a sample detail
-page. Full URLs, paths, query values, fragments, and media are never retained. The dashboard also
+page. Full URLs, path text, query values, fragment values, and media are never retained. The dashboard also
 shows rolling collection/skip counts and supports Spam, Legitimate, and Uncertain labels plus
 individual deletion. Collection-disabled traffic is neither sampled nor counted. It does not train
 a model.

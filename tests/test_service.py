@@ -426,9 +426,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 facts=MessageFacts(
                     preview_text="Guaranteed return private-preview",
                     urls=(raw_url,),
-                    domains=("promo.invalid",),
+                    domains=(
+                        "z.invalid",
+                        "promo.invalid",
+                        "b.invalid",
+                        "a.invalid",
+                    ),
                     quote_urls=("https://quote.invalid/secret?user=private-user",),
-                    quote_domains=("quote.invalid",),
+                    quote_domains=(
+                        "z-quote.invalid",
+                        "quote.invalid",
+                        "b-quote.invalid",
+                        "a-quote.invalid",
+                    ),
                 ),
             ),
             FakeActions(),
@@ -436,8 +446,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         payload = training.samples()[0].payload
         self.assertEqual(payload["preview_text"], "Guaranteed return private-preview")
-        self.assertEqual(payload["domains"], ["promo.invalid"])
-        self.assertEqual(payload["quote_domains"], ["quote.invalid"])
+        self.assertEqual(
+            payload["domains"], ["a.invalid", "b.invalid", "promo.invalid"]
+        )
+        self.assertEqual(
+            payload["quote_domains"],
+            ["a-quote.invalid", "b-quote.invalid", "quote.invalid"],
+        )
         self.assertEqual(payload["url_shape"]["max_path_depth"], 2)
         self.assertTrue(payload["url_shape"]["has_fragment"])
         self.assertTrue(payload["url_shape"]["uses_plain_http"])
@@ -448,6 +463,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         database = training_path.read_bytes()
         self.assertNotIn(b"private-preview", database)
         self.assertNotIn(b"promo.invalid", database)
+        sample = training.samples()[0]
+        training.label(sample.id, "spam")
+        export_path = Path(self.temp.name) / "training-export.jsonl"
+        self.assertEqual(training.export(export_path), 1)
+        exported = export_path.read_text(encoding="utf-8")
+        self.assertNotIn("private-query", exported)
+        self.assertNotIn("private-fragment", exported)
+        self.assertNotIn("private-user", exported)
 
     async def test_monitor_outcome_updates_only_current_sample(self) -> None:
         self.now = int(time.time())

@@ -191,8 +191,8 @@ Optional training samples live in a separate owner-only `training.sqlite3`. Elig
 messages contain text/captions, Telegram-provided quoted or webpage-preview text, or a detector
 signal. Those values, up to three normalized message-side and quoted domains, aggregate URL-shape
 features, and structural features are encrypted with AES-256-GCM under an independent dataset key.
-Full URLs, paths, query values, fragments, media, names, usernames, raw IDs, access hashes, and the
-dedicated test sender are excluded. Dataset-key-derived HMAC tokens enforce per-sender and
+Full URLs, path text, query values, fragment values, media, names, usernames, raw IDs, access hashes,
+and the dedicated test sender are excluded. Dataset-key-derived HMAC tokens enforce per-sender and
 per-message limits without storing raw identities. The limit is three unexpired independent samples
 by default, not a rolling latest-three window. Samples expire after 30 days by default and no later
 than 90 days. New payloads declare schema version 3; old version 1 and 2 payloads remain readable.

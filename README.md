@@ -197,7 +197,8 @@ then resets the state. Never configure a real correspondent as the test sender.
 Dataset collection is off by default. When enabled, Gatekeeper retains eligible unknown-sender
 messages containing text/captions, Telegram-provided quoted or webpage-preview text, or a detector
 signal. Encrypted samples also include up to three normalized message-side and quoted domains plus
-aggregate URL-shape features; full URLs, paths, query values, and fragments are excluded. Collection
+aggregate URL-shape features; full URLs, path text, query values, and fragment values are excluded.
+Collection
 is capped at three unexpired messages per sender for 30 days by default. This is not a rolling
 “latest three”: after a sender reaches the cap, later messages are ignored until a sample expires or
 is deleted. Monitor mode can gradually reach the cap; protect mode normally collects only the first
