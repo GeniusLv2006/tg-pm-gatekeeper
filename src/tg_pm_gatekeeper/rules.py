@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .policy import DetectionResult, Severity
 
@@ -136,6 +136,70 @@ def url_shape(urls: tuple[str, ...]) -> dict[str, object]:
     }
 
 
+def telegram_link_kind(url: str) -> str:
+    candidate = url.strip().rstrip(TRAILING_URL_PUNCTUATION)
+    if "://" not in candidate:
+        candidate = "https://" + candidate
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return "unknown"
+    scheme = parsed.scheme.casefold()
+    try:
+        hostname = (
+            (parsed.hostname or "").rstrip(".").encode("idna").decode("ascii").casefold()
+        )
+    except UnicodeError:
+        hostname = ""
+    query = parse_qs(parsed.query)
+    if scheme == "tg":
+        if parsed.netloc == "join" or "invite" in query:
+            return "invite"
+        if "start" in query or "startapp" in query:
+            return "bot_start"
+        if "domain" in query:
+            return "public_username"
+        return "unknown"
+    if hostname not in {"t.me", "telegram.me"}:
+        return "external_web"
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return "unknown"
+    first = parts[0].casefold()
+    if first == "joinchat" or parts[0].startswith("+"):
+        return "invite"
+    if first == "c" and len(parts) >= 3:
+        return "internal_message"
+    if "start" in query or "startapp" in query:
+        return "bot_start"
+    return "public_username"
+
+
+def url_evidence(
+    urls: tuple[str, ...],
+    *,
+    button_urls: tuple[str, ...] = (),
+    preview_urls: tuple[str, ...] = (),
+) -> list[dict[str, object]]:
+    button_set = set(button_urls)
+    preview_set = set(preview_urls)
+    records: list[dict[str, object]] = []
+    for url in sorted(set(urls))[:10]:
+        sources = ["button"] if url in button_set else []
+        if url in preview_set:
+            sources.append("preview")
+        if url not in button_set and url not in preview_set:
+            sources.append("message")
+        records.append(
+            {
+                "url": url,
+                "kind": telegram_link_kind(url),
+                "sources": sources,
+            }
+        )
+    return records
+
+
 def domain_is_denied(domain: str, denylist: frozenset[str]) -> bool:
     return any(domain == denied or domain.endswith("." + denied) for denied in denylist)
 
@@ -147,6 +211,9 @@ class MessageFacts:
     quote_text: str = ""
     urls: tuple[str, ...] = ()
     domains: tuple[str, ...] = ()
+    button_texts: tuple[str, ...] = ()
+    button_urls: tuple[str, ...] = ()
+    preview_urls: tuple[str, ...] = ()
     quote_urls: tuple[str, ...] = ()
     quote_domains: tuple[str, ...] = ()
     has_link_button: bool = False

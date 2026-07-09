@@ -26,8 +26,8 @@ class InitializeTests(unittest.TestCase):
         config = render_config(1, "TEST_API_HASH_DO_NOT_USE").decode("ascii")
         self.assertIn("TG_API_ID=1", config)
         self.assertIn("TG_SESSION_FILE=/run/secrets/telegram_session", config)
-        self.assertIn("TG_DATASET_KEY_FILE=/run/secrets/dataset_key", config)
-        self.assertIn("TG_DATASET_COLLECTION=off", config)
+        self.assertIn("TG_EVIDENCE_KEY_FILE=/run/secrets/evidence_key", config)
+        self.assertIn("TG_EVIDENCE_COLLECTION=off", config)
         self.assertIn("TG_TEST_SENDER_ID=\n", config)
         self.assertNotIn("REPLACE_WITH_", config)
 
@@ -51,17 +51,17 @@ class InitializeTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "between 30 and 600"):
                 Settings.from_environment(require_telegram=False)
 
-    def test_dataset_configuration_is_bounded(self) -> None:
-        with patch.dict("os.environ", {"TG_DATASET_RETENTION_DAYS": "91"}, clear=True):
+    def test_evidence_configuration_is_bounded(self) -> None:
+        with patch.dict("os.environ", {"TG_EVIDENCE_RETENTION_DAYS": "91"}, clear=True):
             with self.assertRaisesRegex(ConfigurationError, "between 1 and 90"):
                 Settings.from_environment(require_telegram=False)
 
-    def test_dataset_files_must_be_cryptographically_separate(self) -> None:
+    def test_evidence_files_must_be_cryptographically_separate(self) -> None:
         with patch.dict(
             os.environ,
             {
                 "TG_DB_PATH": "/tmp/shared.sqlite3",
-                "TG_DATASET_PATH": "/tmp/shared.sqlite3",
+                "TG_EVIDENCE_PATH": "/tmp/shared.sqlite3",
             },
             clear=True,
         ):
@@ -72,7 +72,7 @@ class InitializeTests(unittest.TestCase):
             os.environ,
             {
                 "TG_HMAC_KEY_FILE": "/tmp/shared.key",
-                "TG_DATASET_KEY_FILE": "/tmp/shared.key",
+                "TG_EVIDENCE_KEY_FILE": "/tmp/shared.key",
             },
             clear=True,
         ):

@@ -17,7 +17,7 @@ from telethon.sync import TelegramClient
 TARGETS = (
     Path("telegram.session.secret"),
     Path("hmac.key"),
-    Path("dataset.key"),
+    Path("evidence.key"),
     Path("config.env"),
     Path("deny-domains.txt"),
 )
@@ -37,17 +37,17 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_DB_PATH=/var/lib/tg-pm-gatekeeper/state.sqlite3\n"
         "TG_SESSION_FILE=/run/secrets/telegram_session\n"
         "TG_HMAC_KEY_FILE=/run/secrets/hmac_key\n"
-        "TG_DATASET_KEY_FILE=/run/secrets/dataset_key\n"
-        "TG_DATASET_PATH=/var/lib/tg-pm-gatekeeper/training.sqlite3\n"
-        "TG_DATASET_COLLECTION=off\n"
-        "TG_DATASET_RETENTION_DAYS=30\n"
-        "TG_DATASET_MAX_MESSAGES_PER_SENDER=3\n"
+        "TG_EVIDENCE_KEY_FILE=/run/secrets/evidence_key\n"
+        "TG_EVIDENCE_PATH=/var/lib/tg-pm-gatekeeper/evidence.sqlite3\n"
+        "TG_EVIDENCE_COLLECTION=off\n"
+        "TG_EVIDENCE_RETENTION_DAYS=7\n"
+        "TG_EVIDENCE_MAX_RECORDS_PER_SENDER=3\n"
         "TG_DENYLIST_FILE=/run/config/deny-domains.txt\n"
         "TG_CHALLENGE_TTL_SECONDS=60\n"
         "TG_CHALLENGE_MAX_ATTEMPTS=2\n"
         "TG_AUDIT_RETENTION_DAYS=30\n"
         "TG_REVIEW_RETENTION_DAYS=7\n"
-        "TG_REVIEW_SOCKET_PATH=/var/lib/tg-pm-gatekeeper/review.sock\n"
+        "TG_DASHBOARD_SOCKET_PATH=/var/lib/tg-pm-gatekeeper/review.sock\n"
         "TG_MUTE_DAYS=3650\n"
         "TG_OUTBOUND_LIMIT_PER_HOUR=10\n"
         "TG_TEST_SENDER_ID=\n"

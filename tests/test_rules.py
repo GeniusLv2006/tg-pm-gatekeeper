@@ -10,6 +10,8 @@ from tg_pm_gatekeeper.rules import (
     evaluate_hard_rules,
     normalize_text,
     normalized_domain,
+    telegram_link_kind,
+    url_evidence,
     url_shape,
 )
 
@@ -29,6 +31,40 @@ class RuleTests(unittest.TestCase):
                 "uses_plain_http": True,
             },
         )
+
+    def test_url_evidence_keeps_full_url_sources_and_telegram_kind(self) -> None:
+        records = url_evidence(
+            (
+                "https://t.me/+privateInvite",
+                "https://example.invalid/private/path?token=secret#fragment",
+            ),
+            button_urls=("https://t.me/+privateInvite",),
+            preview_urls=(
+                "https://example.invalid/private/path?token=secret#fragment",
+            ),
+        )
+        self.assertEqual(
+            records[0]["url"],
+            "https://example.invalid/private/path?token=secret#fragment",
+        )
+        self.assertEqual(records[0]["kind"], "external_web")
+        self.assertEqual(records[0]["sources"], ["preview"])
+        self.assertEqual(records[1]["url"], "https://t.me/+privateInvite")
+        self.assertEqual(records[1]["kind"], "invite")
+        self.assertEqual(records[1]["sources"], ["button"])
+
+    def test_telegram_link_kind_classifies_common_shapes(self) -> None:
+        self.assertEqual(telegram_link_kind("https://t.me/joinchat/abc"), "invite")
+        self.assertEqual(
+            telegram_link_kind("https://t.me/bot?start=abc"), "bot_start"
+        )
+        self.assertEqual(
+            telegram_link_kind("https://t.me/c/123/456"), "internal_message"
+        )
+        self.assertEqual(
+            telegram_link_kind("https://t.me/public_name"), "public_username"
+        )
+        self.assertEqual(telegram_link_kind("tg://join?invite=abc"), "invite")
 
     def test_single_link_button_is_not_a_hard_rule(self) -> None:
         decision = evaluate_hard_rules(MessageFacts(has_link_button=True))

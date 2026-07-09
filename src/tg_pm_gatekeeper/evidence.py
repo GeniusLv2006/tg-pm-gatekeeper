@@ -20,8 +20,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
-DATASET_SCHEMA_VERSION = 2
-MANUAL_LABELS = {"spam", "legitimate", "uncertain"}
+EVIDENCE_SCHEMA_VERSION = 1
+REVIEW_OUTCOMES = {"correct", "false_positive", "insufficient"}
+LEGACY_REVIEW_OUTCOME_MAP = {
+    "spam": "correct",
+    "legitimate": "false_positive",
+    "uncertain": "insufficient",
+}
 WEAK_LABELS = {"spam_candidate", "legitimate_candidate", "uncertain"}
 COLLECTION_OUTCOMES = {
     "collected_content",
@@ -34,30 +39,42 @@ CollectionStatus = Literal["collected", "duplicate", "sender_cap"]
 
 
 @dataclass(frozen=True, slots=True)
-class TrainingSample:
+class EvidenceRecord:
     id: int
     sender_token: str
     payload: dict[str, object]
-    weak_label: str
-    manual_label: str | None
+    automatic_hint: str
+    review_outcome: str | None
     created_at: int
     expires_at: int
+
+    @property
+    def weak_label(self) -> str:
+        return self.automatic_hint
+
+    @property
+    def manual_label(self) -> str | None:
+        return self.review_outcome
 
 
 @dataclass(frozen=True, slots=True)
 class CollectionResult:
     status: CollectionStatus
-    sample_id: int | None = None
+    record_id: int | None = None
+
+    @property
+    def sample_id(self) -> int | None:
+        return self.record_id
 
 
-class DatasetProtector:
+class EvidenceProtector:
     def __init__(self, key: bytes) -> None:
         if len(key) < 32:
-            raise ValueError("dataset key must contain at least 32 bytes")
-        self._encryption_key = self._derive(key, b"dataset-content")
+            raise ValueError("evidence key must contain at least 32 bytes")
+        self._encryption_key = self._derive(key, b"evidence-content")
         self._enforcement_key = self._derive(key, b"enforcement-review-content")
-        self._sender_key = self._derive(key, b"dataset-sender")
-        self._message_key = self._derive(key, b"dataset-message")
+        self._sender_key = self._derive(key, b"evidence-sender")
+        self._message_key = self._derive(key, b"evidence-message")
 
     @staticmethod
     def _derive(key: bytes, info: bytes) -> bytes:
@@ -80,22 +97,22 @@ class DatasetProtector:
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         ciphertext = AESGCM(self._encryption_key).encrypt(
-            nonce, plaintext, b"tg-pm-gatekeeper:dataset:v1"
+            nonce, plaintext, b"tg-pm-gatekeeper:evidence:v1"
         )
         return b"\x01" + nonce + ciphertext
 
     def open(self, envelope: bytes) -> dict[str, object]:
         if len(envelope) < 30 or envelope[0] != 1:
-            raise ValueError("invalid dataset envelope")
+            raise ValueError("invalid evidence envelope")
         try:
             plaintext = AESGCM(self._encryption_key).decrypt(
-                envelope[1:13], envelope[13:], b"tg-pm-gatekeeper:dataset:v1"
+                envelope[1:13], envelope[13:], b"tg-pm-gatekeeper:evidence:v1"
             )
             value = json.loads(plaintext.decode("utf-8"))
         except Exception as exc:
-            raise ValueError("invalid dataset envelope") from exc
+            raise ValueError("invalid evidence envelope") from exc
         if not isinstance(value, dict):
-            raise ValueError("invalid dataset payload")
+            raise ValueError("invalid evidence payload")
         return value
 
     def seal_enforcement(self, payload: dict[str, object]) -> bytes:
@@ -125,8 +142,8 @@ class DatasetProtector:
         return value
 
 
-class TrainingStore:
-    def __init__(self, path: Path, protector: DatasetProtector) -> None:
+class EvidenceStore:
+    def __init__(self, path: Path, protector: EvidenceProtector) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = path
         self.protector = protector
@@ -135,26 +152,31 @@ class TrainingStore:
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        if version not in {0, 1, DATASET_SCHEMA_VERSION}:
+        if self._has_legacy_dataset_schema(version):
+            self._discard_legacy_dataset_schema()
+            version = 0
+        if version not in {0, EVIDENCE_SCHEMA_VERSION}:
             self._connection.close()
-            raise ValueError(f"unsupported dataset schema version: {version}")
+            raise ValueError(f"unsupported evidence schema version: {version}")
         with self._connection:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS samples (
+                CREATE TABLE IF NOT EXISTS evidence_records (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sender_token TEXT NOT NULL,
                     message_token TEXT NOT NULL UNIQUE,
                     envelope BLOB NOT NULL,
-                    weak_label TEXT NOT NULL,
-                    manual_label TEXT,
+                    automatic_hint TEXT NOT NULL,
+                    review_outcome TEXT,
                     created_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS samples_expiry_idx ON samples(expires_at);
-                CREATE INDEX IF NOT EXISTS samples_sender_idx ON samples(sender_token);
+                CREATE INDEX IF NOT EXISTS evidence_records_expiry_idx
+                    ON evidence_records(expires_at);
+                CREATE INDEX IF NOT EXISTS evidence_records_sender_idx
+                    ON evidence_records(sender_token);
                 CREATE TABLE IF NOT EXISTS collection_stats (
                     day_start INTEGER NOT NULL,
                     outcome TEXT NOT NULL,
@@ -163,7 +185,28 @@ class TrainingStore:
                 );
                 """
             )
-            self._connection.execute(f"PRAGMA user_version={DATASET_SCHEMA_VERSION}")
+            self._connection.execute(f"PRAGMA user_version={EVIDENCE_SCHEMA_VERSION}")
+
+    def _has_legacy_dataset_schema(self, version: int) -> bool:
+        if version not in {1, 2}:
+            return False
+        row = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='samples'"
+        ).fetchone()
+        evidence = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_records'"
+        ).fetchone()
+        return row is not None and evidence is None
+
+    def _discard_legacy_dataset_schema(self) -> None:
+        with self._connection:
+            self._connection.executescript(
+                """
+                DROP TABLE IF EXISTS samples;
+                DROP TABLE IF EXISTS collection_stats;
+                PRAGMA user_version=0;
+                """
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -175,14 +218,19 @@ class TrainingStore:
         sender_id: int,
         message_id: int,
         payload: dict[str, object],
-        weak_label: str,
-        retention_days: int,
-        max_per_sender: int,
+        automatic_hint: str | None = None,
+        retention_days: int = 30,
+        max_per_sender: int = 3,
         sample_kind: Literal["content", "structural"] = "content",
         now: int | None = None,
+        weak_label: str | None = None,
     ) -> CollectionResult:
-        if weak_label not in WEAK_LABELS:
-            raise ValueError("invalid weak label")
+        if automatic_hint is None:
+            automatic_hint = weak_label
+        if automatic_hint is None:
+            raise ValueError("missing automatic hint")
+        if automatic_hint not in WEAK_LABELS:
+            raise ValueError("invalid automatic hint")
         if sample_kind not in {"content", "structural"}:
             raise ValueError("invalid sample kind")
         timestamp = int(time.time()) if now is None else now
@@ -190,28 +238,28 @@ class TrainingStore:
         message_token = self.protector.message_token(sender_id, message_id)
         with self._lock, self._connection:
             self._connection.execute(
-                "DELETE FROM samples WHERE expires_at<=?", (timestamp,)
+                "DELETE FROM evidence_records WHERE expires_at<=?", (timestamp,)
             )
             if self._connection.execute(
-                "SELECT 1 FROM samples WHERE message_token=?", (message_token,)
+                "SELECT 1 FROM evidence_records WHERE message_token=?", (message_token,)
             ).fetchone():
                 self._increment_collection_stat_locked("skipped_duplicate", timestamp)
                 return CollectionResult("duplicate")
             count = self._connection.execute(
-                "SELECT COUNT(*) FROM samples WHERE sender_token=? AND expires_at>?",
+                "SELECT COUNT(*) FROM evidence_records WHERE sender_token=? AND expires_at>?",
                 (sender_token, timestamp),
             ).fetchone()[0]
             if int(count) >= max_per_sender:
                 self._increment_collection_stat_locked("skipped_sender_cap", timestamp)
                 return CollectionResult("sender_cap")
             cursor = self._connection.execute(
-                "INSERT INTO samples(sender_token,message_token,envelope,weak_label,"
+                "INSERT INTO evidence_records(sender_token,message_token,envelope,automatic_hint,"
                 "created_at,expires_at) VALUES (?,?,?,?,?,?)",
                 (
                     sender_token,
                     message_token,
                     self.protector.seal(payload),
-                    weak_label,
+                    automatic_hint,
                     timestamp,
                     timestamp + retention_days * 86400,
                 ),
@@ -236,33 +284,36 @@ class TrainingStore:
             (day_start, outcome),
         )
 
-    def samples(self, *, limit: int = 100, offset: int = 0) -> list[TrainingSample]:
+    def records(self, *, limit: int = 100, offset: int = 0) -> list[EvidenceRecord]:
         now = int(time.time())
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id,sender_token,envelope,weak_label,manual_label,created_at,"
-                "expires_at FROM samples WHERE expires_at>? ORDER BY created_at DESC "
+                "SELECT id,sender_token,envelope,automatic_hint,review_outcome,created_at,"
+                "expires_at FROM evidence_records WHERE expires_at>? ORDER BY created_at DESC "
                 "LIMIT ? OFFSET ?",
                 (now, limit, offset),
             ).fetchall()
-        return [self._sample(row) for row in rows]
+        return [self._record(row) for row in rows]
 
-    def summaries(self, *, limit: int = 100, offset: int = 0) -> list[TrainingSample]:
+    def samples(self, *, limit: int = 100, offset: int = 0) -> list[EvidenceRecord]:
+        return self.records(limit=limit, offset=offset)
+
+    def summaries(self, *, limit: int = 100, offset: int = 0) -> list[EvidenceRecord]:
         now = int(time.time())
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id,sender_token,weak_label,manual_label,created_at,expires_at "
-                "FROM samples WHERE expires_at>? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                "SELECT id,sender_token,automatic_hint,review_outcome,created_at,expires_at "
+                "FROM evidence_records WHERE expires_at>? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (now, limit, offset),
             ).fetchall()
         return [
-            TrainingSample(
+            EvidenceRecord(
                 id=int(row["id"]),
                 sender_token=str(row["sender_token"]),
                 payload={},
-                weak_label=str(row["weak_label"]),
-                manual_label=(
-                    str(row["manual_label"]) if row["manual_label"] else None
+                automatic_hint=str(row["automatic_hint"]),
+                review_outcome=(
+                    str(row["review_outcome"]) if row["review_outcome"] else None
                 ),
                 created_at=int(row["created_at"]),
                 expires_at=int(row["expires_at"]),
@@ -270,67 +321,83 @@ class TrainingStore:
             for row in rows
         ]
 
-    def sample(self, sample_id: int) -> TrainingSample | None:
+    def record(self, record_id: int) -> EvidenceRecord | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT id,sender_token,envelope,weak_label,manual_label,created_at,"
-                "expires_at FROM samples WHERE id=? AND expires_at>?",
-                (sample_id, int(time.time())),
+                "SELECT id,sender_token,envelope,automatic_hint,review_outcome,created_at,"
+                "expires_at FROM evidence_records WHERE id=? AND expires_at>?",
+                (record_id, int(time.time())),
             ).fetchone()
-        return self._sample(row) if row else None
+        return self._record(row) if row else None
 
-    def _sample(self, row: sqlite3.Row) -> TrainingSample:
-        return TrainingSample(
+    def sample(self, sample_id: int) -> EvidenceRecord | None:
+        return self.record(sample_id)
+
+    def _record(self, row: sqlite3.Row) -> EvidenceRecord:
+        return EvidenceRecord(
             id=int(row["id"]),
             sender_token=str(row["sender_token"]),
             payload=self.protector.open(bytes(row["envelope"])),
-            weak_label=str(row["weak_label"]),
-            manual_label=(str(row["manual_label"]) if row["manual_label"] else None),
+            automatic_hint=str(row["automatic_hint"]),
+            review_outcome=(
+                str(row["review_outcome"]) if row["review_outcome"] else None
+            ),
             created_at=int(row["created_at"]),
             expires_at=int(row["expires_at"]),
         )
 
-    def label(self, sample_id: int, label: str) -> bool:
-        if label not in MANUAL_LABELS:
-            raise ValueError("invalid manual label")
+    def review(self, record_id: int, outcome: str) -> bool:
+        outcome = LEGACY_REVIEW_OUTCOME_MAP.get(outcome, outcome)
+        if outcome not in REVIEW_OUTCOMES:
+            raise ValueError("invalid review outcome")
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "UPDATE samples SET manual_label=? WHERE id=? AND expires_at>?",
-                (label, sample_id, int(time.time())),
+                "UPDATE evidence_records SET review_outcome=? WHERE id=? AND expires_at>?",
+                (outcome, record_id, int(time.time())),
             )
         return cursor.rowcount == 1
 
-    def update_sample_outcome(
-        self, sample_id: int, *, weak_label: str, actual_action: str
+    def label(self, sample_id: int, label: str) -> bool:
+        return self.review(sample_id, label)
+
+    def update_record_action(
+        self, record_id: int, *, automatic_hint: str, actual_action: str
     ) -> bool:
-        if weak_label not in WEAK_LABELS:
-            raise ValueError("invalid weak label")
+        if automatic_hint not in WEAK_LABELS:
+            raise ValueError("invalid automatic hint")
         now = int(time.time())
         with self._lock, self._connection:
             row = self._connection.execute(
-                "SELECT envelope FROM samples WHERE id=? AND expires_at>?",
-                (sample_id, now),
+                "SELECT envelope FROM evidence_records WHERE id=? AND expires_at>?",
+                (record_id, now),
             ).fetchone()
             if row is None:
                 return False
             payload = self.protector.open(bytes(row["envelope"]))
             payload["actual_action"] = actual_action
             self._connection.execute(
-                "UPDATE samples SET envelope=?,weak_label=? WHERE id=?",
-                (self.protector.seal(payload), weak_label, sample_id),
+                "UPDATE evidence_records SET envelope=?,automatic_hint=? WHERE id=?",
+                (self.protector.seal(payload), automatic_hint, record_id),
             )
         return True
 
-    def finalize_challenged_sample(
-        self, sender_id: int, *, weak_label: str, actual_action: str
+    def update_sample_outcome(
+        self, sample_id: int, *, weak_label: str, actual_action: str
     ) -> bool:
-        if weak_label not in WEAK_LABELS:
-            raise ValueError("invalid weak label")
+        return self.update_record_action(
+            sample_id, automatic_hint=weak_label, actual_action=actual_action
+        )
+
+    def finalize_challenged_record(
+        self, sender_id: int, *, automatic_hint: str, actual_action: str
+    ) -> bool:
+        if automatic_hint not in WEAK_LABELS:
+            raise ValueError("invalid automatic hint")
         token = self.protector.sender_token(sender_id)
         now = int(time.time())
         with self._lock, self._connection:
             rows = self._connection.execute(
-                "SELECT id,envelope FROM samples WHERE sender_token=? AND expires_at>? "
+                "SELECT id,envelope FROM evidence_records WHERE sender_token=? AND expires_at>? "
                 "ORDER BY created_at DESC,id DESC",
                 (token, now),
             ).fetchall()
@@ -340,29 +407,36 @@ class TrainingStore:
                     continue
                 payload["actual_action"] = actual_action
                 self._connection.execute(
-                    "UPDATE samples SET envelope=?,weak_label=? WHERE id=?",
-                    (self.protector.seal(payload), weak_label, row["id"]),
+                    "UPDATE evidence_records SET envelope=?,automatic_hint=? WHERE id=?",
+                    (self.protector.seal(payload), automatic_hint, row["id"]),
                 )
                 return True
         return False
 
-    def delete(self, sample_id: int) -> bool:
+    def finalize_challenged_sample(
+        self, sender_id: int, *, weak_label: str, actual_action: str
+    ) -> bool:
+        return self.finalize_challenged_record(
+            sender_id, automatic_hint=weak_label, actual_action=actual_action
+        )
+
+    def delete(self, record_id: int) -> bool:
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "DELETE FROM samples WHERE id=?", (sample_id,)
+                "DELETE FROM evidence_records WHERE id=?", (record_id,)
             )
         return cursor.rowcount == 1
 
     def purge(self) -> int:
         with self._lock, self._connection:
-            cursor = self._connection.execute("DELETE FROM samples")
+            cursor = self._connection.execute("DELETE FROM evidence_records")
         return cursor.rowcount
 
     def prune(self, now: int | None = None, *, retention_days: int = 30) -> int:
         timestamp = int(time.time()) if now is None else now
         with self._lock, self._connection:
             cursor = self._connection.execute(
-                "DELETE FROM samples WHERE expires_at<=?", (timestamp,)
+                "DELETE FROM evidence_records WHERE expires_at<=?", (timestamp,)
             )
             cutoff_day = self._collection_cutoff_day(timestamp, retention_days)
             self._connection.execute(
@@ -381,17 +455,17 @@ class TrainingStore:
         timestamp = int(time.time()) if now is None else now
         with self._lock:
             rows = self._connection.execute(
-                "SELECT COALESCE(manual_label,'unlabeled') AS label, COUNT(*) AS count "
-                "FROM samples WHERE expires_at>? GROUP BY label",
+                "SELECT COALESCE(review_outcome,'unreviewed') AS label, COUNT(*) AS count "
+                "FROM evidence_records WHERE expires_at>? GROUP BY label",
                 (timestamp,),
             ).fetchall()
             weak = self._connection.execute(
-                "SELECT weak_label,COUNT(*) AS count FROM samples WHERE expires_at>? "
-                "GROUP BY weak_label",
+                "SELECT automatic_hint,COUNT(*) AS count FROM evidence_records WHERE expires_at>? "
+                "GROUP BY automatic_hint",
                 (timestamp,),
             ).fetchall()
             expiring = self._connection.execute(
-                "SELECT COUNT(*) FROM samples WHERE expires_at>? AND expires_at<=?",
+                "SELECT COUNT(*) FROM evidence_records WHERE expires_at>? AND expires_at<=?",
                 (timestamp, timestamp + 86400),
             ).fetchone()[0]
             collection = self._connection.execute(
@@ -400,44 +474,17 @@ class TrainingStore:
                 (self._collection_cutoff_day(timestamp, retention_days),),
             ).fetchall()
         result = {str(row["label"]): int(row["count"]) for row in rows}
-        result.update({f"weak_{row['weak_label']}": int(row["count"]) for row in weak})
+        result.update(
+            {f"hint_{row['automatic_hint']}": int(row["count"]) for row in weak}
+        )
+        result.setdefault("unreviewed", 0)
+        for outcome in REVIEW_OUTCOMES:
+            result.setdefault(outcome, 0)
         result["total"] = sum(int(row["count"]) for row in rows)
         result["expiring_24h"] = int(expiring)
-        result["exportable_gold"] = result.get("spam", 0) + result.get("legitimate", 0)
         result.update(
             {f"collection_{row['outcome']}": int(row["count"]) for row in collection}
         )
         for outcome in COLLECTION_OUTCOMES:
             result.setdefault(f"collection_{outcome}", 0)
         return result
-
-    def export(self, path: Path, *, include_weak: bool = False) -> int:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        descriptor = os.open(path, flags, 0o600)
-        count = 0
-        groups: dict[str, str] = {}
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-                for sample in reversed(self.samples(limit=1_000_000)):
-                    label = sample.manual_label
-                    label_source = "manual"
-                    if label not in {"spam", "legitimate"}:
-                        if not include_weak:
-                            continue
-                        label = sample.weak_label
-                        label_source = "weak"
-                    group = groups.setdefault(
-                        sample.sender_token, f"sender-{len(groups) + 1:06d}"
-                    )
-                    row = {
-                        **sample.payload,
-                        "label": label,
-                        "label_source": label_source,
-                        "sender_group": group,
-                    }
-                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    count += 1
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
-        return count

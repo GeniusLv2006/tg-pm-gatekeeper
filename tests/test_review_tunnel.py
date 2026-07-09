@@ -12,7 +12,8 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "review-tunnel.sh"
+SCRIPT = Path(__file__).parents[1] / "scripts" / "dashboard-tunnel.sh"
+LEGACY_SCRIPT = Path(__file__).parents[1] / "scripts" / "review-tunnel.sh"
 
 
 class ReviewTunnelTests(unittest.TestCase):
@@ -23,6 +24,10 @@ class ReviewTunnelTests(unittest.TestCase):
             "TG_REVIEW_PORT",
             "TG_REVIEW_SOCKET",
             "TG_REVIEW_SSH_CONFIG",
+            "TG_DASHBOARD_HOST",
+            "TG_DASHBOARD_PORT",
+            "TG_DASHBOARD_SOCKET",
+            "TG_DASHBOARD_SSH_CONFIG",
         ):
             environment.pop(name, None)
         return subprocess.run(
@@ -37,9 +42,21 @@ class ReviewTunnelTests(unittest.TestCase):
         result = self.run_script("-h")
         self.assertEqual(result.returncode, 0)
         self.assertIn("SSH_TARGET", result.stdout)
-        self.assertIn("TG_REVIEW_HOST", result.stdout)
+        self.assertIn("TG_DASHBOARD_HOST", result.stdout)
+        self.assertIn("TG_REVIEW_*", result.stdout)
         self.assertIn("-o", result.stdout)
         self.assertNotIn("bv", result.stdout)
+
+    def test_legacy_wrapper_delegates_with_deprecation_notice(self) -> None:
+        result = subprocess.run(
+            [str(LEGACY_SCRIPT), "-h"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("dashboard-tunnel.sh", result.stdout)
+        self.assertIn("deprecated", result.stderr)
 
     def test_open_option_launches_default_browser(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -54,7 +71,7 @@ class ReviewTunnelTests(unittest.TestCase):
                 'case "$*" in *"cat /var/lib/tg-pm-gatekeeper/review.access-token"*) '
                 "echo test-access-token; exit 0;; esac\n"
                 'echo $$ > "$FAKE_SSH_PID"\n'
-                "sleep 0.3\n",
+                "sleep 1\n",
                 encoding="utf-8",
             )
             fake_curl.write_text(

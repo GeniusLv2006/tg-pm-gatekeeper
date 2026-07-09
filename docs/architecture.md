@@ -97,7 +97,7 @@ jobs.
 
 ## Post-event review
 
-The running process serves a small review dashboard on an owner-only Unix socket. The socket is not
+The running process serves a small Operations Dashboard on an owner-only Unix socket. The socket is not
 published by Docker and is intended to be reached only through SSH local forwarding. This keeps the
 live Telethon client as the only Telegram connection and avoids exposing an administrative TCP
 service.
@@ -124,16 +124,17 @@ Deleting a conversation in Telegram does not itself update the local queue. If t
 message is no longer available, the detail page still exposes a resolve-only action that dismisses
 the local review and erases its reference without changing sender state.
 
-Protect-mode terminal states have a separate **Active enforcement** surface. The service captures
-the original triggering text/caption and Telegram-provided quote before a challenge begins, encrypts
-it with the enforcement-review key, and exposes it only after the sender becomes quarantined or
-suppressed. A correct answer, challenge rollback, manual allowance, or suppression expiry erases the
-snapshot. Other snapshots expire after the configured review retention, capped at seven days.
-Allowing a sender first restores the saved Telegram folder and notification settings; failure leaves
-both policy state and snapshot unchanged. Keeping the restriction is an explicit no-op.
-Summary metrics count all active local states, while the case table includes only unexpired encrypted
-snapshots. Older states without snapshots remain visible as an unavailable count and derive a reason
-from historical verdicts when possible.
+Protect-mode terminal states have a separate **Active Cases** surface. The service captures the
+original triggering text/caption, Telegram-provided quote and preview, button text, full URLs,
+normalized domains, URL shape, and detector evidence before a challenge begins, encrypts it with the
+active-case review key, and exposes it only after the sender becomes quarantined or suppressed. A
+correct answer, challenge rollback, manual allowance, or suppression expiry erases the snapshot.
+Other snapshots expire after the configured review retention, capped at seven days. Allowing a
+sender first restores the saved Telegram folder and notification settings; failure leaves both
+policy state and snapshot unchanged. Keeping the restriction records an operator decision and
+changes nothing. Summary metrics count all active local states, while the case table includes only
+unexpired encrypted snapshots. Older states without snapshots remain visible as an unavailable count
+and derive a reason from historical verdicts when possible.
 
 ## Implemented action policy
 
@@ -187,23 +188,27 @@ including these envelopes, must not be included in general backups.
 The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
 authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.
 
-Optional training samples live in a separate owner-only `training.sqlite3`. Eligible unknown-sender
+Optional evidence records live in a separate owner-only `evidence.sqlite3`. Eligible unknown-sender
 messages contain text/captions, Telegram-provided quoted or webpage-preview text, or a detector
-signal. Those values, up to three normalized message-side and quoted domains, aggregate URL-shape
-features, and structural features are encrypted with AES-256-GCM under an independent dataset key.
-Full URLs, path text, query values, fragment values, media, names, usernames, raw IDs, access hashes,
-and the dedicated test sender are excluded. Dataset-key-derived HMAC tokens enforce per-sender and
-per-message limits without storing raw identities. The limit is three unexpired independent samples
-by default, not a rolling latest-three window. Samples expire after 30 days by default and no later
-than 90 days. New payloads declare schema version 3; old version 1 and 2 payloads remain readable.
-The database schema version 2 also stores UTC-day collection outcome counts without sender or
-message identifiers and prunes them on the configured sample-retention window. This release does
-not train or run a model.
+signal. Those values, button display text, full URLs, normalized message-side and quoted domains,
+Telegram link kind, aggregate URL-shape features, structural features, detector signals, and
+planned/actual action are encrypted with AES-256-GCM under an independent evidence key. Webpage
+bodies, media, names, usernames, raw IDs, access hashes, and the dedicated test sender are excluded.
+Evidence-key-derived HMAC tokens enforce per-sender and per-message limits without storing raw
+identities. The limit is three unexpired independent records by default, not a rolling latest-three
+window. Records expire after seven days by default and no later than 90 days. UTC-day collection
+outcome counts contain no sender or message identifiers and are pruned on the configured evidence
+retention window. This release does not train or run a model and does not provide plaintext export.
 
-The dataset secret also derives a distinct `enforcement-review-content` AES-256-GCM key through HKDF.
-Training and enforcement envelopes use separate keys, authenticated-data strings, lifetimes, and
-tables. An enforcement snapshot includes the original trigger and quoted context, but never
-verification answers or media.
+Old Dataset `training.sqlite3` tables are intentionally not decrypted or migrated. If such a file is
+opened as the configured evidence database, the legacy Dataset tables are discarded and a fresh
+Evidence schema is created.
+
+The evidence secret also derives a distinct `enforcement-review-content` AES-256-GCM key through
+HKDF. Evidence-log and active-case envelopes use separate keys, authenticated-data strings,
+lifetimes, and tables. An active-case snapshot includes the original trigger, quoted context,
+Telegram preview text, button text, full URLs, normalized domains, URL shape, and detector evidence,
+but never verification answers, webpage bodies, or media.
 
 ## Failure behavior
 

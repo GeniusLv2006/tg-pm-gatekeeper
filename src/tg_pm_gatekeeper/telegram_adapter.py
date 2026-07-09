@@ -14,7 +14,7 @@ from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 
 from .config import ConfigurationError, Settings, read_private_file
-from .dataset import TrainingStore
+from .evidence import EvidenceStore
 from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
 from .service import (
@@ -128,21 +128,29 @@ def facts_from_message(message: types.Message) -> MessageFacts:
     has_link_button = False
     link_button_count = 0
     has_any_button = False
+    button_texts: set[str] = set()
+    button_urls: set[str] = set()
     markup = message.reply_markup
     for row in getattr(markup, "rows", ()) or ():
         for button in getattr(row, "buttons", ()) or ():
             has_any_button = True
+            text_value = getattr(button, "text", None)
+            if isinstance(text_value, str) and text_value.strip():
+                button_texts.add(text_value.strip())
             if isinstance(button, LINK_BUTTON_TYPES):
                 has_link_button = True
                 link_button_count += 1
                 url = getattr(button, "url", None)
                 if url:
                     urls.add(url)
+                    button_urls.add(url)
 
     webpage = getattr(message.media, "webpage", None)
     webpage_url = getattr(webpage, "url", None)
+    preview_urls: set[str] = set()
     if webpage_url:
         urls.add(webpage_url)
+        preview_urls.add(webpage_url)
     preview_text = "\n".join(
         value
         for attribute in ("site_name", "title", "description", "author")
@@ -160,6 +168,9 @@ def facts_from_message(message: types.Message) -> MessageFacts:
         quote_text=quote_text,
         urls=tuple(sorted(urls)),
         domains=domains,
+        button_texts=tuple(sorted(button_texts)),
+        button_urls=tuple(sorted(button_urls)),
+        preview_urls=tuple(sorted(preview_urls)),
         quote_urls=tuple(sorted(quote_urls)),
         quote_domains=quote_domains,
         has_link_button=has_link_button,
@@ -371,12 +382,12 @@ class TelegramAdapter:
         store: StateStore,
         service: GatekeeperService,
         *,
-        training_store: TrainingStore | None = None,
+        evidence_store: EvidenceStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.service = service
-        self.training_store = training_store
+        self.evidence_store = evidence_store
         session = read_private_file(
             settings.session_file, minimum_bytes=64, strip=True
         ).decode("ascii")
@@ -398,10 +409,10 @@ class TelegramAdapter:
             self.client,
             mute_days=settings.mute_days,
             cancel_timeout=self.cancel_timeout,
-            training_store=training_store,
-            dataset_collection=settings.dataset_collection,
-            dataset_retention_days=settings.dataset_retention_days,
-            dataset_max_messages_per_sender=settings.dataset_max_messages_per_sender,
+            evidence_store=evidence_store,
+            evidence_collection=settings.evidence_collection,
+            evidence_retention_days=settings.evidence_retention_days,
+            evidence_max_records_per_sender=settings.evidence_max_records_per_sender,
         )
 
     async def run(self) -> None:
@@ -438,9 +449,9 @@ class TelegramAdapter:
             write_runtime_heartbeat(HEARTBEAT_PATH, now)
             if now >= next_prune:
                 self.store.prune(self.settings.audit_retention_days, now)
-                if self.training_store is not None:
-                    self.training_store.prune(
-                        now, retention_days=self.settings.dataset_retention_days
+                if self.evidence_store is not None:
+                    self.evidence_store.prune(
+                        now, retention_days=self.settings.evidence_retention_days
                     )
                 next_prune = now + PRUNE_INTERVAL_SECONDS
             await asyncio.sleep(60)
