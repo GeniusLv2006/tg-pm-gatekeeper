@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import tempfile
@@ -11,15 +10,15 @@ import time
 import unittest
 from pathlib import Path
 
-from tg_pm_gatekeeper.dataset import DatasetProtector, TrainingStore
+from tg_pm_gatekeeper.evidence import EvidenceProtector, EvidenceStore
 
 
-class DatasetTests(unittest.TestCase):
+class EvidenceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.path = Path(self.temp.name) / "training.sqlite3"
-        self.protector = DatasetProtector(b"d" * 32)
-        self.store = TrainingStore(self.path, self.protector)
+        self.path = Path(self.temp.name) / "evidence.sqlite3"
+        self.protector = EvidenceProtector(b"d" * 32)
+        self.store = EvidenceStore(self.path, self.protector)
         self.now = int(time.time())
 
     def tearDown(self) -> None:
@@ -32,45 +31,57 @@ class DatasetTests(unittest.TestCase):
             message_id=message_id,
             payload={
                 "text": f"private-canary-{message_id}",
+                "button_texts": ["Open private offer"],
+                "urls": [
+                    {
+                        "url": "https://example.invalid/private/path?token=secret",
+                        "kind": "external_web",
+                        "sources": ["message"],
+                    }
+                ],
                 "features": {"has_link": True},
                 "signals": ["HR-03_PROMOTION_WITH_LINK"],
                 "policy_version": "rules-v2",
             },
-            weak_label="uncertain",
-            retention_days=30,
+            automatic_hint="uncertain",
+            retention_days=7,
             max_per_sender=3,
             now=self.now,
-        ).sample_id
+        ).record_id
 
     def test_content_is_encrypted_and_file_is_private(self) -> None:
-        sample_id = self.collect(1)
-        self.assertIsNotNone(sample_id)
-        self.assertEqual(
-            self.store.sample(sample_id).payload["text"], "private-canary-1"
-        )
-        self.assertNotIn(b"private-canary-1", self.path.read_bytes())
+        record_id = self.collect(1)
+        self.assertIsNotNone(record_id)
+        record = self.store.record(record_id)
+        self.assertEqual(record.payload["text"], "private-canary-1")
+        self.assertEqual(record.payload["button_texts"], ["Open private offer"])
+        self.assertIn("private/path", record.payload["urls"][0]["url"])
+        database = self.path.read_bytes()
+        self.assertNotIn(b"private-canary-1", database)
+        self.assertNotIn(b"Open private offer", database)
+        self.assertNotIn(b"https://example.invalid", database)
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
     def test_tampered_or_wrong_key_is_rejected(self) -> None:
-        sample_id = self.collect(1)
-        wrong_key_store = TrainingStore(self.path, DatasetProtector(b"w" * 32))
+        record_id = self.collect(1)
+        wrong_key_store = EvidenceStore(self.path, EvidenceProtector(b"w" * 32))
         try:
             with self.assertRaises(ValueError):
-                wrong_key_store.sample(sample_id)
+                wrong_key_store.record(record_id)
         finally:
             wrong_key_store.close()
         envelope = bytes(
             self.store._connection.execute(
-                "SELECT envelope FROM samples WHERE id=?", (sample_id,)
+                "SELECT envelope FROM evidence_records WHERE id=?", (record_id,)
             ).fetchone()[0]
         )
         self.store._connection.execute(
-            "UPDATE samples SET envelope=? WHERE id=?",
-            (envelope[:-1] + bytes([envelope[-1] ^ 1]), sample_id),
+            "UPDATE evidence_records SET envelope=? WHERE id=?",
+            (envelope[:-1] + bytes([envelope[-1] ^ 1]), record_id),
         )
         self.store._connection.commit()
         with self.assertRaises(ValueError):
-            self.store.sample(sample_id)
+            self.store.record(record_id)
 
     def test_enforcement_content_uses_an_independent_authenticated_envelope(self) -> None:
         payload = {"text": "review-canary", "quote_text": "quoted-canary"}
@@ -79,7 +90,7 @@ class DatasetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.protector.open(envelope)
         with self.assertRaises(ValueError):
-            DatasetProtector(b"w" * 32).open_enforcement(envelope)
+            EvidenceProtector(b"w" * 32).open_enforcement(envelope)
         with self.assertRaises(ValueError):
             self.protector.open_enforcement(
                 envelope[:-1] + bytes([envelope[-1] ^ 1])
@@ -91,8 +102,8 @@ class DatasetTests(unittest.TestCase):
         connection.execute("PRAGMA user_version=99")
         connection.close()
 
-        with self.assertRaisesRegex(ValueError, "unsupported dataset schema"):
-            TrainingStore(alternate, self.protector)
+        with self.assertRaisesRegex(ValueError, "unsupported evidence schema"):
+            EvidenceStore(alternate, self.protector)
 
     def test_per_sender_limit_deduplication_and_expiry(self) -> None:
         self.assertIsNotNone(self.collect(1))
@@ -100,78 +111,57 @@ class DatasetTests(unittest.TestCase):
         self.assertIsNotNone(self.collect(2))
         self.assertIsNotNone(self.collect(3))
         self.assertIsNone(self.collect(4))
-        self.assertEqual(self.store.prune(now=self.now + 30 * 86400), 3)
+        self.assertEqual(self.store.prune(now=self.now + 7 * 86400), 3)
 
-    def test_label_export_and_purge(self) -> None:
+    def test_review_outcome_and_purge(self) -> None:
         first = self.collect(1)
         second = self.collect(2, sender_id=456)
-        self.assertTrue(self.store.label(first, "spam"))
-        output = Path(self.temp.name) / "samples.jsonl"
-        self.assertEqual(self.store.export(output), 1)
-        row = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(row["label"], "spam")
-        self.assertEqual(row["label_source"], "manual")
-        self.assertEqual(row["sender_group"], "sender-000001")
-        self.assertNotIn("sender_token", row)
-        self.assertNotIn("message_id", row)
-        self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
-        with self.assertRaises(FileExistsError):
-            self.store.export(output)
+        self.assertTrue(self.store.review(first, "correct"))
+        self.assertEqual(self.store.record(first).review_outcome, "correct")
+        self.assertEqual(self.store.statistics()["correct"], 1)
         self.assertEqual(self.store.purge(), 2)
-        self.assertIsNone(self.store.sample(second))
+        self.assertIsNone(self.store.record(second))
 
-    def test_terminal_outcome_reencrypts_payload_and_updates_weak_label(self) -> None:
-        sample_id = self.collect(1)
+    def test_terminal_action_reencrypts_payload_and_updates_automatic_hint(self) -> None:
+        record_id = self.collect(1)
         self.assertTrue(
-            self.store.update_sample_outcome(
-                sample_id,
-                weak_label="legitimate_candidate",
+            self.store.update_record_action(
+                record_id,
+                automatic_hint="legitimate_candidate",
                 actual_action="provisional",
             )
         )
-        sample = self.store.sample(sample_id)
-        self.assertEqual(sample.weak_label, "legitimate_candidate")
-        self.assertEqual(sample.payload["actual_action"], "provisional")
+        record = self.store.record(record_id)
+        self.assertEqual(record.automatic_hint, "legitimate_candidate")
+        self.assertEqual(record.payload["actual_action"], "provisional")
         self.assertNotIn(b"provisional", self.path.read_bytes())
 
-    def test_finalize_updates_only_latest_challenged_sample(self) -> None:
+    def test_finalize_updates_only_latest_challenged_record(self) -> None:
         first = self.collect(1)
         second = self.collect(2)
-        self.store.update_sample_outcome(
-            first, weak_label="uncertain", actual_action="would_challenge"
+        self.store.update_record_action(
+            first, automatic_hint="uncertain", actual_action="would_challenge"
         )
-        self.store.update_sample_outcome(
-            second, weak_label="uncertain", actual_action="challenged"
+        self.store.update_record_action(
+            second, automatic_hint="uncertain", actual_action="challenged"
         )
 
         self.assertTrue(
-            self.store.finalize_challenged_sample(
-                123, weak_label="legitimate_candidate", actual_action="provisional"
+            self.store.finalize_challenged_record(
+                123,
+                automatic_hint="legitimate_candidate",
+                actual_action="provisional",
             )
         )
         self.assertEqual(
-            self.store.sample(first).payload["actual_action"], "would_challenge"
+            self.store.record(first).payload["actual_action"], "would_challenge"
         )
         self.assertEqual(
-            self.store.sample(second).payload["actual_action"], "provisional"
+            self.store.record(second).payload["actual_action"], "provisional"
         )
         self.assertFalse(
-            self.store.finalize_challenged_sample(
-                123, weak_label="spam_candidate", actual_action="suppressed"
-            )
-        )
-
-        expired = self.collect(3)
-        self.store.update_sample_outcome(
-            expired, weak_label="uncertain", actual_action="challenged"
-        )
-        self.store._connection.execute(
-            "UPDATE samples SET expires_at=0 WHERE id=?", (expired,)
-        )
-        self.store._connection.commit()
-        self.assertFalse(
-            self.store.finalize_challenged_sample(
-                123, weak_label="spam_candidate", actual_action="suppressed"
+            self.store.finalize_challenged_record(
+                123, automatic_hint="spam_candidate", actual_action="suppressed"
             )
         )
 
@@ -185,24 +175,24 @@ class DatasetTests(unittest.TestCase):
         self.store.collect(
             sender_id=456,
             message_id=1,
-            payload={"schema_version": 3, "text": "", "signals": ["HR-02"]},
-            weak_label="uncertain",
-            retention_days=30,
+            payload={"schema_version": 1, "text": "", "signals": ["HR-02"]},
+            automatic_hint="uncertain",
+            retention_days=7,
             max_per_sender=3,
             sample_kind="structural",
             now=self.now,
         )
 
-        stats = self.store.statistics(retention_days=30, now=self.now)
+        stats = self.store.statistics(retention_days=7, now=self.now)
         self.assertEqual(stats["collection_collected_content"], 3)
         self.assertEqual(stats["collection_collected_structural"], 1)
         self.assertEqual(stats["collection_skipped_duplicate"], 1)
         self.assertEqual(stats["collection_skipped_sender_cap"], 1)
         self.assertEqual(stats["collection_skipped_no_signal"], 1)
 
-        later = self.now + 31 * 86400
-        self.store.prune(later, retention_days=30)
-        stats = self.store.statistics(retention_days=30, now=later)
+        later = self.now + 8 * 86400
+        self.store.prune(later, retention_days=7)
+        stats = self.store.statistics(retention_days=7, now=later)
         self.assertEqual(stats["collection_collected_content"], 0)
         self.assertEqual(
             self.store._connection.execute(
@@ -211,8 +201,8 @@ class DatasetTests(unittest.TestCase):
             0,
         )
 
-    def test_v1_database_migrates_without_rewriting_samples(self) -> None:
-        legacy_path = Path(self.temp.name) / "legacy.sqlite3"
+    def test_legacy_dataset_database_is_discarded_without_migration(self) -> None:
+        legacy_path = Path(self.temp.name) / "legacy-training.sqlite3"
         envelope = self.protector.seal({"schema_version": 2, "text": "legacy"})
         connection = sqlite3.connect(legacy_path)
         connection.executescript(
@@ -238,24 +228,16 @@ class DatasetTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
-        migrated = TrainingStore(legacy_path, self.protector)
+        migrated = EvidenceStore(legacy_path, self.protector)
         try:
             self.assertEqual(
-                migrated._connection.execute("PRAGMA user_version").fetchone()[0], 2
+                migrated._connection.execute("PRAGMA user_version").fetchone()[0], 1
             )
-            self.assertEqual(migrated.sample(1).payload["text"], "legacy")
-            self.assertTrue(migrated.label(1, "legitimate"))
-            export_path = Path(self.temp.name) / "legacy.jsonl"
-            self.assertEqual(migrated.export(export_path), 1)
-            self.assertEqual(
-                json.loads(export_path.read_text(encoding="utf-8"))["schema_version"],
-                2,
-            )
-            self.assertEqual(
+            self.assertEqual(migrated.statistics()["total"], 0)
+            self.assertIsNone(
                 migrated._connection.execute(
-                    "SELECT COUNT(*) FROM collection_stats"
-                ).fetchone()[0],
-                0,
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='samples'"
+                ).fetchone()
             )
         finally:
             migrated.close()

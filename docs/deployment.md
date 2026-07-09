@@ -47,13 +47,13 @@ them:
 
 - `telegram.session.secret`: the Telegram authorization session;
 - `hmac.key`: sender-identity and review-reference protection;
-- `dataset.key`: independent optional-dataset encryption;
+- `evidence.key`: independent Evidence Log encryption;
 - `config.env`: environment entries consumed by Compose; and
 - `deny-domains.txt`: one normalized denied domain per line.
 
-The files initially use mode `0600`. Never print, commit, or share their contents. The dataset key is
-required at startup even while collection is disabled. It protects optional training samples and
-derives a separate enforcement-review content key; neither purpose reuses the state HMAC key. See
+The files initially use mode `0600`. Never print, commit, or share their contents. The evidence key
+is required at startup even while collection is disabled. It protects short-lived evidence records
+and derives a separate active-case content key; neither purpose reuses the state HMAC key. See
 [the example denylist](../deny-domains.example.txt) for the accepted format.
 
 ### Prepare the host
@@ -75,8 +75,8 @@ Transfer the generated files to temporary root-only locations, install them with
 ownership, and remove the temporary copies:
 
 ```shell
-scp telegram.session.secret hmac.key dataset.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
-ssh "$DEPLOY_HOST" 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o 10001 -g 10001 -m 0600 /tmp/dataset.key /etc/tg-pm-gatekeeper/dataset.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/dataset.key /tmp/config.env /tmp/deny-domains.txt'
+scp telegram.session.secret hmac.key evidence.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
+ssh "$DEPLOY_HOST" 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o 10001 -g 10001 -m 0600 /tmp/evidence.key /etc/tg-pm-gatekeeper/evidence.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/evidence.key /tmp/config.env /tmp/deny-domains.txt'
 ```
 
 Do not include these files in a general server backup job.
@@ -96,7 +96,7 @@ Check health, mode, and redacted status explicitly:
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
 ```
 
-Open the [review dashboard](#review-dashboard), exercise the intended rules with a dedicated account,
+Open the [Operations Dashboard](#operations-dashboard), exercise the intended rules with a dedicated account,
 and verify the [deployment boundary](#verify-the-boundary). Enable protection only after those checks:
 
 ```shell
@@ -148,7 +148,7 @@ database for diagnosis and restore the backup together with the prior image.
 
 `scripts/initialize.py` writes the production defaults. [.env.example](../.env.example) is the public
 reference. Compose overrides the fixed container paths for the state database, session, keys,
-dataset, and denylist; host files remain under `/etc/tg-pm-gatekeeper` and
+evidence store, and denylist; host files remain under `/etc/tg-pm-gatekeeper` and
 `/var/lib/tg-pm-gatekeeper`.
 
 | Setting | Default | Constraint or purpose |
@@ -158,11 +158,11 @@ dataset, and denylist; host files remain under `/etc/tg-pm-gatekeeper` and
 | `TG_OUTBOUND_LIMIT_PER_HOUR` | `10` | 1–100 Gatekeeper messages per hour |
 | `TG_AUDIT_RETENTION_DAYS` | `30` | Positive number of days |
 | `TG_REVIEW_RETENTION_DAYS` | `7` | Positive; runtime hard-caps it at 7 days |
-| `TG_REVIEW_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only server Unix socket |
+| `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only server Unix socket |
 | `TG_MUTE_DAYS` | `3650` | Positive quarantine mute duration |
-| `TG_DATASET_COLLECTION` | `off` | `on` or `off` |
-| `TG_DATASET_RETENTION_DAYS` | `30` | 1–90 days |
-| `TG_DATASET_MAX_MESSAGES_PER_SENDER` | `3` | 1–10 unexpired samples; not a rolling window |
+| `TG_EVIDENCE_COLLECTION` | `off` | `on` or `off`; legacy `TG_DATASET_COLLECTION` is accepted for one release |
+| `TG_EVIDENCE_RETENTION_DAYS` | `7` | 1–90 days |
+| `TG_EVIDENCE_MAX_RECORDS_PER_SENDER` | `3` | 1–10 unexpired records; not a rolling window |
 | `TG_TEST_SENDER_ID` | empty | Positive ID of a dedicated test account only |
 
 Changing private configuration requires recreating the container. Invalid bounded settings stop
@@ -182,41 +182,44 @@ This setting deliberately performs Telegram actions even in `monitor`, bypasses 
 quota, and can delete the dedicated test dialog after exhausted attempts. Never use a real
 correspondent. Remove the value when testing is complete.
 
-### Optional encrypted dataset
+### Optional encrypted Evidence Log
 
-Collection is disabled by default. To retain eligible text/captions, Telegram-provided quoted or
-webpage-preview text, detector-signal-only structural samples, normalized domains, and aggregate
-URL-shape features from at most three unexpired messages per anonymous unknown sender for 30 days:
+Collection is disabled by default. To retain eligible short-lived review evidence from at most three
+unexpired records per anonymous unknown sender for seven days:
 
 ```shell
-TG_DATASET_COLLECTION=on
-TG_DATASET_RETENTION_DAYS=30
-TG_DATASET_MAX_MESSAGES_PER_SENDER=3
+TG_EVIDENCE_COLLECTION=on
+TG_EVIDENCE_RETENTION_DAYS=7
+TG_EVIDENCE_MAX_RECORDS_PER_SENDER=3
 ```
 
-After the cap is reached, later samples are ignored until one expires or is deleted; existing rows
+Eligible evidence includes text/caption, Telegram-provided quoted or webpage-preview text, detector
+signal-only structural records, button display text, full URLs, normalized domains, Telegram link
+kind, aggregate URL shape, detector signals, structural features, and planned/actual action. The
+service does not fetch webpage bodies, copy media, or save profile data. Message text, full URLs, and
+button text stay inside the encrypted envelope and are not written to logs or SQLite plaintext
+columns.
+
+After the cap is reached, later records are ignored until one expires or is deleted; existing rows
 are not rotated to keep the newest three. Monitor mode can gradually fill the cap, while protect mode
-normally collects only the initial message before the sender changes state. The Dataset dashboard
-decrypts text, quoted context, preview text, domains, and link-shape metadata only on a sample detail
-page. Full URLs, path text, query values, fragment values, and media are never retained. The dashboard also
-shows rolling collection/skip counts and supports Spam, Legitimate, and Uncertain labels plus
-individual deletion. Collection-disabled traffic is neither sampled nor counted. It does not train
-a model.
+normally collects only the initial message before the sender changes state. The Evidence Log decrypts
+records only on a detail page and collapses full URLs by default. It also shows rolling
+collection/skip counts and supports Correct Enforcement, False Positive, and Insufficient Evidence
+outcomes plus individual deletion. Collection-disabled traffic is neither sampled nor counted. It
+does not train or run a model.
 
-On first startup after the Dataset schema upgrade, `training.sqlite3` migrates from version 1 to 2 by
-adding the aggregate collection-statistics table. Existing encrypted sample envelopes are not
-decrypted or rewritten.
+Old `training.sqlite3` Dataset files are not decrypted or migrated. When opened as the configured
+evidence database, legacy Dataset tables are discarded and a fresh Evidence schema is created.
 
-Use `samples export` only for a temporary owner-only plaintext JSONL, transfer it immediately to a
-trusted workstation, and remove the server copy. `samples purge --confirm DELETE-ALL-SAMPLES`
-irreversibly deletes every retained sample.
+Plaintext export is intentionally not provided. `samples export` returns an explicit error. Use
+`evidence purge --confirm DELETE-ALL-SAMPLES` to irreversibly delete every retained evidence record.
 
-## Review dashboard
+## Operations Dashboard
 
 The service has no TCP listener. From the local repository, open the supplied tunnel:
 
 ```shell
-scripts/review-tunnel.sh "$DEPLOY_HOST"
+scripts/dashboard-tunnel.sh "$DEPLOY_HOST"
 ```
 
 The helper requires `ssh` and `curl`. It reads the short-lived owner-only `review.access-token`,
@@ -229,17 +232,19 @@ The SSH target can be an alias or `user@host` and must be able to read the token
 socket. Defaults may come from environment variables or flags:
 
 ```shell
-TG_REVIEW_HOST=root@gatekeeper.example \
-TG_REVIEW_PORT=18765 \
-TG_REVIEW_SOCKET=/srv/gatekeeper/review.sock \
-TG_REVIEW_TOKEN=/srv/gatekeeper/review.access-token \
-TG_REVIEW_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf" \
-scripts/review-tunnel.sh
+TG_DASHBOARD_HOST=root@gatekeeper.example \
+TG_DASHBOARD_PORT=18765 \
+TG_DASHBOARD_SOCKET=/srv/gatekeeper/review.sock \
+TG_DASHBOARD_TOKEN=/srv/gatekeeper/review.access-token \
+TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf" \
+scripts/dashboard-tunnel.sh
 ```
 
-`TG_REVIEW_SOCKET` configures the workstation helper; `TG_REVIEW_SOCKET_PATH` configures the service.
+Prefer the corresponding `TG_DASHBOARD_*` workstation variables; `TG_REVIEW_*` remains a deprecated
+helper alias. `TG_DASHBOARD_SOCKET` configures the workstation helper;
+`TG_DASHBOARD_SOCKET_PATH` configures the service.
 If the service socket moves, update both values and keep the service path inside a writable mounted
-directory. Run `scripts/review-tunnel.sh -h` for all flags.
+directory. Run `scripts/dashboard-tunnel.sh -h` for all flags.
 
 The default local URL is `http://127.0.0.1:8765/`. The queue checks the server every 10 seconds. The
 **Live connection** response timestamp and the next refresh—not a previously rendered page—show that
@@ -263,16 +268,18 @@ message no longer exists, open the row and choose **Resolve deleted conversation
 dismissed review and erases the encrypted reference without changing sender trust or enforcement
 state.
 
-The **Active enforcement** page lists current quarantines and suppressions with reason and remaining
-duration. Opening a row decrypts the original triggering text/caption and quoted context from the
-short-lived local snapshot; it does not depend on the Telegram message still existing after dialog
-deletion. **Allow now** restores the saved folder and notification settings before allowing the
-sender, while **Keep current restriction** is a no-op. Missing or expired identity references prevent
-safe allowance. Snapshots expire after at most seven days and are erased earlier after success,
-rollback, allowance, or suppression expiry. Telegram block is not used.
-The summary reports total local quarantined/suppressed states separately from reviewable snapshots.
-Legacy states without a snapshot remain in the totals, use the best available historical reason, and
-are explicitly reported as unavailable for detail review.
+The **Active Cases** page lists current quarantines and suppressions with reason and remaining
+duration. Opening a row decrypts the original triggering text/caption, quoted context, Telegram
+webpage preview, button text, full URLs, normalized domains, URL shape, and detector evidence from
+the short-lived local snapshot; it does not depend on the Telegram message still existing after
+dialog deletion. Full URLs are collapsed by default. **Allow now** restores the saved folder and
+notification settings before allowing the sender, while **Keep current restriction** records an
+operator decision and changes nothing. Missing or expired identity references prevent safe
+allowance. Snapshots expire after at most seven days and are erased earlier after success, rollback,
+allowance, or suppression expiry. Telegram block is not used. The summary reports total local
+quarantined/suppressed states separately from reviewable evidence. Legacy states without evidence
+remain in the totals, use the best available historical reason, and are explicitly reported as
+unavailable for detail review.
 
 ## Verify the boundary
 
@@ -281,7 +288,7 @@ The deployment is acceptable only when all checks pass:
 ```shell
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh "$DEPLOY_HOST" 'ss -lnt'
-ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/dataset.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
+ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/evidence.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
 ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock /var/lib/tg-pm-gatekeeper/review.access-token'
 ```
 

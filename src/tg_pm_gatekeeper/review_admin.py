@@ -19,7 +19,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from telethon import functions, types
 
-from .dataset import TrainingStore
+from .evidence import EvidenceStore
+from .rules import URL_RE, normalized_domain, url_evidence, url_shape
 from .service import GatekeeperService
 from .store import DialogSnapshot, EnforcementReview, ReviewItem, StateStore
 
@@ -50,10 +51,10 @@ class ReviewAdminServer:
         *,
         mute_days: int,
         cancel_timeout: Callable[[str], None] = lambda _sender_key: None,
-        training_store: TrainingStore | None = None,
-        dataset_collection: bool = False,
-        dataset_retention_days: int = 30,
-        dataset_max_messages_per_sender: int = 3,
+        evidence_store: EvidenceStore | None = None,
+        evidence_collection: bool = False,
+        evidence_retention_days: int = 7,
+        evidence_max_records_per_sender: int = 3,
     ) -> None:
         self.socket_path = socket_path
         self.store = store
@@ -62,10 +63,10 @@ class ReviewAdminServer:
         self.telegram_client = telegram_client
         self.mute_days = mute_days
         self.cancel_timeout = cancel_timeout
-        self.training_store = training_store
-        self.dataset_collection = dataset_collection
-        self.dataset_retention_days = dataset_retention_days
-        self.dataset_max_messages_per_sender = dataset_max_messages_per_sender
+        self.evidence_store = evidence_store
+        self.evidence_collection = evidence_collection
+        self.evidence_retention_days = evidence_retention_days
+        self.evidence_max_records_per_sender = evidence_max_records_per_sender
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
         self._access_token = secrets.token_urlsafe(32)
@@ -109,10 +110,10 @@ class ReviewAdminServer:
                 method, target, body, request_headers=request_headers
             )
         except (ValueError, asyncio.IncompleteReadError):
-            status, headers, response = 400, {}, self._page("Invalid request")
+            status, headers, response = 400, {}, self._page("Invalid Request")
         except Exception:
             LOG.error("review_request_failed")
-            status, headers, response = 500, {}, self._page("Request failed")
+            status, headers, response = 500, {}, self._page("Request Failed")
         reason = {
             200: "OK",
             303: "See Other",
@@ -186,11 +187,11 @@ class ReviewAdminServer:
         if request_headers is not None:
             host = request_headers.get("host", "")
             if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
-                return 400, {}, self._page("Invalid host")
+                return 400, {}, self._page("Invalid Host")
             if path == "/login":
                 token = parse_qs(parsed.query).get("token", [""])[0]
                 if not secrets.compare_digest(token, self._access_token):
-                    return 400, {}, self._page("Invalid access token")
+                    return 400, {}, self._page("Invalid Access Token")
                 self._access_token = secrets.token_urlsafe(32)
                 self._write_access_token()
                 return (
@@ -208,45 +209,57 @@ class ReviewAdminServer:
             if not secrets.compare_digest(
                 self._cookie_value(cookie, "gatekeeper_session"), self._session_token
             ):
-                return 404, {}, self._page("Not found")
+                return 404, {}, self._page("Not Found")
         if path == "/" and method == "GET":
-            return 200, {}, await self._index_page()
+            return 200, {}, await self._dashboard_page()
+        if path == "/review" and method == "GET":
+            return 200, {}, await self._review_queue_page()
         if path == "/dataset" and method == "GET":
+            return 303, {"Location": "/evidence"}, b""
+        if path.startswith("/dataset/"):
+            suffix = path.removeprefix("/dataset/")
+            return 303, {"Location": f"/evidence/{suffix}"}, b""
+        if path == "/evidence" and method == "GET":
             try:
                 page = max(1, int(parse_qs(parsed.query).get("page", ["1"])[0]))
             except ValueError:
-                return 400, {}, self._page("Invalid page")
-            return 200, {}, self._dataset_index_page(page)
-        if path.startswith("/dataset/"):
-            return self._dispatch_dataset(method, path, body)
+                return 400, {}, self._page("Invalid Page")
+            return 200, {}, self._evidence_index_page(page)
+        if path.startswith("/evidence/"):
+            return self._dispatch_evidence(method, path, body)
         if path == "/enforcement" and method == "GET":
-            return 200, {}, await self._enforcement_index_page()
+            return 303, {"Location": "/cases"}, b""
         if path.startswith("/enforcement/"):
+            suffix = path.removeprefix("/enforcement/")
+            return 303, {"Location": f"/cases/{suffix}"}, b""
+        if path == "/cases" and method == "GET":
+            return 200, {}, await self._enforcement_index_page()
+        if path.startswith("/cases/"):
             return await self._dispatch_enforcement(method, path, body)
         if not path.startswith("/review/"):
-            return 404, {}, self._page("Not found")
+            return 404, {}, self._page("Not Found")
         try:
             review_id = int(path.removeprefix("/review/"))
         except ValueError:
-            return 404, {}, self._page("Not found")
+            return 404, {}, self._page("Not Found")
         item = self.store.review_item(review_id)
         if item is None or (
             item.status == "pending" and item.expires_at <= int(time.time())
         ):
-            return 404, {}, self._page("Review item not found")
+            return 404, {}, self._page("Review Item Not Found")
         if method == "GET":
             return await self._show_review(item)
         if method != "POST":
-            return 405, {"Allow": "GET, POST"}, self._page("Method not allowed")
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
         values = parse_qs(body.decode("utf-8"), strict_parsing=True)
         token = values.get("token", [""])[0]
         action = values.get("action", [""])[0]
         if not secrets.compare_digest(token, self._csrf_token):
-            return 400, {}, self._page("Invalid action token")
+            return 400, {}, self._page("Invalid Action Token")
         async with self.service.sender_lock(item.sender_key):
             item = self.store.review_item(review_id)
             if item is None or item.status != "pending" or item.reference is None:
-                return 409, {}, self._page("This item has already been reviewed")
+                return 409, {}, self._page("This Item Has Already Been Reviewed")
             state = self.store.sender(item.sender_key)
             if action == "legitimate":
                 if state.status in {"challenged", "quarantined", "suppressed"}:
@@ -255,7 +268,7 @@ class ReviewAdminServer:
                         return (
                             500,
                             {},
-                            self._page("Telegram action failed; item was not changed"),
+                            self._page("Telegram Action Failed; Item Was Not Changed"),
                         )
                 self.store.allow(item.sender_key)
                 self.cancel_timeout(item.sender_key)
@@ -270,7 +283,7 @@ class ReviewAdminServer:
                         return (
                             500,
                             {},
-                            self._page("Telegram action failed; item was not changed"),
+                            self._page("Telegram Action Failed; Item Was Not Changed"),
                         )
                     self.store.quarantine(item.sender_key)
                 elif state.status == "challenged":
@@ -286,9 +299,9 @@ class ReviewAdminServer:
             elif action == "dismiss":
                 self.store.decide_sender_reviews(item.sender_key, "dismissed")
             else:
-                return 400, {}, self._page("Unknown action")
+                return 400, {}, self._page("Unknown Action")
             self._identity_cache.pop(item.sender_key, None)
-        return 303, {"Location": "/"}, b""
+        return 303, {"Location": "/review"}, b""
 
     def _write_access_token(self) -> None:
         temporary = self.access_token_path.with_suffix(".access-token.tmp")
@@ -316,218 +329,254 @@ class ReviewAdminServer:
                 return value
         return ""
 
-    def _dataset_index_page(self, page: int = 1) -> bytes:
-        if self.training_store is None:
-            return self._page("Dataset collection is disabled")
-        stats = self.training_store.statistics(
-            retention_days=self.dataset_retention_days
+    def _evidence_index_page(self, page: int = 1) -> bytes:
+        if self.evidence_store is None:
+            return self._page("Evidence Collection Is Disabled")
+        stats = self.evidence_store.statistics(
+            retention_days=self.evidence_retention_days
         )
-        samples = self.training_store.summaries(limit=101, offset=(page - 1) * 100)
-        has_next = len(samples) > 100
+        records = self.evidence_store.summaries(limit=101, offset=(page - 1) * 100)
+        has_next = len(records) > 100
         groups: dict[str, str] = {}
-        for sample in samples[:100]:
-            groups.setdefault(sample.sender_token, f"Sender {len(groups) + 1}")
+        for record in records[:100]:
+            groups.setdefault(record.sender_token, f"Sender {len(groups) + 1}")
         rows = (
             "".join(
-                f"<tr><td><a href='/dataset/{sample.id}'>#{sample.id}</a></td>"
-                f"<td>{html.escape(groups[sample.sender_token])}</td>"
-                f"<td>{html.escape(sample.weak_label)}</td>"
-                f"<td>{html.escape(sample.manual_label or 'Unlabeled')}</td>"
-                f"<td>{html.escape(self._relative_age(sample.created_at))}</td></tr>"
-                for sample in samples[:100]
+                f"<tr><td><a href='/evidence/{record.id}'>#{record.id}</a></td>"
+                f"<td>{html.escape(groups[record.sender_token])}</td>"
+                f"<td>{html.escape(record.automatic_hint)}</td>"
+                f"<td>{html.escape(self._evidence_outcome_label(record.review_outcome))}</td>"
+                f"<td>{html.escape(self._relative_age(record.created_at))}</td></tr>"
+                for record in records[:100]
             )
-            or "<tr><td colspan='5'>No unexpired samples.</td></tr>"
+            or "<tr><td colspan='5'>No retained evidence records.</td></tr>"
         )
         navigation = "<p class='back'>"
         if page > 1:
-            navigation += f"<a href='/dataset?page={page - 1}'>← Newer</a> "
+            navigation += f"<a href='/evidence?page={page - 1}'>← Newer</a> "
         if has_next:
-            navigation += f"<a href='/dataset?page={page + 1}'>Older →</a>"
+            navigation += f"<a href='/evidence?page={page + 1}'>Older →</a>"
         navigation += "</p>"
         labeled = sum(
-            stats.get(label, 0) for label in ("spam", "legitimate", "uncertain")
+            stats.get(label, 0)
+            for label in ("correct", "false_positive", "insufficient")
         )
         overview = (
             "<dl class='metric-grid'>"
-            f"<div><dt>Total samples</dt><dd class='data-value'>{stats.get('total', 0)}</dd></div>"
-            f"<div><dt>Manually labeled</dt><dd class='data-value'>{labeled}</dd></div>"
-            f"<div><dt>Spam / Legitimate / Uncertain</dt><dd class='data-value'>"
-            f"{stats.get('spam', 0)} / {stats.get('legitimate', 0)} / "
-            f"{stats.get('uncertain', 0)}</dd></div>"
-            f"<div><dt>Weak spam / legitimate / uncertain</dt><dd class='data-value'>"
-            f"{stats.get('weak_spam_candidate', 0)} / "
-            f"{stats.get('weak_legitimate_candidate', 0)} / "
-            f"{stats.get('weak_uncertain', 0)}</dd></div>"
+            f"<div><dt>Total Evidence Records</dt><dd class='data-value'>{stats.get('total', 0)}</dd></div>"
+            f"<div><dt>Operator Reviewed</dt><dd class='data-value'>{labeled}</dd></div>"
+            f"<div><dt>Correct / False Positive / Insufficient</dt><dd class='data-value'>"
+            f"{stats.get('correct', 0)} / {stats.get('false_positive', 0)} / "
+            f"{stats.get('insufficient', 0)}</dd></div>"
+            f"<div><dt>Automatic Hints</dt><dd class='data-value'>"
+            f"{stats.get('hint_spam_candidate', 0)} / "
+            f"{stats.get('hint_legitimate_candidate', 0)} / "
+            f"{stats.get('hint_uncertain', 0)}</dd></div>"
             f"<div><dt>Expiring within 24 hours</dt><dd class='data-value'>"
             f"{stats.get('expiring_24h', 0)}</dd></div>"
-            f"<div><dt>Exportable manual labels</dt><dd class='data-value'>"
-            f"{stats.get('exportable_gold', 0)}</dd></div>"
+            f"<div><dt>Retention Window</dt><dd class='data-value'>"
+            f"{self.evidence_retention_days}d</dd></div>"
             "</dl>"
         )
         activity = (
-            "<h3>Collection activity</h3><p class='refresh-note'>"
-            f"UTC calendar-day totals within the current {self.dataset_retention_days}-day retention window.</p>"
+            "<h3>Collection Activity</h3><p class='refresh-note'>"
+            f"UTC calendar-day totals within the current {self.evidence_retention_days}-day retention window.</p>"
             "<dl class='metric-grid'>"
-            f"<div><dt>Content samples</dt><dd class='data-value'>{stats.get('collection_collected_content', 0)}</dd></div>"
-            f"<div><dt>Structural-only samples</dt><dd class='data-value'>{stats.get('collection_collected_structural', 0)}</dd></div>"
-            f"<div><dt>Skipped: no usable signal</dt><dd class='data-value'>{stats.get('collection_skipped_no_signal', 0)}</dd></div>"
-            f"<div><dt>Skipped: duplicate</dt><dd class='data-value'>{stats.get('collection_skipped_duplicate', 0)}</dd></div>"
-            f"<div><dt>Skipped: sender cap</dt><dd class='data-value'>{stats.get('collection_skipped_sender_cap', 0)}</dd></div>"
+            f"<div><dt>Content Evidence</dt><dd class='data-value'>{stats.get('collection_collected_content', 0)}</dd></div>"
+            f"<div><dt>Structural-Only Evidence</dt><dd class='data-value'>{stats.get('collection_collected_structural', 0)}</dd></div>"
+            f"<div><dt>Skipped: No Usable Signal</dt><dd class='data-value'>{stats.get('collection_skipped_no_signal', 0)}</dd></div>"
+            f"<div><dt>Skipped: Duplicate</dt><dd class='data-value'>{stats.get('collection_skipped_duplicate', 0)}</dd></div>"
+            f"<div><dt>Skipped: Sender Cap</dt><dd class='data-value'>{stats.get('collection_skipped_sender_cap', 0)}</dd></div>"
             "</dl>"
         )
         content = (
-            self._masthead("Dataset", f"{stats.get('total', 0)} samples")
-            + "<p class='back'><a href='/'>← Review queue</a> · <a href='/enforcement'>Active enforcement</a></p><main>"
-            + "<section class='queue-intro'><p class='eyebrow'>Dataset status</p>"
-            + "<h2>Dataset overview</h2>"
-            + f"<p>Collection {'enabled' if self.dataset_collection else 'disabled'} · "
-            + f"{self.dataset_retention_days}-day retention · "
-            + f"up to {self.dataset_max_messages_per_sender} messages per sender.</p>"
-            + "<p>Eligible unknown-sender messages contain text, quoted text, Telegram preview text, or a detector signal. Collection-disabled traffic is not counted.</p>"
+            self._masthead("Evidence Log", f"{stats.get('total', 0)} records")
+            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a> · <a href='/review'>Pending Reviews</a></p><main>"
+            + "<section class='queue-intro'><p class='eyebrow'>Short-Lived Audit Evidence</p>"
+            + "<h2>Evidence Log</h2>"
+            + f"<p>Collection {'enabled' if self.evidence_collection else 'disabled'} · "
+            + f"{self.evidence_retention_days}-day retention · "
+            + f"up to {self.evidence_max_records_per_sender} records per sender.</p>"
+            + "<p>Evidence is retained for short-term review and rule auditing, not model training. Eligible unknown-sender messages contain text, quoted text, Telegram preview text, or a detector signal.</p>"
             + overview
             + activity
             + "</section>"
-            + "<div class='table-shell'><table><thead><tr><th>Sample</th><th>Sender group</th>"
-            + "<th>Weak label</th><th>Manual label</th><th>Age</th></tr></thead>"
+            + "<div class='table-shell'><table><thead><tr><th>Evidence</th><th>Sender Group</th>"
+            + "<th>Automatic Hint</th><th>Review Outcome</th><th>Age</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div>{navigation}</main>"
         )
         return self._page(content, raw=True)
 
-    def _dispatch_dataset(
+    def _dispatch_evidence(
         self, method: str, path: str, body: bytes
     ) -> tuple[int, dict[str, str], bytes]:
-        if self.training_store is None:
-            return 404, {}, self._page("Dataset collection is disabled")
+        if self.evidence_store is None:
+            return 404, {}, self._page("Evidence Collection Is Disabled")
         try:
-            sample_id = int(path.removeprefix("/dataset/"))
+            record_id = int(path.rsplit("/", 1)[-1])
         except ValueError:
-            return 404, {}, self._page("Sample not found")
-        sample = self.training_store.sample(sample_id)
-        if sample is None:
-            return 404, {}, self._page("Sample not found")
+            return 404, {}, self._page("Evidence Record Not Found")
+        record = self.evidence_store.record(record_id)
+        if record is None:
+            return 404, {}, self._page("Evidence Record Not Found")
         if method == "POST":
             values = parse_qs(body.decode("utf-8"), strict_parsing=True)
             if not secrets.compare_digest(
                 values.get("token", [""])[0], self._csrf_token
             ):
-                return 400, {}, self._page("Invalid action token")
+                return 400, {}, self._page("Invalid Action Token")
             action = values.get("action", [""])[0]
             if action == "delete":
-                self.training_store.delete(sample_id)
-            elif action in {"spam", "legitimate", "uncertain"}:
-                self.training_store.label(sample_id, action)
+                self.evidence_store.delete(record_id)
+            elif action in {"correct", "false_positive", "insufficient"}:
+                self.evidence_store.review(record_id, action)
             else:
-                return 400, {}, self._page("Unknown action")
-            return 303, {"Location": "/dataset"}, b""
+                return 400, {}, self._page("Unknown Action")
+            return 303, {"Location": "/evidence"}, b""
         if method != "GET":
-            return 405, {"Allow": "GET, POST"}, self._page("Method not allowed")
-        payload = sample.payload
-        text = str(payload.get("text", ""))
-        quote_text = str(payload.get("quote_text", ""))
-        preview_text = str(payload.get("preview_text", ""))
-        domains = ", ".join(str(value) for value in payload.get("domains", [])) or "—"
-        quote_domains = (
-            ", ".join(str(value) for value in payload.get("quote_domains", [])) or "—"
-        )
-        url_shape = json.dumps(payload.get("url_shape", {}), indent=2, sort_keys=True)
-        quote_url_shape = json.dumps(
-            payload.get("quote_url_shape", {}), indent=2, sort_keys=True
-        )
-        structural_only = not (
-            text.strip() or quote_text.strip() or preview_text.strip()
-        )
-        details = html.escape(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
+        payload = record.payload
         actions = "".join(
-            self._action_form(sample_id, label, label.title(), base="dataset")
-            for label in ("spam", "legitimate", "uncertain")
+            self._action_form(record_id, label, display, base="evidence")
+            for label, display in (
+                ("correct", "Correct enforcement"),
+                ("false_positive", "False positive"),
+                ("insufficient", "Insufficient evidence"),
+            )
         ) + self._action_form(
-            sample_id, "delete", "Delete sample", danger=True, base="dataset"
+            record_id, "delete", "Delete evidence", danger=True, base="evidence"
         )
         content = (
-            self._masthead("Dataset sample", f"#{sample.id}")
-            + "<p class='back'><a href='/dataset'>← Dataset</a></p>"
-            + "<main><section class='message-panel'><p class='eyebrow'>Message text or caption</p>"
-            + (f"<pre class='message'>{html.escape(text)}</pre>" if text else "")
-            + (
-                f"<p class='eyebrow'>Quoted context</p><pre class='message quote'>"
-                f"{html.escape(quote_text)}</pre>"
-                if quote_text
-                else ""
-            )
-            + (
-                f"<p class='eyebrow'>Telegram webpage preview</p><pre class='message quote'>"
-                f"{html.escape(preview_text)}</pre>"
-                if preview_text
-                else ""
-            )
-            + (
-                "<div class='notice'><strong>Structural-only sample.</strong> No message, quoted, or preview text was retained. Review the detector signals and structural metadata; choose Uncertain when the evidence is insufficient.</div>"
-                if structural_only
-                else ""
-            )
-            + f"<p class='content-label'>Normalized domains</p><pre>{html.escape(domains)}</pre>"
-            + f"<p class='content-label'>Quoted-context domains</p><pre>{html.escape(quote_domains)}</pre>"
-            + f"<details><summary>Link shape</summary><pre>{html.escape(url_shape)}</pre></details>"
-            + f"<details><summary>Quoted-context link shape</summary><pre>{html.escape(quote_url_shape)}</pre></details>"
-            + f"<details><summary>Encrypted payload metadata</summary><pre>{details}</pre></details>"
+            self._masthead("Evidence Record", f"#{record.id}")
+            + "<p class='back'><a href='/evidence'>← Evidence Log</a></p>"
+            + "<main><section class='message-panel'>"
+            + self._evidence_sections(payload)
             + f"<div class='actions'>{actions}</div></section></main>"
         )
         return 200, {}, self._page(content, raw=True)
 
+    @staticmethod
+    def _evidence_outcome_label(outcome: str | None) -> str:
+        return {
+            "correct": "Correct Enforcement",
+            "false_positive": "False Positive",
+            "insufficient": "Insufficient Evidence",
+        }.get(outcome or "", "Unreviewed")
+
+    @staticmethod
+    def _json_block(value: object) -> str:
+        return html.escape(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+    @staticmethod
+    def _text_block(label: str, value: str, *, quote: bool = False) -> str:
+        if not value:
+            return ""
+        css = "message quote" if quote else "message"
+        return (
+            f"<p class='eyebrow'>{html.escape(label)}</p>"
+            f"<pre class='{css}'>{html.escape(value)}</pre>"
+        )
+
+    @staticmethod
+    def _joined(value: object) -> str:
+        if not isinstance(value, list) or not value:
+            return "—"
+        return ", ".join(str(item) for item in value)
+
+    def _evidence_sections(self, payload: dict[str, object]) -> str:
+        text = str(payload.get("text", ""))
+        quote_text = str(payload.get("quote_text", ""))
+        preview_text = str(payload.get("preview_text", ""))
+        structural_only = not (
+            text.strip() or quote_text.strip() or preview_text.strip()
+        )
+        button_texts = self._joined(payload.get("button_texts", []))
+        domains = self._joined(payload.get("domains", []))
+        quote_domains = self._joined(payload.get("quote_domains", []))
+        details = self._json_block(payload)
+        urls = self._json_block(payload.get("urls", []))
+        quote_urls = self._json_block(payload.get("quote_urls", []))
+        url_shape = self._json_block(payload.get("url_shape", {}))
+        quote_url_shape = self._json_block(payload.get("quote_url_shape", {}))
+        sections = (
+            self._text_block("Message Text Or Caption", text)
+            + self._text_block("Quoted Context", quote_text, quote=True)
+            + self._text_block("Telegram Webpage Preview", preview_text, quote=True)
+        )
+        if structural_only:
+            sections += (
+                "<div class='notice'><strong>Structural-Only Evidence.</strong> "
+                "No message, quoted, or preview text was retained. Review the detector "
+                "signals and structural metadata; choose Insufficient evidence when the "
+                "record is not enough.</div>"
+            )
+        return (
+            sections
+            + f"<p class='content-label'>Button Text</p><pre>{html.escape(button_texts)}</pre>"
+            + f"<p class='content-label'>Normalized Domains</p><pre>{html.escape(domains)}</pre>"
+            + f"<p class='content-label'>Quoted-Context Domains</p><pre>{html.escape(quote_domains)}</pre>"
+            + f"<details><summary>Full URLs</summary><pre>{urls}</pre></details>"
+            + f"<details><summary>Quoted-Context URLs</summary><pre>{quote_urls}</pre></details>"
+            + f"<details><summary>Link Shape</summary><pre>{url_shape}</pre></details>"
+            + f"<details><summary>Quoted-Context Link Shape</summary><pre>{quote_url_shape}</pre></details>"
+            + f"<details><summary>Encrypted Evidence Payload</summary><pre>{details}</pre></details>"
+        )
+
     async def _dispatch_enforcement(
         self, method: str, path: str, body: bytes
     ) -> tuple[int, dict[str, str], bytes]:
-        sender_key = path.removeprefix("/enforcement/")
+        sender_key = path.rsplit("/", 1)[-1]
         if len(sender_key) != 64 or any(char not in "0123456789abcdef" for char in sender_key):
-            return 404, {}, self._page("Enforcement record not found")
+            return 404, {}, self._page("Active Case Not Found")
         item = self.store.enforcement_review(sender_key)
         if item is None:
-            return 404, {}, self._page("Enforcement record not found")
+            return 404, {}, self._page("Active Case Not Found")
         if method == "GET":
             return await self._show_enforcement(item)
         if method != "POST":
-            return 405, {"Allow": "GET, POST"}, self._page("Method not allowed")
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
         values = parse_qs(body.decode("utf-8"), strict_parsing=True)
         if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
-            return 400, {}, self._page("Invalid action token")
+            return 400, {}, self._page("Invalid Action Token")
         action = values.get("action", [""])[0]
         if action == "keep":
-            return 303, {"Location": "/enforcement"}, b""
+            self.store.audit(sender_key, "OPERATOR_KEEP", "kept", int(time.time()))
+            return 303, {"Location": "/cases"}, b""
         if action != "allow":
-            return 400, {}, self._page("Unknown action")
+            return 400, {}, self._page("Unknown Action")
         async with self.service.sender_lock(sender_key):
             item = self.store.enforcement_review(sender_key)
             if item is None:
-                return 409, {}, self._page("This enforcement record has expired")
+                return 409, {}, self._page("This Active Case Has Expired")
             if item.reference is None:
-                return 409, {}, self._page("Telegram identity is unavailable")
+                return 409, {}, self._page("Telegram Identity Is Unavailable")
             try:
                 user_id, access_hash, _ = self.protector.open_review_reference(
                     item.reference
                 )
             except ValueError:
-                return 409, {}, self._page("Telegram identity is unavailable")
+                return 409, {}, self._page("Telegram Identity Is Unavailable")
             peer = types.InputPeerUser(user_id=user_id, access_hash=access_hash)
             if not await self._restore(peer, sender_key):
-                return 500, {}, self._page("Telegram action failed; item was not changed")
+                return 500, {}, self._page("Telegram Action Failed; Item Was Not Changed")
             self.store.allow(sender_key)
             self.cancel_timeout(sender_key)
             self._identity_cache.pop(sender_key, None)
-        return 303, {"Location": "/enforcement"}, b""
+        return 303, {"Location": "/cases"}, b""
 
     async def _enforcement_index_page(self) -> bytes:
         items = self.store.enforcement_reviews()
         identities = await self._live_enforcement_identities(items)
         stats = self.store.enforcement_statistics()
         rows = "".join(
-            f"<tr><td><a href='/enforcement/{item.sender_key}'>Open</a></td>"
+            f"<tr><td><a href='/cases/{item.sender_key}'>Open</a></td>"
             f"<td>{self._identity_cell(identities.get(item.sender_key))}</td>"
             f"<td><span class='badge'>{html.escape(item.status)}</span></td>"
             f"<td>{html.escape(item.reason)}</td>"
             f"<td>{html.escape(self._remaining(item))}</td>"
             f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
             for item in items
-        ) or "<tr><td colspan='6'>No reviewable active restrictions.</td></tr>"
+        ) or "<tr><td colspan='6'>No active cases.</td></tr>"
         reason_counts = sorted(
             (key.removeprefix("reason:"), value)
             for key, value in stats.items()
@@ -538,24 +587,24 @@ class ReviewAdminServer:
             for reason, count in reason_counts
         ) or "No active reasons"
         snapshot_note = (
-            f"{stats['unreviewable']} active restriction"
+            f"{stats['unreviewable']} active case"
             f"{'s' if stats['unreviewable'] != 1 else ''} "
             f"{'have' if stats['unreviewable'] != 1 else 'has'} no encrypted snapshot "
-            "and cannot be opened here. Such states may predate snapshot collection."
+            "and cannot be opened here. Such states may predate evidence capture."
             if stats["unreviewable"]
-            else "Every active restriction currently has a reviewable snapshot."
+            else "Every active case currently has reviewable evidence."
         )
         content = (
-            self._masthead("Active enforcement", f"{len(items)} reviewable")
-            + "<p class='back'><a href='/'>← Review queue</a> · <a href='/dataset'>Dataset</a></p>"
-            + "<main><section class='queue-intro'><p class='eyebrow'>Protect mode state</p>"
-            + "<h2>Review active restrictions</h2>"
-            + "<p>Encrypted snapshots preserve the original triggering message and quoted context for up to seven days. Telegram block is not used.</p>"
+            self._masthead("Active Cases", f"{len(items)} reviewable")
+            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a> · <a href='/evidence'>Evidence Log</a></p>"
+            + "<main><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
+            + "<h2>Review Active Cases</h2>"
+            + "<p>Encrypted evidence preserves the triggering message, links, buttons, and quoted context for short-term operator review. Telegram block is not used.</p>"
             + "<dl class='metric-grid'>"
             + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
             + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
-            + f"<div><dt>Reviewable snapshots</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
-            + f"<p class='refresh-note'><strong>State reasons:</strong> {reasons}. {snapshot_note}</p></section>"
+            + f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
+            + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}</p></section>"
             + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Updated</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div></main>"
         )
@@ -565,13 +614,13 @@ class ReviewAdminServer:
         self, item: EnforcementReview
     ) -> tuple[int, dict[str, str], bytes]:
         if self.service.review_content_protector is None:
-            return 500, {}, self._page("Encrypted review content is unavailable")
+            return 500, {}, self._page("Encrypted Review Content Is Unavailable")
         try:
             payload = self.service.review_content_protector.open_enforcement(
                 item.envelope
             )
         except ValueError:
-            return 500, {}, self._page("Encrypted review content is unavailable")
+            return 500, {}, self._page("Encrypted Review Content Is Unavailable")
         identity = "Identity unavailable"
         telegram_link = ""
         user_id: int | None = None
@@ -591,8 +640,6 @@ class ReviewAdminServer:
                 )
             except Exception:
                 pass
-        text = str(payload.get("text", "")) or "[No text or caption]"
-        quote_text = str(payload.get("quote_text", ""))
         rules = ", ".join(str(value) for value in payload.get("rule_codes", [])) or "—"
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
         observed = datetime.fromtimestamp(item.created_at, timezone.utc).strftime(
@@ -600,32 +647,30 @@ class ReviewAdminServer:
         )
         allow_action = (
             self._action_form(
-                item.sender_key, "allow", "Allow now", base="enforcement"
+                item.sender_key, "allow", "Allow now", base="cases"
             )
             if user_id is not None
             else "<button type='button' disabled>Allow unavailable</button>"
         )
         content = f"""
-        {self._masthead("Active enforcement", item.status)}
-        <p class="back"><a href="/enforcement">← Active enforcement</a></p>
+        {self._masthead("Active Cases", item.status)}
+        <p class="back"><a href="/cases">← Active Cases</a></p>
         <main class="review-grid"><section class="message-panel">
-          <p class="eyebrow">Encrypted local review snapshot</p>
+          <p class="eyebrow">Encrypted Local Evidence</p>
           <h2>{html.escape(identity)}</h2>
-          <p class="content-label">Original message or caption</p>
-          <pre class="message">{html.escape(text)}</pre>
-          {f'<p class="content-label">Quoted context</p><pre class="message quote">{html.escape(quote_text)}</pre>' if quote_text else ''}
+          {self._evidence_sections(payload)}
           {telegram_link}
-        </section><aside class="case-file"><p class="eyebrow">Restriction details</p>
+        </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
           <dl><dt>Status</dt><dd><span class="badge">{html.escape(item.status)}</span></dd>
           <dt>Reason</dt><dd>{html.escape(item.reason)}</dd><dt>Rules</dt><dd>{html.escape(rules)}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
-          <dt>Snapshot expires</dt><dd>{datetime.fromtimestamp(item.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd></dl>
-          <details><summary>Structural features</summary><pre>{html.escape(features)}</pre></details>
-        </aside></main><section class="decision-panel"><p class="eyebrow">Sender decision</p>
+          <dt>Evidence Expires</dt><dd>{datetime.fromtimestamp(item.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd></dl>
+          <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
+        </aside></main><section class="decision-panel"><p class="eyebrow">Operator Action</p>
           <h2>Allow restores the saved folder and notification state before changing policy.</h2>
           <div class="actions two">
             {allow_action}
-            {self._action_form(item.sender_key, "keep", "Keep current restriction", base="enforcement")}
+            {self._action_form(item.sender_key, "keep", "Keep current restriction", base="cases")}
           </div></section>"""
         return 200, {}, self._page(content, raw=True)
 
@@ -645,11 +690,65 @@ class ReviewAdminServer:
             message = await self.telegram_client.get_messages(peer, ids=message_id)
             if message is None:
                 return
+            text = getattr(message, "message", None) or ""
             reply_header = getattr(message, "reply_to", None)
+            quote_text = getattr(reply_header, "quote_text", None) or ""
+            quote_urls = tuple(sorted(set(URL_RE.findall(quote_text))))
+            urls = set(URL_RE.findall(text))
+            button_texts: set[str] = set()
+            button_urls: set[str] = set()
+            markup = getattr(message, "reply_markup", None)
+            for row in getattr(markup, "rows", ()) or ():
+                for button in getattr(row, "buttons", ()) or ():
+                    text_value = getattr(button, "text", None)
+                    if isinstance(text_value, str) and text_value.strip():
+                        button_texts.add(text_value.strip())
+                    url_value = getattr(button, "url", None)
+                    if isinstance(url_value, str) and url_value.strip():
+                        urls.add(url_value.strip())
+                        button_urls.add(url_value.strip())
+            webpage = getattr(getattr(message, "media", None), "webpage", None)
+            webpage_url = getattr(webpage, "url", None)
+            preview_urls: set[str] = set()
+            if isinstance(webpage_url, str) and webpage_url.strip():
+                urls.add(webpage_url.strip())
+                preview_urls.add(webpage_url.strip())
+            preview_text = "\n".join(
+                value
+                for attribute in ("site_name", "title", "description", "author")
+                if isinstance(value := getattr(webpage, attribute, None), str)
+                and value.strip()
+            )
+            url_values = tuple(sorted(urls))
+            domains = tuple(
+                sorted({domain for url in url_values if (domain := normalized_domain(url))})
+            )
+            quote_domains = tuple(
+                sorted({domain for url in quote_urls if (domain := normalized_domain(url))})
+            )
             payload: dict[str, object] = {
-                "schema_version": 1,
-                "text": getattr(message, "message", None) or "",
-                "quote_text": getattr(reply_header, "quote_text", None) or "",
+                "schema_version": 4,
+                "text": text,
+                "quote_text": quote_text,
+                "preview_text": preview_text,
+                "button_texts": list(sorted(button_texts))[:10],
+                "urls": url_evidence(
+                    url_values,
+                    button_urls=tuple(sorted(button_urls)),
+                    preview_urls=tuple(sorted(preview_urls)),
+                ),
+                "quote_urls": url_evidence(quote_urls),
+                "domains": list(domains[:3]),
+                "quote_domains": list(quote_domains[:3]),
+                "url_shape": url_shape(url_values),
+                "quote_url_shape": url_shape(quote_urls),
+                "signals": [],
+                "severity": "high",
+                "score": None,
+                "model_version": None,
+                "planned_action": "manual_spam",
+                "actual_action": "active_case",
+                "policy": "manual_review",
                 "rule_codes": json.loads(item.rule_codes),
                 "features": json.loads(item.features),
             }
@@ -669,7 +768,7 @@ class ReviewAdminServer:
 
     async def _show_review(self, item: ReviewItem) -> tuple[int, dict[str, str], bytes]:
         if item.status != "pending" or item.reference is None:
-            return 409, {}, self._page("This item is no longer pending")
+            return 409, {}, self._page("This Item Is No Longer Pending")
         user_id, access_hash, message_id = self.protector.open_review_reference(
             item.reference
         )
@@ -828,7 +927,35 @@ class ReviewAdminServer:
             LOG.error("review_restore_failed")
             return False
 
-    async def _index_page(self) -> bytes:
+    async def _dashboard_page(self) -> bytes:
+        review_items = self.store.review_items()
+        active_cases = self.store.enforcement_reviews()
+        evidence_total = 0
+        if self.evidence_store is not None:
+            evidence_total = self.evidence_store.statistics(
+                retention_days=self.evidence_retention_days
+            ).get("total", 0)
+        mode = self.store.get_mode()
+        content = (
+            self._masthead("Operations Dashboard", mode.title())
+            + "<main><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
+            "<h2>Operations Dashboard</h2>"
+            "<p>Use Active Cases for recovery after a possible false positive. "
+            "Pending Reviews cover monitor-mode sender decisions. Evidence Log is short-lived encrypted audit evidence.</p>"
+            "<dl class='metric-grid'>"
+            f"<div><dt>Active Cases</dt><dd class='data-value'>{len(active_cases)}</dd></div>"
+            f"<div><dt>Pending Reviews</dt><dd class='data-value'>{len(review_items)}</dd></div>"
+            f"<div><dt>Evidence Records</dt><dd class='data-value'>{evidence_total}</dd></div>"
+            "</dl></section>"
+            "<div class='table-shell'><table><thead><tr><th>Area</th><th>Purpose</th><th>Open</th></tr></thead><tbody>"
+            "<tr><td>Active Cases</td><td>Restore or keep current quarantines and suppressions.</td><td><a href='/cases'>Open</a></td></tr>"
+            "<tr><td>Pending Reviews</td><td>Resolve monitor-mode or ordinary sender review items.</td><td><a href='/review'>Open</a></td></tr>"
+            "<tr><td>Evidence Log</td><td>Review short-lived encrypted evidence for rule audits and false-positive analysis.</td><td><a href='/evidence'>Open</a></td></tr>"
+            "</tbody></table></div></main>"
+        )
+        return self._page(content, raw=True, refresh_seconds=10)
+
+    async def _review_queue_page(self) -> bytes:
         items = self.store.review_items()
         identities = await self._live_identities(items)
         rows = "".join(
@@ -843,10 +970,10 @@ class ReviewAdminServer:
         if not rows:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
-            self._masthead("Review queue", f"{len(items)} pending")
-            + "<p class='back'><a href='/enforcement'>Active enforcement</a> · <a href='/dataset'>Dataset</a></p>"
-            + "<main><section class='queue-intro'><p class='eyebrow'>Pending reviews</p>"
-            "<h2>Review pending senders</h2>"
+            self._masthead("Pending Reviews", f"{len(items)} pending")
+            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a> · <a href='/evidence'>Evidence Log</a></p>"
+            + "<main><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
+            "<h2>Review Pending Senders</h2>"
             "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
             "Message content is fetched only when a review item is opened.</p>"
             "<p>Deleting a conversation in Telegram does not remove its local pending review. "
@@ -855,7 +982,7 @@ class ReviewAdminServer:
             "an error when the SSH tunnel is unavailable.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Simulation</th>"
             "<th>Rules</th><th>Messages</th>"
-            f"<th>Last seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
+            f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
             raw=True,
             refresh_seconds=10,
         )
@@ -1069,26 +1196,26 @@ class ReviewAdminServer:
             body = content
         else:
             guidance = {
-                "Invalid access token": (
+                "Invalid Access Token": (
                     "This login link is invalid or has already been used. Run "
                     "the tunnel helper again to generate a new one-time link."
                 ),
-                "Not found": (
+                "Not Found": (
                     "The page is unavailable or the dashboard session is missing. "
                     "Open the one-time link printed by the tunnel helper."
                 ),
-                "Request failed": (
+                "Request Failed": (
                     "The request could not be completed. No dashboard action was confirmed."
                 ),
             }.get(content, "Check the request and return to the dashboard.")
             body = (
-                cls._masthead("Error", "Request not completed")
+                cls._masthead("Error", "Request Not Completed")
                 + "<main class='error-layout'><section class='error-card'>"
                 + "<div class='error-content'>"
-                + "<p class='eyebrow'>Dashboard error</p>"
+                + "<p class='eyebrow'>Dashboard Error</p>"
                 + f"<h1>{html.escape(content)}</h1>"
                 + f"<p>{html.escape(guidance)}</p>"
-                + "<p class='error-command'><code>scripts/review-tunnel.sh SSH_TARGET</code></p>"
+                + "<p class='error-command'><code>scripts/dashboard-tunnel.sh SSH_TARGET</code></p>"
                 + "<a class='button-link' href='/'>Return to dashboard</a>"
                 + "</div></section></main>"
             )
@@ -1099,7 +1226,7 @@ class ReviewAdminServer:
         )
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-{refresh}<title>Gatekeeper review</title><style>
+{refresh}<title>Gatekeeper Review</title><style>
 :root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#d84a28;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}}
 *{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}

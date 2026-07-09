@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tg_pm_gatekeeper.crypto import IdentifierProtector
-from tg_pm_gatekeeper.dataset import DatasetProtector, TrainingStore
+from tg_pm_gatekeeper.evidence import EvidenceProtector, EvidenceStore
 from tg_pm_gatekeeper.rules import MessageFacts
 from tg_pm_gatekeeper.service import (
     DIGITS_REQUIRED_TEXT,
@@ -163,7 +163,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.database_path = Path(self.temp.name) / "state.sqlite3"
         self.store = StateStore(self.database_path)
         self.protector = IdentifierProtector(b"k" * 32)
-        self.review_protector = DatasetProtector(b"r" * 32)
+        self.review_protector = EvidenceProtector(b"r" * 32)
         self.now = 1_000
         self.service = self.make_service()
 
@@ -172,8 +172,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         *,
         outbound_limit: int = 10,
         test_sender_id: int | None = None,
-        training_store: TrainingStore | None = None,
-        dataset_collection: bool = True,
+        evidence_store: EvidenceStore | None = None,
+        evidence_collection: bool = True,
     ) -> GatekeeperService:
         return GatekeeperService(
             self.store,
@@ -182,27 +182,27 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             challenge_max_attempts=2,
             outbound_limit_per_hour=outbound_limit,
             test_sender_id=test_sender_id,
-            training_store=training_store,
+            evidence_store=evidence_store,
             review_content_protector=self.review_protector,
-            dataset_collection=dataset_collection,
+            evidence_collection=evidence_collection,
             challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
             clock=lambda: self.now,
         )
 
-    async def test_disabled_collection_does_not_add_samples(self) -> None:
-        training_store = TrainingStore(
-            Path(self.temp.name) / "training.sqlite3",
-            DatasetProtector(b"d" * 32),
+    async def test_disabled_collection_does_not_add_evidence(self) -> None:
+        evidence_store = EvidenceStore(
+            Path(self.temp.name) / "evidence.sqlite3",
+            EvidenceProtector(b"d" * 32),
         )
-        self.addCleanup(training_store.close)
+        self.addCleanup(evidence_store.close)
         service = self.make_service(
-            training_store=training_store,
-            dataset_collection=False,
+            evidence_store=evidence_store,
+            evidence_collection=False,
         )
 
         await service.handle(self.message(1), FakeActions())
 
-        stats = training_store.statistics()
+        stats = evidence_store.statistics()
         self.assertEqual(stats["total"], 0)
         self.assertEqual(stats["collection_skipped_no_signal"], 0)
 
@@ -314,19 +314,19 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         self.now = int(time.time())
-        training_path = Path(self.temp.name) / "training.sqlite3"
-        training = TrainingStore(training_path, DatasetProtector(b"d" * 32))
-        self.addCleanup(training.close)
+        evidence_path = Path(self.temp.name) / "evidence.sqlite3"
+        evidence = EvidenceStore(evidence_path, EvidenceProtector(b"d" * 32))
+        self.addCleanup(evidence.close)
         service = self.make_service(
-            test_sender_id=TEST_SENDER_ID, training_store=training
+            test_sender_id=TEST_SENDER_ID, evidence_store=evidence
         )
         self.assertEqual(
             await service.handle(
                 self.message(
                     10,
-                    "dataset-private-canary",
+                    "evidence-private-canary",
                     facts=MessageFacts(
-                        text="dataset-private-canary",
+                        text="evidence-private-canary",
                         quote_text="quoted-private-canary",
                     ),
                 ),
@@ -334,17 +334,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "would_challenge",
         )
-        self.assertEqual(training.statistics()["total"], 1)
-        sample = training.samples()[0]
-        self.assertEqual(sample.payload["schema_version"], 3)
+        self.assertEqual(evidence.statistics()["total"], 1)
+        sample = evidence.samples()[0]
+        self.assertEqual(sample.payload["schema_version"], 4)
         self.assertEqual(sample.payload["quote_text"], "quoted-private-canary")
         self.assertTrue(sample.payload["features"]["has_quote"])
-        self.assertNotIn(b"dataset-private-canary", training_path.read_bytes())
+        self.assertNotIn(b"evidence-private-canary", evidence_path.read_bytes())
         await service.handle(
             self.message(11, "test-private-canary", sender_id=TEST_SENDER_ID),
             FakeActions(),
         )
-        self.assertEqual(training.statistics()["total"], 1)
+        self.assertEqual(evidence.statistics()["total"], 1)
         self.assertEqual(
             self.store._connection.execute(
                 "SELECT COUNT(*) FROM enforcement_reviews"
@@ -354,11 +354,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_monitor_collects_structural_rule_sample_without_text(self) -> None:
         self.now = int(time.time())
-        training = TrainingStore(
-            Path(self.temp.name) / "training.sqlite3", DatasetProtector(b"d" * 32)
+        evidence = EvidenceStore(
+            Path(self.temp.name) / "evidence.sqlite3", EvidenceProtector(b"d" * 32)
         )
-        self.addCleanup(training.close)
-        service = self.make_service(training_store=training)
+        self.addCleanup(evidence.close)
+        service = self.make_service(evidence_store=evidence)
 
         outcome = await service.handle(
             self.message(
@@ -377,25 +377,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(outcome, "would_delete")
-        sample = training.samples()[0]
+        sample = evidence.samples()[0]
         self.assertEqual(sample.payload["text"], "")
         self.assertEqual(sample.payload["signals"], ["HR-02_FORWARDED_LINK_BUTTON"])
         self.assertEqual(sample.payload["domains"], ["spam.invalid"])
         self.assertTrue(sample.payload["url_shape"]["has_query"])
         serialized = json.dumps(sample.payload)
-        self.assertNotIn("private-canary", serialized)
-        self.assertNotIn("/invite", serialized)
-        self.assertEqual(training.statistics()["collection_collected_structural"], 1)
+        self.assertIn("private-canary", serialized)
+        self.assertIn("/invite", serialized)
+        self.assertEqual(evidence.statistics()["collection_collected_structural"], 1)
 
     async def test_empty_message_without_signal_is_counted_but_not_collected(
         self,
     ) -> None:
         self.now = int(time.time())
-        training = TrainingStore(
-            Path(self.temp.name) / "training.sqlite3", DatasetProtector(b"d" * 32)
+        evidence = EvidenceStore(
+            Path(self.temp.name) / "evidence.sqlite3", EvidenceProtector(b"d" * 32)
         )
-        self.addCleanup(training.close)
-        service = self.make_service(training_store=training)
+        self.addCleanup(evidence.close)
+        service = self.make_service(evidence_store=evidence)
 
         self.assertEqual(
             await service.handle(
@@ -403,18 +403,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "would_challenge",
         )
-        stats = training.statistics()
+        stats = evidence.statistics()
         self.assertEqual(stats["total"], 0)
         self.assertEqual(stats["collection_skipped_no_signal"], 1)
 
-    async def test_preview_and_safe_url_metadata_are_encrypted_without_raw_url(
+    async def test_preview_and_full_url_evidence_are_encrypted_at_rest(
         self,
     ) -> None:
         self.now = int(time.time())
-        training_path = Path(self.temp.name) / "training.sqlite3"
-        training = TrainingStore(training_path, DatasetProtector(b"d" * 32))
-        self.addCleanup(training.close)
-        service = self.make_service(training_store=training)
+        evidence_path = Path(self.temp.name) / "evidence.sqlite3"
+        evidence = EvidenceStore(evidence_path, EvidenceProtector(b"d" * 32))
+        self.addCleanup(evidence.close)
+        service = self.make_service(evidence_store=evidence)
         raw_url = (
             "http://promo.invalid/private/path?token=private-query#private-fragment"
         )
@@ -444,7 +444,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             FakeActions(),
         )
 
-        payload = training.samples()[0].payload
+        payload = evidence.samples()[0].payload
         self.assertEqual(payload["preview_text"], "Guaranteed return private-preview")
         self.assertEqual(
             payload["domains"], ["a.invalid", "b.invalid", "promo.invalid"]
@@ -457,28 +457,23 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["url_shape"]["has_fragment"])
         self.assertTrue(payload["url_shape"]["uses_plain_http"])
         serialized = json.dumps(payload)
-        self.assertNotIn("private-query", serialized)
-        self.assertNotIn("private-fragment", serialized)
-        self.assertNotIn("private-user", serialized)
-        database = training_path.read_bytes()
+        self.assertIn("private-query", serialized)
+        self.assertIn("private-fragment", serialized)
+        self.assertIn("private-user", serialized)
+        database = evidence_path.read_bytes()
         self.assertNotIn(b"private-preview", database)
         self.assertNotIn(b"promo.invalid", database)
-        sample = training.samples()[0]
-        training.label(sample.id, "spam")
-        export_path = Path(self.temp.name) / "training-export.jsonl"
-        self.assertEqual(training.export(export_path), 1)
-        exported = export_path.read_text(encoding="utf-8")
-        self.assertNotIn("private-query", exported)
-        self.assertNotIn("private-fragment", exported)
-        self.assertNotIn("private-user", exported)
+        self.assertNotIn(b"private-query", database)
+        self.assertNotIn(b"private-fragment", database)
+        self.assertNotIn(b"private-user", database)
 
     async def test_monitor_outcome_updates_only_current_sample(self) -> None:
         self.now = int(time.time())
-        training = TrainingStore(
-            Path(self.temp.name) / "training.sqlite3", DatasetProtector(b"d" * 32)
+        evidence = EvidenceStore(
+            Path(self.temp.name) / "evidence.sqlite3", EvidenceProtector(b"d" * 32)
         )
-        self.addCleanup(training.close)
-        service = self.make_service(training_store=training)
+        self.addCleanup(evidence.close)
+        service = self.make_service(evidence_store=evidence)
         actions = FakeActions()
 
         self.assertEqual(
@@ -501,7 +496,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "would_delete",
         )
-        samples = sorted(training.samples(), key=lambda item: item.id)
+        samples = sorted(evidence.samples(), key=lambda item: item.id)
         self.assertEqual(samples[0].weak_label, "uncertain")
         self.assertEqual(samples[0].payload["actual_action"], "would_challenge")
         self.assertEqual(samples[1].weak_label, "spam_candidate")

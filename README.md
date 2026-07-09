@@ -49,7 +49,7 @@ Debian-compatible host with Docker Engine and the Compose plugin.
    .venv/bin/python -m pip install --require-hashes --no-deps --no-build-isolation -r requirements.txt
    ```
 
-3. Create the Telegram session, HMAC key, dataset key, private configuration, and denylist:
+3. Create the Telegram session, HMAC key, evidence key, private configuration, and denylist:
 
    ```shell
    .venv/bin/python scripts/initialize.py
@@ -62,7 +62,7 @@ Debian-compatible host with Docker Engine and the Compose plugin.
 4. Follow [docs/deployment.md](docs/deployment.md) to prepare the host, transfer the generated files,
    build the container, and verify the isolation boundary.
 5. Keep the service in its fresh-database default `monitor` mode. Send test messages, inspect the
-   redacted status, and open the review dashboard through the SSH tunnel.
+   redacted status, and open the Operations Dashboard through the SSH tunnel.
 6. Enable `protect` on the deployment host only after the monitor results and preflight are
    understood:
 
@@ -96,16 +96,22 @@ The challenge response window starts after Telegram confirms prompt delivery. Re
 message and non-numeric input do not consume an attempt. At most one corrective hint is sent per
 challenge.
 
-## Review dashboard
+## Operations Dashboard
 
 The dashboard is served on an owner-only Unix socket. Docker publishes no TCP port; access it from a
 trusted workstation through the supplied SSH tunnel:
 
 ```shell
-scripts/review-tunnel.sh root@server.example
+scripts/dashboard-tunnel.sh root@server.example
 ```
 
-The pending queue is sender-centric, not a conversation archive:
+The home page is an **Operations Dashboard** with three primary areas:
+
+- **Active Cases** for current `quarantined` and `suppressed` senders that may need release;
+- **Pending Reviews** for manual review rows created in monitor mode or fallback paths; and
+- **Evidence Log** for short-lived encrypted audit evidence.
+
+The pending-review queue is sender-centric, not a conversation archive:
 
 - one pending row represents one sender;
 - `Messages observed` is the number of messages consolidated into that row;
@@ -129,18 +135,20 @@ Review decisions apply to all pending entries for that sender:
 - **Dismiss** records no classification and performs no new Telegram action.
 
 Every decision immediately erases the encrypted Telegram reference. Pending references expire after
-at most seven days. See [docs/deployment.md](docs/deployment.md#review-dashboard) for tunnel options
+at most seven days. See [docs/deployment.md](docs/deployment.md#operations-dashboard) for tunnel options
 and operational details.
 
-The **Active enforcement** page covers current quarantines and suppressions. For up to seven days it
-can decrypt the original triggering text/caption, Telegram-provided quoted context, matched rules,
-and a short-lived peer reference. **Allow now** restores the saved archive and notification state
-before allowing the sender; **Keep current restriction** changes nothing. Successful verification,
-manual allowance, suppression expiry, and rollback erase the encrypted snapshot immediately. Media
-is never copied into the snapshot, and the project does not call Telegram's block API.
-Its summary separates total local restriction states from reviewable encrypted snapshots. Older
-states without snapshots remain counted, show their best available historical reason, and are
-explicitly identified as unavailable for detail review.
+The **Active Cases** page covers current quarantines and suppressions. For up to seven days it can
+decrypt the original triggering text/caption, Telegram-provided quoted context and webpage preview,
+button text, full URLs, normalized domains, URL shape, matched rules, and a short-lived peer
+reference. Full URLs are collapsed by default in the UI. **Allow now** restores the saved archive and
+notification state before allowing the sender; **Keep current restriction** records an operator
+decision and changes nothing. Successful verification, manual allowance, suppression expiry, and
+rollback erase the encrypted snapshot immediately. Media is never copied into the snapshot, webpage
+bodies are never fetched, and the project does not call Telegram's block API. Its summary separates
+total local restriction states from reviewable encrypted evidence. Older states without evidence
+remain counted, show their best available historical reason, and are explicitly identified as
+unavailable for detail review.
 
 ## Deterministic rules
 
@@ -192,30 +200,31 @@ Exhausted attempts warn and delete the entire test dialog after 10 seconds. A te
 warns, keeps the dialog archived and muted, deletes only messages recorded for that challenge, and
 then resets the state. Never configure a real correspondent as the test sender.
 
-## Optional encrypted dataset
+## Optional encrypted Evidence Log
 
-Dataset collection is off by default. When enabled, Gatekeeper retains eligible unknown-sender
-messages containing text/captions, Telegram-provided quoted or webpage-preview text, or a detector
-signal. Encrypted samples also include up to three normalized message-side and quoted domains plus
-aggregate URL-shape features; full URLs, path text, query values, and fragment values are excluded.
-Collection
-is capped at three unexpired messages per sender for 30 days by default. This is not a rolling
-“latest three”: after a sender reaches the cap, later messages are ignored until a sample expires or
-is deleted. Monitor mode can gradually reach the cap; protect mode normally collects only the first
-message before the sender enters a challenge or enforcement state. Samples use AES-256-GCM under an
-independent key. Media, profile data, raw IDs, access hashes, and the dedicated test sender are
-excluded.
+Evidence collection is off by default. When enabled, Gatekeeper retains short-lived encrypted review
+evidence for eligible unknown-sender messages containing text/captions, Telegram-provided quoted or
+webpage-preview text, or a detector signal. Evidence is for manual review and rule auditing, not
+model training. Encrypted records may include text/caption, quoted text, Telegram preview text,
+button display text, full URLs, normalized domains, aggregate URL shape, Telegram link kind,
+detector signals, structural features, and planned/actual action.
+
+Collection is capped at three unexpired records per sender for seven days by default. This is not a
+rolling “latest three”: after a sender reaches the cap, later messages are ignored until a record
+expires or is deleted. Monitor mode can gradually reach the cap; protect mode normally collects only
+the first message before the sender enters a challenge or enforcement state. Records use
+AES-256-GCM under an independent key. Media, webpage bodies, profile data, raw IDs, access hashes,
+and the dedicated test sender are excluded. Message bodies, URLs, and button text are not written to
+logs or SQLite plaintext columns.
 
 ```shell
-docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples status
-docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples export /var/lib/tg-pm-gatekeeper/training.jsonl
-docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli samples purge --confirm DELETE-ALL-SAMPLES
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli evidence status
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli evidence purge --confirm DELETE-ALL-SAMPLES
 ```
 
-The dashboard reports rolling collection and skip counts, explains structural-only samples, and
-supports manual Spam, Legitimate, and Uncertain labels. Plaintext exports are sensitive and should be
-transferred to a trusted workstation and deleted from the host immediately. This release collects,
-labels, and exports samples; it does not train or run a model.
+The dashboard reports rolling collection and skip counts, explains structural-only evidence, and
+supports operator outcomes: Correct Enforcement, False Positive, and Insufficient Evidence.
+Plaintext export is intentionally not provided.
 
 ## Documentation
 

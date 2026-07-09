@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 from telethon import functions
 
 from tg_pm_gatekeeper.crypto import IdentifierProtector
-from tg_pm_gatekeeper.dataset import DatasetProtector, TrainingStore
+from tg_pm_gatekeeper.evidence import EvidenceProtector, EvidenceStore
 from tg_pm_gatekeeper.review_admin import ReviewAdminServer
 from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.store import StateStore
@@ -62,7 +62,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.store = StateStore(Path(self.temp.name) / "state.sqlite3")
         self.protector = IdentifierProtector(b"k" * 32)
-        self.review_protector = DatasetProtector(b"r" * 32)
+        self.review_protector = EvidenceProtector(b"r" * 32)
         self.service = GatekeeperService(
             self.store,
             self.protector,
@@ -126,7 +126,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST", f"/review/{self.review_id}", body
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(headers["Location"], "/review")
         item = self.store.review_item(self.review_id)
         self.assertEqual(item.status, "dismissed")
         self.assertIsNone(item.reference)
@@ -147,7 +147,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(headers["Location"], "/review")
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_accepts_missing_origin(self) -> None:
@@ -165,7 +165,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(headers["Location"], "/review")
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_accepts_noncanonical_origin(self) -> None:
@@ -183,7 +183,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(headers["Location"], "/review")
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_rejects_invalid_csrf_for_any_origin(self) -> None:
@@ -203,13 +203,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 self.assertEqual(status, 400)
-                self.assertIn(b"Invalid action token", response)
+                self.assertIn(b"Invalid Action Token", response)
                 self.assertEqual(
                     self.store.review_item(self.review_id).status, "pending"
                 )
 
     async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
-        response = await self.server._index_page()
+        response = await self.server._review_queue_page()
         self.assertIn(b'http-equiv="refresh" content="10"', response)
         self.assertIn(b"Connected", response)
         self.assertIn(b"Updated ", response)
@@ -218,8 +218,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"ID 123456789", response)
 
     async def test_queue_identity_uses_short_lived_memory_cache(self) -> None:
-        first = await self.server._index_page()
-        second = await self.server._index_page()
+        first = await self.server._review_queue_page()
+        second = await self.server._review_queue_page()
         self.assertIn(b"Test Sender", first)
         self.assertIn(b"Test Sender", second)
         self.assertEqual(self.client.entity_requests, 1)
@@ -242,11 +242,11 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"button{width:100%}", response)
 
     async def test_error_page_uses_dashboard_layout_and_actionable_copy(self) -> None:
-        response = self.server._page("Invalid access token")
+        response = self.server._page("Invalid Access Token")
         self.assertIn(b"class='masthead'", response)
         self.assertIn(b"class='error-card'", response)
         self.assertIn(b"has already been used", response)
-        self.assertIn(b"scripts/review-tunnel.sh SSH_TARGET", response)
+        self.assertIn(b"scripts/dashboard-tunnel.sh SSH_TARGET", response)
         self.assertIn(b"width:min(100%,680px)", response)
         self.assertIn(b"class='error-content'", response)
         self.assertIn(b".error-content{width:100%;text-align:left", response)
@@ -297,61 +297,83 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
 
-    async def test_dataset_list_hides_text_until_detail_and_supports_label(
+    async def test_legacy_dataset_and_enforcement_routes_redirect(self) -> None:
+        status, headers, _ = await self.server._dispatch("GET", "/dataset", b"")
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/evidence")
+
+        status, headers, _ = await self.server._dispatch("GET", "/dataset/12", b"")
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/evidence/12")
+
+        status, headers, _ = await self.server._dispatch("GET", "/enforcement", b"")
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases")
+
+        status, headers, _ = await self.server._dispatch(
+            "GET", "/enforcement/sender-key", b""
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases/sender-key")
+
+    async def test_evidence_log_hides_text_until_detail_and_supports_review(
         self,
     ) -> None:
-        training = TrainingStore(
-            Path(self.temp.name) / "training.sqlite3",
-            DatasetProtector(b"d" * 32),
+        evidence = EvidenceStore(
+            Path(self.temp.name) / "evidence.sqlite3",
+            EvidenceProtector(b"d" * 32),
         )
-        self.addCleanup(training.close)
-        sample_id = training.collect(
+        self.addCleanup(evidence.close)
+        sample_id = evidence.collect(
             sender_id=123,
             message_id=1,
             payload={
-                "schema_version": 2,
-                "text": "dataset-private-canary",
-                "quote_text": "quoted-dataset-canary",
+                "schema_version": 4,
+                "text": "evidence-private-canary",
+                "quote_text": "quoted-evidence-canary",
                 "features": {"has_quote": True},
             },
-            weak_label="uncertain",
+            automatic_hint="uncertain",
             retention_days=30,
             max_per_sender=3,
-        ).sample_id
-        self.server.training_store = training
-        index = self.server._dataset_index_page()
-        self.assertNotIn(b"dataset-private-canary", index)
-        self.assertIn(b"Manually labeled", index)
-        self.assertIn(b"Weak spam / legitimate / uncertain", index)
+        ).record_id
+        self.server.evidence_store = evidence
+        index = self.server._evidence_index_page()
+        self.assertNotIn(b"evidence-private-canary", index)
+        self.assertIn(b"Operator Reviewed", index)
+        self.assertIn(b"Automatic Hints", index)
         self.assertIn(b"Expiring within 24 hours", index)
-        self.assertIn(b"Dataset overview", index)
-        self.assertIn(b"Collection activity", index)
+        self.assertIn(b"Evidence Log", index)
+        self.assertIn(b"Collection Activity", index)
         self.assertIn(b"Eligible unknown-sender messages", index)
-        self.assertIn(b"Exportable manual labels", index)
+        self.assertNotIn(b"Exportable manual labels", index)
+        self.assertNotIn(b"Dataset overview", index)
         self.assertNotIn(b"gold labels ready", index)
         self.assertIn(b'font-feature-settings:"tnum" 1,"zero" 1', index)
-        status, _, detail = self.server._dispatch_dataset(
-            "GET", f"/dataset/{sample_id}", b""
+        status, _, detail = self.server._dispatch_evidence(
+            "GET", f"/evidence/{sample_id}", b""
         )
         self.assertEqual(status, 200)
-        self.assertIn(b"dataset-private-canary", detail)
-        self.assertIn(b"quoted-dataset-canary", detail)
-        self.assertIn(b"Quoted context", detail)
-        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
-        status, _, _ = self.server._dispatch_dataset(
-            "POST", f"/dataset/{sample_id}", body
+        self.assertIn(b"evidence-private-canary", detail)
+        self.assertIn(b"quoted-evidence-canary", detail)
+        self.assertIn(b"Quoted Context", detail)
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "correct"}
+        ).encode()
+        status, _, _ = self.server._dispatch_evidence(
+            "POST", f"/evidence/{sample_id}", body
         )
         self.assertEqual(status, 303)
-        self.assertEqual(training.sample(sample_id).manual_label, "spam")
+        self.assertEqual(evidence.record(sample_id).review_outcome, "correct")
         self.assertFalse(self.server.socket_path.exists())
 
-    async def test_dataset_structural_sample_explains_missing_content(self) -> None:
-        training = TrainingStore(
+    async def test_evidence_structural_record_explains_missing_content(self) -> None:
+        evidence = EvidenceStore(
             Path(self.temp.name) / "structural.sqlite3",
-            DatasetProtector(b"d" * 32),
+            EvidenceProtector(b"d" * 32),
         )
-        self.addCleanup(training.close)
-        sample_id = training.collect(
+        self.addCleanup(evidence.close)
+        sample_id = evidence.collect(
             sender_id=123,
             message_id=2,
             payload={
@@ -366,22 +388,22 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 "features": {"forwarded": True, "has_link_button": True},
                 "signals": ["HR-02_FORWARDED_LINK_BUTTON"],
             },
-            weak_label="spam_candidate",
+            automatic_hint="spam_candidate",
             retention_days=30,
             max_per_sender=3,
             sample_kind="structural",
-        ).sample_id
-        self.server.training_store = training
+        ).record_id
+        self.server.evidence_store = evidence
 
-        status, _, detail = self.server._dispatch_dataset(
-            "GET", f"/dataset/{sample_id}", b""
+        status, _, detail = self.server._dispatch_evidence(
+            "GET", f"/evidence/{sample_id}", b""
         )
 
         self.assertEqual(status, 200)
-        self.assertIn(b"Structural-only sample", detail)
+        self.assertIn(b"Structural-Only Evidence", detail)
         self.assertIn(b"spam.invalid", detail)
-        self.assertIn(b"choose Uncertain", detail)
-        self.assertIn(b"Link shape", detail)
+        self.assertIn(b"choose Insufficient evidence", detail)
+        self.assertIn(b"Link Shape", detail)
 
     async def test_active_enforcement_shows_encrypted_content_and_allows_sender(
         self,
@@ -413,26 +435,26 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             reference=reference,
         )
         index = await self.server._enforcement_index_page()
-        self.assertIn(b"Active enforcement", index)
+        self.assertIn(b"Active Cases", index)
         self.assertIn(b"Test Sender (@testsender)", index)
-        self.assertIn(b"Reviewable snapshots", index)
-        self.assertIn(b"State reasons:", index)
-        self.assertIn(b"Every active restriction currently has a reviewable snapshot", index)
+        self.assertIn(b"Reviewable Evidence", index)
+        self.assertIn(b"State Reasons:", index)
+        self.assertIn(b"Every active case currently has reviewable evidence", index)
         self.assertNotIn(b"<dt>Reasons</dt>", index)
         self.assertNotIn(b"enforcement-private-canary", index)
         status, _, detail = await self.server._dispatch_enforcement(
-            "GET", f"/enforcement/{sender_key}", b""
+            "GET", f"/cases/{sender_key}", b""
         )
         self.assertEqual(status, 200)
         self.assertIn(b"enforcement-private-canary", detail)
         self.assertIn(b"quoted-enforcement-canary", detail)
-        self.assertIn(b"Quoted context", detail)
+        self.assertIn(b"Quoted Context", detail)
 
         keep_body = urlencode(
             {"token": self.server._csrf_token, "action": "keep"}
         ).encode()
         status, _, _ = await self.server._dispatch_enforcement(
-            "POST", f"/enforcement/{sender_key}", keep_body
+            "POST", f"/cases/{sender_key}", keep_body
         )
         self.assertEqual(status, 303)
         self.assertEqual(self.store.sender(sender_key).status, "suppressed")
@@ -442,10 +464,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             {"token": self.server._csrf_token, "action": "allow"}
         ).encode()
         status, headers, _ = await self.server._dispatch_enforcement(
-            "POST", f"/enforcement/{sender_key}", body
+            "POST", f"/cases/{sender_key}", body
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/enforcement")
+        self.assertEqual(headers["Location"], "/cases")
         self.assertEqual(self.store.sender(sender_key).status, "allowed")
         self.assertIsNone(self.store.enforcement_review(sender_key))
 
@@ -484,9 +506,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         page = await self.server._enforcement_index_page()
         self.assertIn(b"manual spam 1", page)
-        self.assertIn(b"1 active restriction", page)
+        self.assertIn(b"1 active case", page)
         self.assertIn(b"has no encrypted snapshot", page)
-        self.assertIn(b"No reviewable active restrictions", page)
+        self.assertIn(b"No active cases", page)
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
         body = urlencode(
@@ -496,13 +518,40 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST", f"/review/{self.review_id}", body
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/")
+        self.assertEqual(headers["Location"], "/review")
         self.assertEqual(self.store.sender("sender").status, "allowed")
         self.assertEqual(self.cancelled, ["sender"])
         self.assertIsNone(self.store.review_item(self.review_id).reference)
         self.assertNotIn("sender", self.server._identity_cache)
 
     async def test_spam_decision_performs_explicit_telegram_actions(self) -> None:
+        self.client.message = SimpleNamespace(
+            message="transient-canary https://body.invalid/private?token=body-secret",
+            media=SimpleNamespace(
+                webpage=SimpleNamespace(
+                    url="https://preview.invalid/path?token=preview-secret",
+                    site_name="Preview Site",
+                    title="Preview Title",
+                    description="Preview Description",
+                    author=None,
+                )
+            ),
+            reply_to=SimpleNamespace(
+                quote_text="quoted context https://quote.invalid/secret"
+            ),
+            reply_markup=SimpleNamespace(
+                rows=[
+                    SimpleNamespace(
+                        buttons=[
+                            SimpleNamespace(
+                                text="Open private offer",
+                                url="https://button.invalid/start?token=button-secret",
+                            )
+                        ]
+                    )
+                ]
+            ),
+        )
         body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
@@ -517,7 +566,15 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(item)
         self.assertEqual(item.reason, "manual_spam")
         payload = self.review_protector.open_enforcement(item.envelope)
-        self.assertEqual(payload["text"], "transient-canary")
+        self.assertEqual(payload["schema_version"], 4)
+        self.assertIn("transient-canary", payload["text"])
+        self.assertIn("Preview Title", payload["preview_text"])
+        self.assertEqual(payload["button_texts"], ["Open private offer"])
+        serialized = str(payload)
+        self.assertIn("button-secret", serialized)
+        self.assertIn("preview-secret", serialized)
+        self.assertIn("body-secret", serialized)
+        self.assertIn("quote.invalid", serialized)
         self.assertIsNotNone(self.store.dialog_snapshot("sender"))
         self.assertEqual(self.cancelled, ["sender"])
 

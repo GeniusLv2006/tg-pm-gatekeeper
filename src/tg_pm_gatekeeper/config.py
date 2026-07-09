@@ -60,6 +60,32 @@ def _boolean(name: str, default: bool = False) -> bool:
     raise ConfigurationError(f"{name} must be on or off")
 
 
+def _configured_name(name: str, legacy_name: str | None = None) -> str:
+    if name in os.environ:
+        return name
+    if legacy_name is not None and legacy_name in os.environ:
+        return legacy_name
+    return name
+
+
+def _boolean_compat(name: str, legacy_name: str, default: bool = False) -> bool:
+    return _boolean(_configured_name(name, legacy_name), default)
+
+
+def _bounded_int_compat(
+    name: str, legacy_name: str, default: int, minimum: int, maximum: int
+) -> int:
+    return _bounded_int(_configured_name(name, legacy_name), default, minimum, maximum)
+
+
+def _path_compat(name: str, legacy_name: str, default: str) -> Path:
+    if name in os.environ:
+        return Path(os.environ[name])
+    if legacy_name in os.environ:
+        return Path(os.environ[legacy_name])
+    return Path(default)
+
+
 def read_private_file(
     path: Path, *, minimum_bytes: int = 1, strip: bool = False
 ) -> bytes:
@@ -95,11 +121,11 @@ class Settings:
     mute_days: int
     outbound_limit_per_hour: int
     test_sender_id: int | None
-    dataset_collection: bool
-    dataset_path: Path
-    dataset_key_file: Path
-    dataset_retention_days: int
-    dataset_max_messages_per_sender: int
+    evidence_collection: bool
+    evidence_path: Path
+    evidence_key_file: Path
+    evidence_retention_days: int
+    evidence_max_records_per_sender: int
 
     @classmethod
     def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
@@ -133,8 +159,11 @@ class Settings:
             review_retention_days=min(_positive_int("TG_REVIEW_RETENTION_DAYS", 7), 7),
             review_socket_path=Path(
                 os.environ.get(
-                    "TG_REVIEW_SOCKET_PATH",
-                    "/var/lib/tg-pm-gatekeeper/review.sock",
+                    "TG_DASHBOARD_SOCKET_PATH",
+                    os.environ.get(
+                        "TG_REVIEW_SOCKET_PATH",
+                        "/var/lib/tg-pm-gatekeeper/review.sock",
+                    ),
                 )
             ),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
@@ -142,30 +171,59 @@ class Settings:
                 "TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100
             ),
             test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
-            dataset_collection=_boolean("TG_DATASET_COLLECTION"),
-            dataset_path=Path(
-                os.environ.get(
-                    "TG_DATASET_PATH",
-                    "/var/lib/tg-pm-gatekeeper/training.sqlite3",
-                )
+            evidence_collection=_boolean_compat(
+                "TG_EVIDENCE_COLLECTION", "TG_DATASET_COLLECTION"
             ),
-            dataset_key_file=Path(
-                os.environ.get("TG_DATASET_KEY_FILE", "/run/secrets/dataset_key")
+            evidence_path=_path_compat(
+                "TG_EVIDENCE_PATH",
+                "TG_DATASET_PATH",
+                "/var/lib/tg-pm-gatekeeper/evidence.sqlite3",
             ),
-            dataset_retention_days=_bounded_int("TG_DATASET_RETENTION_DAYS", 30, 1, 90),
-            dataset_max_messages_per_sender=_bounded_int(
-                "TG_DATASET_MAX_MESSAGES_PER_SENDER", 3, 1, 10
+            evidence_key_file=_path_compat(
+                "TG_EVIDENCE_KEY_FILE",
+                "TG_DATASET_KEY_FILE",
+                "/run/secrets/evidence_key",
+            ),
+            evidence_retention_days=_bounded_int_compat(
+                "TG_EVIDENCE_RETENTION_DAYS", "TG_DATASET_RETENTION_DAYS", 7, 1, 90
+            ),
+            evidence_max_records_per_sender=_bounded_int_compat(
+                "TG_EVIDENCE_MAX_RECORDS_PER_SENDER",
+                "TG_DATASET_MAX_MESSAGES_PER_SENDER",
+                3,
+                1,
+                10,
             ),
         )
-        if settings.dataset_path == settings.database_path:
-            raise ConfigurationError("training and state databases must be separate")
+        if settings.evidence_path == settings.database_path:
+            raise ConfigurationError("evidence and state databases must be separate")
         private_paths = {
             settings.session_file,
             settings.hmac_key_file,
-            settings.dataset_key_file,
+            settings.evidence_key_file,
         }
         if len(private_paths) != 3:
             raise ConfigurationError(
-                "session, state HMAC, and dataset keys must be separate"
+                "session, state HMAC, and evidence keys must be separate"
             )
         return settings
+
+    @property
+    def dataset_collection(self) -> bool:
+        return self.evidence_collection
+
+    @property
+    def dataset_path(self) -> Path:
+        return self.evidence_path
+
+    @property
+    def dataset_key_file(self) -> Path:
+        return self.evidence_key_file
+
+    @property
+    def dataset_retention_days(self) -> int:
+        return self.evidence_retention_days
+
+    @property
+    def dataset_max_messages_per_sender(self) -> int:
+        return self.evidence_max_records_per_sender

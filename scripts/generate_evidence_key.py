@@ -10,13 +10,13 @@ from pathlib import Path
 
 
 def main() -> None:
-    destination = Path("dataset.key")
+    destination = Path("evidence.key")
     if destination.exists():
-        raise SystemExit("refusing to overwrite dataset.key")
+        raise SystemExit("refusing to overwrite evidence.key")
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "wb") as output:
         output.write(secrets.token_bytes(32))
-    print("Dataset key written to dataset.key with mode 0600; never commit it.")
+    print("Evidence key written to evidence.key with mode 0600; never commit it.")
 
 
 if __name__ == "__main__":
