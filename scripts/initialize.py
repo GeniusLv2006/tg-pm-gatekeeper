@@ -99,7 +99,8 @@ def main() -> None:
         raise
 
     print("Initialization files created with mode 0600.")
-    print("Do not print, commit, or send their contents.")
+    print("Transfer them only to the intended host over a trusted channel.")
+    print("Do not print, commit, paste, share, or otherwise disclose their contents.")
 
 
 if __name__ == "__main__":

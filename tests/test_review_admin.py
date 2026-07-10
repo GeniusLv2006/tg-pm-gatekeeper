@@ -111,13 +111,23 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deleted_telegram_message_can_resolve_local_review(self) -> None:
         self.client.message = None
+        state = self.store.suppress(
+            "sender", "critical_rule", until=None, reference=b"reference"
+        )
+        self.store.schedule_action(
+            "sender",
+            reason="critical_rule",
+            reference=b"reference",
+            execute_at=int(time.time()) + 600,
+            expected_revision=state.revision,
+        )
         status, _, response = await self.server._dispatch(
             "GET", f"/review/{self.review_id}", b""
         )
         self.assertEqual(status, 200)
-        self.assertIn(b"Telegram message unavailable", response)
-        self.assertIn(b"Resolve deleted conversation", response)
-        self.assertIn(b"without changing Telegram or trust state", response)
+        self.assertIn(b"Telegram Message Unavailable", response)
+        self.assertIn(b"Resolve and Cancel Pending Jobs", response)
+        self.assertIn(b"Telegram and trust state are unchanged", response)
 
         body = urlencode(
             {"token": self.server._csrf_token, "action": "dismiss"}
@@ -130,6 +140,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         item = self.store.review_item(self.review_id)
         self.assertEqual(item.status, "dismissed")
         self.assertIsNone(item.reference)
+        self.assertEqual(self.store.sender("sender").status, "suppressed")
+        self.assertEqual(self.store.pending_actions(), [])
 
     async def test_deleted_review_resolves_through_authenticated_post(self) -> None:
         self.client.message = None
@@ -216,6 +228,26 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"checks the connection every 10 seconds", response)
         self.assertIn(b"Test Sender (@testsender)", response)
         self.assertIn(b"ID 123456789", response)
+        self.assertIn(b"Review Reason", response)
+        self.assertNotIn(b">Simulation<", response)
+
+    async def test_queue_labels_protect_mode_exception_as_real_review_reason(
+        self,
+    ) -> None:
+        reference = self.protector.seal_review_reference(987654321, 123456789, 43)
+        self.store.enqueue_review(
+            "protect-sender",
+            reference,
+            "challenge_unavailable",
+            "[]",
+            "{}",
+            int(time.time()) + 700,
+        )
+
+        response = await self.server._review_queue_page()
+
+        self.assertIn("Challenge Unavailable · Protect".encode(), response)
+        self.assertNotIn(b">Simulation<", response)
 
     async def test_queue_identity_uses_short_lived_memory_cache(self) -> None:
         first = await self.server._review_queue_page()
@@ -247,6 +279,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"class='error-card'", response)
         self.assertIn(b"has already been used", response)
         self.assertIn(b"scripts/dashboard-tunnel.sh SSH_TARGET", response)
+        self.assertNotIn(b"Return to Dashboard", response)
         self.assertIn(b"width:min(100%,680px)", response)
         self.assertIn(b"class='error-content'", response)
         self.assertIn(b".error-content{width:100%;text-align:left", response)
@@ -268,10 +301,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             await self.server.stop()
 
     async def test_production_dispatch_requires_access_cookie(self) -> None:
-        status, _, _ = await self.server._dispatch(
+        status, _, response = await self.server._dispatch(
             "GET", "/", b"", request_headers={"host": "127.0.0.1:8765"}
         )
         self.assertEqual(status, 404)
+        self.assertIn(b"Dashboard Session Missing", response)
+        self.assertNotIn(b"Return to Dashboard", response)
         login_token = self.server._access_token
         status, headers, _ = await self.server._dispatch(
             "GET",
@@ -332,17 +367,27 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 "text": "evidence-private-canary",
                 "quote_text": "quoted-evidence-canary",
                 "features": {"has_quote": True},
+                "planned_action": "challenge",
+                "actual_action": "would_challenge",
             },
             automatic_hint="uncertain",
             retention_days=30,
             max_per_sender=3,
         ).record_id
+        evidence.collect(
+            sender_id=123,
+            message_id=2,
+            payload={"schema_version": 4, "text": "second-private-canary"},
+            automatic_hint="uncertain",
+            retention_days=30,
+            max_per_sender=3,
+        )
         self.server.evidence_store = evidence
         index = self.server._evidence_index_page()
         self.assertNotIn(b"evidence-private-canary", index)
         self.assertIn(b"Operator Reviewed", index)
-        self.assertIn(b"Automatic Hints", index)
-        self.assertIn(b"Expiring within 24 hours", index)
+        self.assertIn(b"Spam / Legitimate / Uncertain Hints", index)
+        self.assertIn(b"Expiring Within 24 Hours", index)
         self.assertIn(b"Evidence Log", index)
         self.assertIn(b"Collection Activity", index)
         self.assertIn(b"Eligible unknown-sender messages", index)
@@ -350,6 +395,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"Dataset overview", index)
         self.assertNotIn(b"gold labels ready", index)
         self.assertIn(b'font-feature-settings:"tnum" 1,"zero" 1', index)
+        sender_prefix = evidence.records()[0].sender_token[:8].encode()
+        self.assertEqual(index.count(b"Sender " + sender_prefix), 2)
         status, _, detail = self.server._dispatch_evidence(
             "GET", f"/evidence/{sample_id}", b""
         )
@@ -357,6 +404,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"evidence-private-canary", detail)
         self.assertIn(b"quoted-evidence-canary", detail)
         self.assertIn(b"Quoted Context", detail)
+        self.assertIn(b"Assessment Context", detail)
+        self.assertIn(b"Correct Assessment", detail)
+        self.assertIn(b"Full Decrypted Evidence Payload", detail)
+        self.assertIn("Simulated Challenge · Monitor".encode(), detail)
         body = urlencode(
             {"token": self.server._csrf_token, "action": "correct"}
         ).encode()
@@ -400,10 +451,52 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertIn(b"Structural-Only Evidence", detail)
+        self.assertIn(b"Limited Textual Evidence", detail)
         self.assertIn(b"spam.invalid", detail)
-        self.assertIn(b"choose Insufficient evidence", detail)
+        self.assertIn(b"Select Insufficient Evidence", detail)
         self.assertIn(b"Link Shape", detail)
+        self.assertNotIn(b"Structural-Only Evidence", detail)
+
+    async def test_active_case_uses_case_specific_limited_evidence_guidance(
+        self,
+    ) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        reference = self.protector.seal_review_reference(
+            123456789, -987654321, 42
+        )
+        envelope = self.review_protector.seal_enforcement(
+            {
+                "schema_version": 4,
+                "text": "",
+                "quote_text": "",
+                "preview_text": "",
+                "button_texts": ["Open"],
+                "urls": [{"url": "https://example.invalid"}],
+                "signals": ["HR-01_MULTIPLE_LINK_BUTTONS"],
+            }
+        )
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=reference,
+            envelope=envelope,
+            reason="critical_rule",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            reference=reference,
+        )
+
+        item = self.store.enforcement_review(sender_key)
+        status, _, detail = await self.server._show_enforcement(item)
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"Limited Textual Evidence", detail)
+        self.assertIn(b"deciding whether to allow the sender", detail)
+        self.assertNotIn(b"Select Insufficient Evidence", detail)
+        self.assertIn(b"Decrypted Local Evidence", detail)
 
     async def test_active_enforcement_shows_encrypted_content_and_allows_sender(
         self,
@@ -449,6 +542,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"enforcement-private-canary", detail)
         self.assertIn(b"quoted-enforcement-canary", detail)
         self.assertIn(b"Quoted Context", detail)
+        self.assertIn(b"No saved dialog state is available", detail)
 
         keep_body = urlencode(
             {"token": self.server._csrf_token, "action": "keep"}
@@ -471,6 +565,37 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "allowed")
         self.assertIsNone(self.store.enforcement_review(sender_key))
 
+    async def test_expired_suppression_does_not_offer_to_extend_restriction(
+        self,
+    ) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        reference = self.protector.seal_review_reference(
+            123456789, -987654321, 42
+        )
+        envelope = self.review_protector.seal_enforcement(
+            {"schema_version": 4, "text": "private-canary"}
+        )
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=reference,
+            envelope=envelope,
+            reason="challenge_timeout",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.suppress(
+            sender_key,
+            "challenge_timeout",
+            until=int(time.time()) - 1,
+            reference=reference,
+        )
+
+        item = self.store.enforcement_review(sender_key)
+        status, _, detail = await self.server._show_enforcement(item)
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"Release pending", detail)
+        self.assertIn(b"Record Without Extending Restriction", detail)
+
     async def test_active_enforcement_disables_allow_without_identity(self) -> None:
         sender_key = self.protector.sender_key(987654321)
         envelope = self.review_protector.seal_enforcement(
@@ -487,7 +612,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         item = self.store.enforcement_review(sender_key)
         status, _, detail = await self.server._show_enforcement(item)
         self.assertEqual(status, 200)
-        self.assertIn(b"Allow unavailable", detail)
+        self.assertIn(b"Allow Unavailable", detail)
         self.assertIn(b"disabled", detail)
 
     async def test_active_enforcement_explains_legacy_state_without_snapshot(
@@ -505,7 +630,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.store.decide_review(review_id, "spam"))
 
         page = await self.server._enforcement_index_page()
-        self.assertIn(b"manual spam 1", page)
+        self.assertIn(b"Manual Spam Review 1", page)
         self.assertIn(b"1 active case", page)
         self.assertIn(b"has no encrypted snapshot", page)
         self.assertIn(b"No active cases", page)

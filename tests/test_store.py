@@ -169,7 +169,7 @@ class StoreTests(unittest.TestCase):
         self.assertIsNotNone(self.store.claim_action(action_id))
         self.store.set_mode("monitor")
         self.assertEqual(self.store.pending_actions(), [])
-        self.assertEqual(self.store.statistics()["pending_reviews"], 1)
+        self.assertEqual(self.store.statistics(now=100)["pending_reviews"], 1)
 
         other = self.store.suppress(
             "other", "critical_rule", until=None, reference=b"other", now=200
@@ -240,13 +240,21 @@ class StoreTests(unittest.TestCase):
         review_id = self.store.enqueue_review(
             "sender", b"sealed-reference", "would_challenge", "[]", "{}", 700, 100
         )
-        self.assertEqual(self.store.statistics()["pending_reviews"], 1)
+        self.assertEqual(self.store.statistics(now=100)["pending_reviews"], 1)
         self.assertTrue(self.store.decide_review(review_id, "legitimate", 200))
         item = self.store.review_item(review_id)
         self.assertIsNotNone(item)
         self.assertEqual(item.status, "legitimate")
         self.assertIsNone(item.reference)
-        self.assertEqual(self.store.statistics()["pending_reviews"], 0)
+        self.assertEqual(self.store.statistics(now=200)["pending_reviews"], 0)
+
+    def test_statistics_exclude_expired_pending_reviews_before_prune(self) -> None:
+        self.store.enqueue_review(
+            "sender", b"sealed-reference", "would_challenge", "[]", "{}", 200, 100
+        )
+
+        self.assertEqual(self.store.statistics(now=199)["pending_reviews"], 1)
+        self.assertEqual(self.store.statistics(now=200)["pending_reviews"], 0)
 
     def test_review_reference_expires_at_its_own_deadline(self) -> None:
         self.store.enqueue_review(

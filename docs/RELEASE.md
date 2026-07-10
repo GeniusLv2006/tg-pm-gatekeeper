@@ -1,47 +1,60 @@
-# Release and deployment policy
+# Maintainer release policy
 
-This document is the authoritative workflow for changing, publishing, and deploying this project.
-It keeps high-risk changes reviewable without forcing the full pull-request ceremony onto changes
-that cannot affect runtime behavior.
+> [!NOTE]
+> This document is for maintainers publishing changes to the repository. You do not need it to
+> install or run Gatekeeper. Use [deployment.md](deployment.md) for installation, updates, and daily
+> operation.
 
-## 1. Classify the change
+This policy keeps behavior and security changes reviewable while allowing genuinely low-risk edits to
+move quickly.
 
-### Direct-to-main changes
+## Choose the publication path
 
-A maintainer may commit and push directly to `main` only when every changed file is limited to:
+| Change | Pull request? | Service deployment? | Image rebuild? |
+| --- | --- | --- | --- |
+| Prose, spelling, comments, or repository metadata with no boundary change | Optional | No | No |
+| Tests or fixtures with no production dependency change | Optional | No | No |
+| Runtime behavior under `src/` | Required | Yes | Yes |
+| Configuration consumed by the service | Required | Yes | Usually yes |
+| Docker, build, or runtime dependencies | Required | Yes | Yes |
+| Executable `scripts/` or `deploy/` changes | Required | Pull to the host when operators need them | Only if image inputs also changed |
+| Security, privacy, networking, storage, logging, or authentication boundaries | Required | Depends on affected behavior | Depends on affected files |
+| License or contribution terms | Required | No | No |
 
-- prose documentation that does not redefine a security boundary;
-- tests or test fixtures that do not change production dependencies;
-- comments, formatting, spelling, or repository metadata;
+Use a pull request whenever the classification is uncertain.
+
+### Direct-to-main eligibility
+
+A maintainer may commit directly to `main` only when every changed file is limited to:
+
+- prose that does not redefine security, privacy, deployment, or runtime behavior;
+- tests or fixtures that do not change production dependencies;
+- comments, formatting, spelling, or repository metadata; or
 - `.gitignore` entries that do not hide source, configuration examples, or audit evidence.
 
-Direct changes still require a focused diff review and a Conventional Commit. GitHub Actions runs
-on the resulting `main` commit and must be checked before any related work continues.
+Review the complete diff and use a Conventional Commit. After pushing, confirm the `test` and
+`secrets` GitHub Actions jobs pass before related work continues.
 
-### Pull-request changes
+### Pull requests required
 
-A pull request is required when any change affects or could affect:
+Use a pull request for changes to:
 
-- `src/` runtime behavior or Telegram API actions;
-- spam rules, challenges, allowlisting, quarantine, or review decisions;
-- stored data, schema migrations, retention, encryption, authentication, or logging;
+- Telegram actions, spam rules, challenges, trust, quarantine, suppression, or review decisions;
+- stored data, migrations, retention, encryption, authentication, or logging;
 - networking, Unix sockets, SSH behavior, Docker isolation, or host permissions;
-- executable files under `scripts/` or `deploy/`;
-- dependencies, pinned images, GitHub Actions, build configuration, or deployment commands;
-- the project license, source-file license notices, or contribution licensing terms;
-- `SECURITY.md` or a documented security/privacy guarantee.
+- executable scripts, dependencies, pinned images, CI, or build configuration;
+- `SECURITY.md` or any documented security/privacy guarantee; or
+- project licensing and contribution terms.
 
-When classification is uncertain, use a pull request.
+## Validate the change
 
-## 2. Validate locally
-
-For prose-only direct changes:
+For a prose-only direct change:
 
 ```shell
 git diff --check
 ```
 
-For tests, executable scripts, configuration, or runtime changes:
+For runtime, configuration, test, executable, Docker, or dependency changes:
 
 ```shell
 PYTHONPATH=src .venv/bin/python -m unittest discover -v
@@ -50,76 +63,67 @@ docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
 
-Also run syntax or behavior checks specific to changed executable files. Never use real Telegram
-identities, messages, credentials, URLs, databases, or logs as test data.
+Add checks specific to the changed executable or workflow. Test data must not contain real Telegram
+identities, messages, credentials, URLs, databases, or logs.
 
-## 3. Publish
+## Publish
 
 ### Direct path
 
 1. Confirm the worktree contains only eligible low-risk changes.
 2. Commit on `main` with a Conventional Commit.
 3. Push `main` over SSH.
-4. Confirm the `test` and `secrets` GitHub Actions jobs pass.
+4. Confirm both GitHub Actions jobs pass.
 
 ### Pull-request path
 
-1. Branch from current `main` using a narrow `codex/<description>` name.
+1. Create a narrow `codex/<description>` branch from current `main`.
 2. Commit only the intended scope with a Conventional Commit.
 3. Push the branch over SSH.
-4. Open a ready-for-review PR. Use Draft only when the implementation is genuinely incomplete.
-5. For ordinary changes, enable Squash auto-merge once the scope has been reviewed; GitHub merges
-   only after the `test` and `secrets` jobs pass. If auto-merge is unavailable, wait for both jobs
-   and merge once. Security-sensitive changes require an explicit human review before merge.
-6. Keep the squash title in the form `<conventional title> (#<PR>)`.
-7. Delete the merged branch and fast-forward local `main`.
+4. Open a ready-for-review PR. Use Draft only while work is genuinely incomplete.
+5. Describe behavior, security/privacy impact, licensing impact when applicable, validation, and
+   deployment requirements.
+6. For ordinary changes, enable squash auto-merge after review. Security-sensitive changes require
+   explicit human review.
+7. Keep the squash title in the form `<conventional title> (#<PR>)`.
+8. After merge, delete the branch and fast-forward local `main`.
 
-Do not bypass a failing check. Test count alone is not a reason to remove coverage; execution time,
-signal quality, and maintenance cost are the relevant measures.
+Never bypass a failing check.
 
-## 4. Decide whether deployment is required
+## Deploy a merged change
 
-No service deployment is required for changes limited to documentation, tests, license text or
-source notices, `.gitignore`, or repository metadata such as the `pyproject.toml` license expression.
-Synchronizing the server checkout is optional and must not restart the healthy container.
+No deployment is needed for changes limited to documentation, tests, license text, source notices,
+`.gitignore`, or repository metadata. Pulling those changes to the server is optional and must not
+restart a healthy container.
 
-Deploy when the merged commit changes runtime code, configuration consumed by the service, Docker
-or dependency inputs, database behavior, or an operator workflow that must exist on the host.
+Deploy when a merged commit changes runtime code, service configuration, Docker or dependency inputs,
+database behavior, or an operator workflow needed on the host.
 
-Rebuild the image when executable, build, or dependency content in any of these changes:
+Rebuild the image when executable content changes in:
 
-- `src/`, `Dockerfile`, `compose.yaml`, `pyproject.toml`;
+- `src/`, `Dockerfile`, `compose.yaml`, or `pyproject.toml`; or
 - `requirements.txt` or `requirements-build.txt`.
 
-Comments, license notices, and metadata-only edits in those files do not by themselves require a
-rebuild.
+Comments, notices, and metadata-only edits in those files do not require a rebuild.
 
-Host-only scripts and documentation may require a repository pull but not an image rebuild.
+For every live update:
 
-## 5. Deploy and verify
+1. Confirm the server checkout is clean; record its commit, container health, and current mode.
+2. Create a temporary remote-only backup only for migrations or persistent-state changes.
+3. Fast-forward the server to the reviewed `main` commit.
+4. Rebuild and recreate the container only when required above.
+5. Verify the deployed commit, health, restart count, mode, redacted status, logs, private-file
+   permissions, dashboard socket, and absence of unexpected port mappings.
+6. Remove temporary backups and tunnels after successful verification.
 
-Follow [deployment.md](deployment.md) for host preparation. For every live update:
+If verification fails, preserve the failed state needed for diagnosis before considering a rollback.
+Do not use destructive Git or Docker commands on user data. The operator commands and security checks
+are in [deployment.md](deployment.md).
 
-1. Verify the server checkout is clean, record its current commit, and confirm the container is
-   healthy.
-2. Confirm the service mode before changing anything. Deployment must not silently switch from
-   `monitor` to `protect`.
-3. Create a remote-only temporary backup only for schema, migration, or persistent-state changes.
-4. Fast-forward the server checkout to the reviewed `main` commit.
-5. Rebuild and recreate the container only when the file classification above requires it.
-6. Verify the exact deployed commit, container health, restart count, mode, redacted status, logs,
-   secret permissions, socket permissions, and absence of unexpected port mappings.
-7. Remove temporary backups and tunnels after successful verification.
+## Local maintainer notes
 
-If verification fails, stop further actions. Restore the prior image or commit only after preserving
-the failed state needed for diagnosis; never discard user data with a destructive Git or Docker
-command.
+Machine-specific aliases, paths, and preferred commands belong in the ignored repository-root file
+`RELEASE.local.md`. It must never contain credentials, Telegram session values, HMAC keys, raw user
+identifiers, message content, or database copies.
 
-## 6. Local operator notes
-
-Machine-specific host aliases, paths, preferred commands, and maintenance notes belong in the
-repository-root file `RELEASE.local.md`. That file is ignored by Git and must never contain API
-credentials, Telegram Session values, HMAC keys, raw user identifiers, message content, or copies of
-the runtime database.
-
-The tracked policy and deployment documentation must remain usable without `RELEASE.local.md`.
+The tracked documentation must remain usable without that file.

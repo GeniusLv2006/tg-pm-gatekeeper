@@ -1419,7 +1419,8 @@ class StateStore:
                 "DELETE FROM enforcement_reviews WHERE expires_at <= ?", (timestamp,)
             )
 
-    def statistics(self) -> dict[str, int | str | None]:
+    def statistics(self, *, now: int | None = None) -> dict[str, int | str | None]:
+        timestamp = int(time.time()) if now is None else now
         with self._lock:
             states = {
                 row["status"]: int(row["count"])
@@ -1435,7 +1436,9 @@ class StateStore:
             ).fetchone()
             pending_reviews = int(
                 self._connection.execute(
-                    "SELECT COUNT(*) FROM review_queue WHERE status='pending'"
+                    "SELECT COUNT(*) FROM review_queue WHERE status='pending' "
+                    "AND expires_at>?",
+                    (timestamp,),
                 ).fetchone()[0]
             )
             challenge_metrics = {
@@ -1447,7 +1450,7 @@ class StateStore:
                     "'CHALLENGE_WRONG_REPLY_TARGET','CHALLENGE_NON_NUMERIC',"
                     "'CHALLENGE_TIMEOUT','attempts_exhausted',"
                     "'CHALLENGE_RESTORE') GROUP BY rule_code",
-                    (int(time.time()) - 7 * 86400,),
+                    (timestamp - 7 * 86400,),
                 )
             }
             pending_actions = int(

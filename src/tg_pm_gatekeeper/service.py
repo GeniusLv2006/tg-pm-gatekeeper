@@ -43,6 +43,17 @@ VERIFICATION_TIMEOUT_TEXT = (
     "⛔ Verification Failed\n\nThe verification window expired.\n\n"
     "This conversation will be deleted in 10 seconds. Try again in 24 hours."
 )
+TEST_VERIFICATION_FAILED_TEXT = (
+    "⛔ Verification Failed\n\nThis test conversation remains archived and muted.\n\n"
+    "This conversation will be deleted in 10 seconds. The test sender will reset "
+    "after 60 seconds."
+)
+TEST_VERIFICATION_TIMEOUT_TEXT = (
+    "⛔ Verification Failed\n\nThe verification window expired.\n\n"
+    "Messages recorded for this test challenge will be deleted in 10 seconds. "
+    "The conversation will remain archived and muted, and the test sender will reset "
+    "after 60 seconds."
+)
 FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
@@ -946,13 +957,18 @@ class GatekeeperService:
         self.store.audit(sender_key, "CHALLENGE_INCORRECT", "rejected", now)
         if attempts >= self.challenge_max_attempts:
             actions.cancel_timeout(sender_key)
+            failed_text = (
+                TEST_VERIFICATION_FAILED_TEXT
+                if sender_key == self.test_sender_key
+                else VERIFICATION_FAILED_TEXT
+            )
             warning_message_id = await self._send_notice(
                 sender_key,
                 actions,
-                VERIFICATION_FAILED_TEXT,
+                failed_text,
                 now,
                 formatting=emphasized(
-                    VERIFICATION_FAILED_TEXT,
+                    failed_text,
                     "⛔ Verification Failed",
                     "10 seconds",
                 ),
@@ -1120,12 +1136,17 @@ class GatekeeperService:
         *,
         fallback_reference: bytes | None = None,
     ) -> None:
+        timeout_text = (
+            TEST_VERIFICATION_TIMEOUT_TEXT
+            if sender_key == self.test_sender_key
+            else VERIFICATION_TIMEOUT_TEXT
+        )
         notice_id = await self._send_notice(
             sender_key,
             actions,
-            VERIFICATION_TIMEOUT_TEXT,
+            timeout_text,
             now,
-            formatting=notice_formatting(VERIFICATION_TIMEOUT_TEXT),
+            formatting=notice_formatting(timeout_text),
         )
         if sender_key != self.test_sender_key:
             terminal = self.store.sender(sender_key)
