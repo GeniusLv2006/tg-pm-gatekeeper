@@ -14,7 +14,6 @@ from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 
 from .config import ConfigurationError, Settings, read_private_file
-from .evidence import EvidenceStore
 from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
 from .service import (
@@ -381,13 +380,10 @@ class TelegramAdapter:
         settings: Settings,
         store: StateStore,
         service: GatekeeperService,
-        *,
-        evidence_store: EvidenceStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.service = service
-        self.evidence_store = evidence_store
         session = read_private_file(
             settings.session_file, minimum_bytes=64, strip=True
         ).decode("ascii")
@@ -409,10 +405,6 @@ class TelegramAdapter:
             self.client,
             mute_days=settings.mute_days,
             cancel_timeout=self.cancel_timeout,
-            evidence_store=evidence_store,
-            evidence_collection=settings.evidence_collection,
-            evidence_retention_days=settings.evidence_retention_days,
-            evidence_max_records_per_sender=settings.evidence_max_records_per_sender,
         )
 
     async def run(self) -> None:
@@ -449,10 +441,6 @@ class TelegramAdapter:
             write_runtime_heartbeat(HEARTBEAT_PATH, now)
             if now >= next_prune:
                 self.store.prune(self.settings.audit_retention_days, now)
-                if self.evidence_store is not None:
-                    self.evidence_store.prune(
-                        now, retention_days=self.settings.evidence_retention_days
-                    )
                 next_prune = now + PRUNE_INTERVAL_SECONDS
             await asyncio.sleep(60)
 

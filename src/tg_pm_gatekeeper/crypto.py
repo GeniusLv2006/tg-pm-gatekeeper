@@ -9,6 +9,9 @@ import json
 import secrets
 
 import pyaes
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 class IdentifierProtector:
@@ -81,3 +84,43 @@ class IdentifierProtector:
     @staticmethod
     def matches(expected: str, actual: str) -> bool:
         return hmac.compare_digest(expected, actual)
+
+
+class ActiveCaseProtector:
+    """Encrypt Active Case content with a dedicated key and domain."""
+
+    def __init__(self, key: bytes) -> None:
+        if len(key) < 32:
+            raise ValueError("review key must contain at least 32 bytes")
+        self._key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"active-case-content:v1",
+        ).derive(key)
+
+    def seal(self, payload: dict[str, object]) -> bytes:
+        nonce = secrets.token_bytes(12)
+        plaintext = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        ciphertext = AESGCM(self._key).encrypt(
+            nonce, plaintext, b"tg-pm-gatekeeper:active-case:v1"
+        )
+        return b"\x01" + nonce + ciphertext
+
+    def open(self, envelope: bytes) -> dict[str, object]:
+        if len(envelope) < 30 or envelope[0] != 1:
+            raise ValueError("invalid active case envelope")
+        try:
+            plaintext = AESGCM(self._key).decrypt(
+                envelope[1:13],
+                envelope[13:],
+                b"tg-pm-gatekeeper:active-case:v1",
+            )
+            value = json.loads(plaintext.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("invalid active case envelope") from exc
+        if not isinstance(value, dict):
+            raise ValueError("invalid active case envelope")
+        return value

@@ -11,8 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tg_pm_gatekeeper.crypto import IdentifierProtector
-from tg_pm_gatekeeper.evidence import EvidenceProtector, EvidenceStore
+from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
 from tg_pm_gatekeeper.rules import MessageFacts
 from tg_pm_gatekeeper.service import (
     DIGITS_REQUIRED_TEXT,
@@ -165,7 +164,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.database_path = Path(self.temp.name) / "state.sqlite3"
         self.store = StateStore(self.database_path)
         self.protector = IdentifierProtector(b"k" * 32)
-        self.review_protector = EvidenceProtector(b"r" * 32)
+        self.review_protector = ActiveCaseProtector(b"r" * 32)
         self.now = 1_000
         self.service = self.make_service()
 
@@ -174,8 +173,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         *,
         outbound_limit: int = 10,
         test_sender_id: int | None = None,
-        evidence_store: EvidenceStore | None = None,
-        evidence_collection: bool = True,
     ) -> GatekeeperService:
         return GatekeeperService(
             self.store,
@@ -184,29 +181,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             challenge_max_attempts=2,
             outbound_limit_per_hour=outbound_limit,
             test_sender_id=test_sender_id,
-            evidence_store=evidence_store,
-            review_content_protector=self.review_protector,
-            evidence_collection=evidence_collection,
+            active_case_protector=self.review_protector,
             challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
             clock=lambda: self.now,
         )
-
-    async def test_disabled_collection_does_not_add_evidence(self) -> None:
-        evidence_store = EvidenceStore(
-            Path(self.temp.name) / "evidence.sqlite3",
-            EvidenceProtector(b"d" * 32),
-        )
-        self.addCleanup(evidence_store.close)
-        service = self.make_service(
-            evidence_store=evidence_store,
-            evidence_collection=False,
-        )
-
-        await service.handle(self.message(1), FakeActions())
-
-        stats = evidence_store.statistics()
-        self.assertEqual(stats["total"], 0)
-        self.assertEqual(stats["collection_skipped_no_signal"], 0)
 
     def tearDown(self) -> None:
         self.store.close()
@@ -310,199 +288,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "would_delete")
         self.assertEqual(actions.sent, [])
         self.assertEqual(actions.quarantines, 0)
+        review = self.store.review_items(now=self.now)[0]
+        self.assertEqual(review.expires_at, self.now + 7 * 86400)
         self.assertNotIn(b"private-message-canary", self.database_path.read_bytes())
-
-    async def test_monitor_collects_encrypted_unknown_sample_but_excludes_test_sender(
-        self,
-    ) -> None:
-        self.now = int(time.time())
-        evidence_path = Path(self.temp.name) / "evidence.sqlite3"
-        evidence = EvidenceStore(evidence_path, EvidenceProtector(b"d" * 32))
-        self.addCleanup(evidence.close)
-        service = self.make_service(
-            test_sender_id=TEST_SENDER_ID, evidence_store=evidence
-        )
-        self.assertEqual(
-            await service.handle(
-                self.message(
-                    10,
-                    "evidence-private-canary",
-                    facts=MessageFacts(
-                        text="evidence-private-canary",
-                        quote_text="quoted-private-canary",
-                    ),
-                ),
-                FakeActions(),
-            ),
-            "would_challenge",
-        )
-        self.assertEqual(evidence.statistics()["total"], 1)
-        sample = evidence.samples()[0]
-        self.assertEqual(sample.payload["schema_version"], 4)
-        self.assertEqual(sample.payload["quote_text"], "quoted-private-canary")
-        self.assertTrue(sample.payload["features"]["has_quote"])
-        self.assertNotIn(b"evidence-private-canary", evidence_path.read_bytes())
-        await service.handle(
-            self.message(11, "test-private-canary", sender_id=TEST_SENDER_ID),
-            FakeActions(),
-        )
-        self.assertEqual(evidence.statistics()["total"], 1)
-        self.assertEqual(
-            self.store._connection.execute(
-                "SELECT COUNT(*) FROM enforcement_reviews"
-            ).fetchone()[0],
-            0,
-        )
-
-    async def test_monitor_collects_structural_rule_sample_without_text(self) -> None:
-        self.now = int(time.time())
-        evidence = EvidenceStore(
-            Path(self.temp.name) / "evidence.sqlite3", EvidenceProtector(b"d" * 32)
-        )
-        self.addCleanup(evidence.close)
-        service = self.make_service(evidence_store=evidence)
-
-        outcome = await service.handle(
-            self.message(
-                20,
-                "",
-                facts=MessageFacts(
-                    is_forwarded=True,
-                    has_any_button=True,
-                    has_link_button=True,
-                    link_button_count=1,
-                    urls=("https://spam.invalid/invite?token=private-canary",),
-                    domains=("spam.invalid",),
-                ),
-            ),
-            FakeActions(),
-        )
-
-        self.assertEqual(outcome, "would_delete")
-        sample = evidence.samples()[0]
-        self.assertEqual(sample.payload["text"], "")
-        self.assertEqual(sample.payload["signals"], ["HR-02_FORWARDED_LINK_BUTTON"])
-        self.assertEqual(sample.payload["domains"], ["spam.invalid"])
-        self.assertTrue(sample.payload["url_shape"]["has_query"])
-        serialized = json.dumps(sample.payload)
-        self.assertIn("private-canary", serialized)
-        self.assertIn("/invite", serialized)
-        self.assertEqual(evidence.statistics()["collection_collected_structural"], 1)
-
-    async def test_empty_message_without_signal_is_counted_but_not_collected(
-        self,
-    ) -> None:
-        self.now = int(time.time())
-        evidence = EvidenceStore(
-            Path(self.temp.name) / "evidence.sqlite3", EvidenceProtector(b"d" * 32)
-        )
-        self.addCleanup(evidence.close)
-        service = self.make_service(evidence_store=evidence)
-
-        self.assertEqual(
-            await service.handle(
-                self.message(21, "", facts=MessageFacts()), FakeActions()
-            ),
-            "would_challenge",
-        )
-        stats = evidence.statistics()
-        self.assertEqual(stats["total"], 0)
-        self.assertEqual(stats["collection_skipped_no_signal"], 1)
-
-    async def test_preview_and_full_url_evidence_are_encrypted_at_rest(
-        self,
-    ) -> None:
-        self.now = int(time.time())
-        evidence_path = Path(self.temp.name) / "evidence.sqlite3"
-        evidence = EvidenceStore(evidence_path, EvidenceProtector(b"d" * 32))
-        self.addCleanup(evidence.close)
-        service = self.make_service(evidence_store=evidence)
-        raw_url = (
-            "http://promo.invalid/private/path?token=private-query#private-fragment"
-        )
-
-        await service.handle(
-            self.message(
-                22,
-                "",
-                facts=MessageFacts(
-                    preview_text="Guaranteed return private-preview",
-                    urls=(raw_url,),
-                    domains=(
-                        "z.invalid",
-                        "promo.invalid",
-                        "b.invalid",
-                        "a.invalid",
-                    ),
-                    quote_urls=("https://quote.invalid/secret?user=private-user",),
-                    quote_domains=(
-                        "z-quote.invalid",
-                        "quote.invalid",
-                        "b-quote.invalid",
-                        "a-quote.invalid",
-                    ),
-                ),
-            ),
-            FakeActions(),
-        )
-
-        payload = evidence.samples()[0].payload
-        self.assertEqual(payload["preview_text"], "Guaranteed return private-preview")
-        self.assertEqual(
-            payload["domains"], ["a.invalid", "b.invalid", "promo.invalid"]
-        )
-        self.assertEqual(
-            payload["quote_domains"],
-            ["a-quote.invalid", "b-quote.invalid", "quote.invalid"],
-        )
-        self.assertEqual(payload["url_shape"]["max_path_depth"], 2)
-        self.assertTrue(payload["url_shape"]["has_fragment"])
-        self.assertTrue(payload["url_shape"]["uses_plain_http"])
-        serialized = json.dumps(payload)
-        self.assertIn("private-query", serialized)
-        self.assertIn("private-fragment", serialized)
-        self.assertIn("private-user", serialized)
-        database = evidence_path.read_bytes()
-        self.assertNotIn(b"private-preview", database)
-        self.assertNotIn(b"promo.invalid", database)
-        self.assertNotIn(b"private-query", database)
-        self.assertNotIn(b"private-fragment", database)
-        self.assertNotIn(b"private-user", database)
-
-    async def test_monitor_outcome_updates_only_current_sample(self) -> None:
-        self.now = int(time.time())
-        evidence = EvidenceStore(
-            Path(self.temp.name) / "evidence.sqlite3", EvidenceProtector(b"d" * 32)
-        )
-        self.addCleanup(evidence.close)
-        service = self.make_service(evidence_store=evidence)
-        actions = FakeActions()
-
-        self.assertEqual(
-            await service.handle(self.message(30, "hello"), actions),
-            "would_challenge",
-        )
-        self.assertEqual(
-            await service.handle(
-                self.message(
-                    31,
-                    "forwarded",
-                    facts=MessageFacts(
-                        text="forwarded",
-                        is_forwarded=True,
-                        has_link_button=True,
-                        link_button_count=1,
-                    ),
-                ),
-                actions,
-            ),
-            "would_delete",
-        )
-        samples = sorted(evidence.samples(), key=lambda item: item.id)
-        self.assertEqual(samples[0].weak_label, "uncertain")
-        self.assertEqual(samples[0].payload["actual_action"], "would_challenge")
-        self.assertEqual(samples[1].weak_label, "spam_candidate")
-        self.assertEqual(samples[1].payload["actual_action"], "would_delete")
 
     async def test_suppressed_sender_retains_encrypted_original_review_snapshot(
         self,
@@ -531,7 +319,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.protector.sender_key(123456789)
         item = self.store.enforcement_review(sender_key, now=self.now)
         self.assertIsNotNone(item)
-        payload = self.review_protector.open_enforcement(item.envelope)
+        payload = self.review_protector.open(item.envelope)
         self.assertEqual(payload["text"], "original-private-canary")
         self.assertEqual(payload["quote_text"], "quoted-private-canary")
         database = self.database_path.read_bytes()
@@ -581,6 +369,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions.quarantines, 1)
         sender_key = self.protector.sender_key(123456789)
         self.assertEqual(self.store.sender(sender_key).status, "challenged")
+        row = self.store._connection.execute(
+            "SELECT envelope FROM enforcement_reviews WHERE sender_key=?",
+            (sender_key,),
+        ).fetchone()
+        payload = self.review_protector.open(row["envelope"])
+        self.assertEqual(payload["severity"], "high")
+        self.assertEqual(payload["rule_codes"], ["HR-03_PROMOTION_WITH_LINK"])
 
     async def test_critical_rule_schedules_silent_persistent_delete(self) -> None:
         self.store.set_mode("protect")
@@ -600,6 +395,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actions.sent, [])
         self.assertEqual(actions.dialog_deletions, [(1, self.now)])
         self.assertEqual(len(self.store.pending_actions()), 1)
+        item = self.store.enforcement_review(sender_key, now=self.now)
+        self.assertEqual(item.expires_at, self.now + 30 * 86400)
+        payload = self.review_protector.open(item.envelope)
+        self.assertEqual(payload["severity"], "critical")
+        self.assertEqual(payload["rule_codes"], ["HR-01_MULTIPLE_LINK_BUTTONS"])
 
     async def test_expired_suppression_returns_sender_to_challenge(self) -> None:
         sender_key = self.protector.sender_key(123456789)

@@ -50,6 +50,18 @@ Report vulnerabilities through [SECURITY.md](SECURITY.md), not a public issue.
 The [maintainer release policy](docs/RELEASE.md) explains which changes require a pull request. Runtime,
 security, networking, deployment, dependency, and executable-script changes always do.
 
+## Check the current direction first
+
+The [project direction](README.md#project-direction) is intentionally provisional. Before investing
+in a substantial feature, open a focused discussion to confirm that it still fits the project. The
+presence of a type, field, configuration hook, or earlier experiment does not mean that its direction
+is committed.
+
+In particular, a local model-training pipeline is not currently planned, the standalone labeling
+workflow has been removed, and external AI evaluation remains exploratory. Do not add a
+provider SDK, transmit message content, or establish a new storage or authentication boundary without
+an agreed design and explicit security and privacy review.
+
 ## Commit format
 
 Every commit and pull-request title uses Conventional Commits:

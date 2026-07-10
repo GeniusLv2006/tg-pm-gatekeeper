@@ -51,41 +51,6 @@ def _optional_positive_int(name: str) -> int | None:
     return value
 
 
-def _boolean(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "on" if default else "off").strip().casefold()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    raise ConfigurationError(f"{name} must be on or off")
-
-
-def _configured_name(name: str, legacy_name: str | None = None) -> str:
-    if name in os.environ:
-        return name
-    if legacy_name is not None and legacy_name in os.environ:
-        return legacy_name
-    return name
-
-
-def _boolean_compat(name: str, legacy_name: str, default: bool = False) -> bool:
-    return _boolean(_configured_name(name, legacy_name), default)
-
-
-def _bounded_int_compat(
-    name: str, legacy_name: str, default: int, minimum: int, maximum: int
-) -> int:
-    return _bounded_int(_configured_name(name, legacy_name), default, minimum, maximum)
-
-
-def _path_compat(name: str, legacy_name: str, default: str) -> Path:
-    if name in os.environ:
-        return Path(os.environ[name])
-    if legacy_name in os.environ:
-        return Path(os.environ[legacy_name])
-    return Path(default)
-
-
 def read_private_file(
     path: Path, *, minimum_bytes: int = 1, strip: bool = False
 ) -> bytes:
@@ -116,16 +81,13 @@ class Settings:
     challenge_ttl_seconds: int
     challenge_max_attempts: int
     audit_retention_days: int
-    review_retention_days: int
+    pending_review_retention_days: int
+    active_case_retention_days: int
     review_socket_path: Path
     mute_days: int
     outbound_limit_per_hour: int
     test_sender_id: int | None
-    evidence_collection: bool
-    evidence_path: Path
-    evidence_key_file: Path
-    evidence_retention_days: int
-    evidence_max_records_per_sender: int
+    review_key_file: Path
 
     @classmethod
     def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
@@ -156,7 +118,12 @@ class Settings:
             challenge_ttl_seconds=_bounded_int("TG_CHALLENGE_TTL_SECONDS", 60, 30, 600),
             challenge_max_attempts=_bounded_int("TG_CHALLENGE_MAX_ATTEMPTS", 2, 1, 5),
             audit_retention_days=_positive_int("TG_AUDIT_RETENTION_DAYS", 30),
-            review_retention_days=min(_positive_int("TG_REVIEW_RETENTION_DAYS", 7), 7),
+            pending_review_retention_days=_bounded_int(
+                "TG_PENDING_REVIEW_RETENTION_DAYS", 7, 1, 7
+            ),
+            active_case_retention_days=_bounded_int(
+                "TG_ACTIVE_CASE_RETENTION_DAYS", 30, 1, 30
+            ),
             review_socket_path=Path(
                 os.environ.get(
                     "TG_DASHBOARD_SOCKET_PATH",
@@ -171,59 +138,17 @@ class Settings:
                 "TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100
             ),
             test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
-            evidence_collection=_boolean_compat(
-                "TG_EVIDENCE_COLLECTION", "TG_DATASET_COLLECTION"
-            ),
-            evidence_path=_path_compat(
-                "TG_EVIDENCE_PATH",
-                "TG_DATASET_PATH",
-                "/var/lib/tg-pm-gatekeeper/evidence.sqlite3",
-            ),
-            evidence_key_file=_path_compat(
-                "TG_EVIDENCE_KEY_FILE",
-                "TG_DATASET_KEY_FILE",
-                "/run/secrets/evidence_key",
-            ),
-            evidence_retention_days=_bounded_int_compat(
-                "TG_EVIDENCE_RETENTION_DAYS", "TG_DATASET_RETENTION_DAYS", 7, 1, 90
-            ),
-            evidence_max_records_per_sender=_bounded_int_compat(
-                "TG_EVIDENCE_MAX_RECORDS_PER_SENDER",
-                "TG_DATASET_MAX_MESSAGES_PER_SENDER",
-                3,
-                1,
-                10,
+            review_key_file=Path(
+                os.environ.get("TG_REVIEW_KEY_FILE", "/run/secrets/review_key")
             ),
         )
-        if settings.evidence_path == settings.database_path:
-            raise ConfigurationError("evidence and state databases must be separate")
         private_paths = {
             settings.session_file,
             settings.hmac_key_file,
-            settings.evidence_key_file,
+            settings.review_key_file,
         }
         if len(private_paths) != 3:
             raise ConfigurationError(
-                "session, state HMAC, and evidence keys must be separate"
+                "session, state HMAC, and review keys must be separate"
             )
         return settings
-
-    @property
-    def dataset_collection(self) -> bool:
-        return self.evidence_collection
-
-    @property
-    def dataset_path(self) -> Path:
-        return self.evidence_path
-
-    @property
-    def dataset_key_file(self) -> Path:
-        return self.evidence_key_file
-
-    @property
-    def dataset_retention_days(self) -> int:
-        return self.evidence_retention_days
-
-    @property
-    def dataset_max_messages_per_sender(self) -> int:
-        return self.evidence_max_records_per_sender
