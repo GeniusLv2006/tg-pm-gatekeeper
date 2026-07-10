@@ -17,6 +17,8 @@ from tg_pm_gatekeeper.rules import MessageFacts
 from tg_pm_gatekeeper.service import (
     DIGITS_REQUIRED_TEXT,
     REPLY_REQUIRED_TEXT,
+    TEST_VERIFICATION_FAILED_TEXT,
+    TEST_VERIFICATION_TIMEOUT_TEXT,
     VERIFICATION_FAILED_TEXT,
     VERIFICATION_TIMEOUT_TEXT,
     Challenge,
@@ -734,7 +736,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "quarantined",
         )
-        self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
+        self.assertEqual(actions.sent[-1][0], TEST_VERIFICATION_FAILED_TEXT)
         self.assertIn(
             "This conversation will be deleted in 10 seconds.",
             actions.sent[-1][0],
@@ -1054,7 +1056,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 actions=actions,
             )
         )
-        self.assertEqual(actions.sent[-1][0], VERIFICATION_TIMEOUT_TEXT)
+        self.assertEqual(actions.sent[-1][0], TEST_VERIFICATION_TIMEOUT_TEXT)
         self.assertEqual(actions.deletions, [(sender_key, self.now, self.now + 75)])
         self.assertEqual(actions.resets, [(sender_key, self.now + 65, self.now + 125)])
 

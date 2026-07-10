@@ -209,7 +209,7 @@ class ReviewAdminServer:
             if not secrets.compare_digest(
                 self._cookie_value(cookie, "gatekeeper_session"), self._session_token
             ):
-                return 404, {}, self._page("Not Found")
+                return 404, {}, self._page("Dashboard Session Missing")
         if path == "/" and method == "GET":
             return 200, {}, await self._dashboard_page()
         if path == "/review" and method == "GET":
@@ -337,14 +337,11 @@ class ReviewAdminServer:
         )
         records = self.evidence_store.summaries(limit=101, offset=(page - 1) * 100)
         has_next = len(records) > 100
-        groups: dict[str, str] = {}
-        for record in records[:100]:
-            groups.setdefault(record.sender_token, f"Sender {len(groups) + 1}")
         rows = (
             "".join(
                 f"<tr><td><a href='/evidence/{record.id}'>#{record.id}</a></td>"
-                f"<td>{html.escape(groups[record.sender_token])}</td>"
-                f"<td>{html.escape(record.automatic_hint)}</td>"
+                f"<td>Sender {html.escape(record.sender_token[:8])}&hellip;</td>"
+                f"<td>{html.escape(self._human_label(record.automatic_hint))}</td>"
                 f"<td>{html.escape(self._evidence_outcome_label(record.review_outcome))}</td>"
                 f"<td>{html.escape(self._relative_age(record.created_at))}</td></tr>"
                 for record in records[:100]
@@ -365,14 +362,14 @@ class ReviewAdminServer:
             "<dl class='metric-grid'>"
             f"<div><dt>Total Evidence Records</dt><dd class='data-value'>{stats.get('total', 0)}</dd></div>"
             f"<div><dt>Operator Reviewed</dt><dd class='data-value'>{labeled}</dd></div>"
-            f"<div><dt>Correct / False Positive / Insufficient</dt><dd class='data-value'>"
+            f"<div><dt>Correct / Incorrect / Insufficient</dt><dd class='data-value'>"
             f"{stats.get('correct', 0)} / {stats.get('false_positive', 0)} / "
             f"{stats.get('insufficient', 0)}</dd></div>"
-            f"<div><dt>Automatic Hints</dt><dd class='data-value'>"
+            f"<div><dt>Spam / Legitimate / Uncertain Hints</dt><dd class='data-value'>"
             f"{stats.get('hint_spam_candidate', 0)} / "
             f"{stats.get('hint_legitimate_candidate', 0)} / "
             f"{stats.get('hint_uncertain', 0)}</dd></div>"
-            f"<div><dt>Expiring within 24 hours</dt><dd class='data-value'>"
+            f"<div><dt>Expiring Within 24 Hours</dt><dd class='data-value'>"
             f"{stats.get('expiring_24h', 0)}</dd></div>"
             f"<div><dt>Retention Window</dt><dd class='data-value'>"
             f"{self.evidence_retention_days}d</dd></div>"
@@ -383,14 +380,14 @@ class ReviewAdminServer:
             f"UTC calendar-day totals within the current {self.evidence_retention_days}-day retention window.</p>"
             "<dl class='metric-grid'>"
             f"<div><dt>Content Evidence</dt><dd class='data-value'>{stats.get('collection_collected_content', 0)}</dd></div>"
-            f"<div><dt>Structural-Only Evidence</dt><dd class='data-value'>{stats.get('collection_collected_structural', 0)}</dd></div>"
+            f"<div><dt>Records Without Textual Evidence</dt><dd class='data-value'>{stats.get('collection_collected_structural', 0)}</dd></div>"
             f"<div><dt>Skipped: No Usable Signal</dt><dd class='data-value'>{stats.get('collection_skipped_no_signal', 0)}</dd></div>"
             f"<div><dt>Skipped: Duplicate</dt><dd class='data-value'>{stats.get('collection_skipped_duplicate', 0)}</dd></div>"
             f"<div><dt>Skipped: Sender Cap</dt><dd class='data-value'>{stats.get('collection_skipped_sender_cap', 0)}</dd></div>"
             "</dl>"
         )
         content = (
-            self._masthead("Evidence Log", f"{stats.get('total', 0)} records")
+            self._masthead("Evidence Log", f"{stats.get('total', 0)} Records")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a> · <a href='/review'>Pending Reviews</a></p><main>"
             + "<section class='queue-intro'><p class='eyebrow'>Short-Lived Audit Evidence</p>"
             + "<h2>Evidence Log</h2>"
@@ -401,11 +398,11 @@ class ReviewAdminServer:
             + overview
             + activity
             + "</section>"
-            + "<div class='table-shell'><table><thead><tr><th>Evidence</th><th>Sender Group</th>"
+            + "<div class='table-shell'><table><thead><tr><th>Evidence</th><th>Anonymous Sender</th>"
             + "<th>Automatic Hint</th><th>Review Outcome</th><th>Age</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div>{navigation}</main>"
         )
-        return self._page(content, raw=True)
+        return self._page(content, raw=True, page_title="Evidence Log")
 
     def _dispatch_evidence(
         self, method: str, path: str, body: bytes
@@ -439,27 +436,36 @@ class ReviewAdminServer:
         actions = "".join(
             self._action_form(record_id, label, display, base="evidence")
             for label, display in (
-                ("correct", "Correct enforcement"),
-                ("false_positive", "False positive"),
-                ("insufficient", "Insufficient evidence"),
+                ("correct", "Correct Assessment"),
+                ("false_positive", "Incorrect Assessment"),
+                ("insufficient", "Insufficient Evidence"),
             )
         ) + self._action_form(
-            record_id, "delete", "Delete evidence", danger=True, base="evidence"
+            record_id, "delete", "Delete Evidence", danger=True, base="evidence"
+        )
+        review_context = (
+            "<aside class='case-file'><p class='eyebrow'>Assessment Context</p><dl>"
+            f"<dt>Automatic Hint</dt><dd>{html.escape(self._human_label(record.automatic_hint))}</dd>"
+            f"<dt>Planned Action</dt><dd>{html.escape(self._human_label(str(payload.get('planned_action') or 'not recorded')))}</dd>"
+            f"<dt>Actual Action</dt><dd>{html.escape(self._human_label(str(payload.get('actual_action') or 'not recorded')))}</dd>"
+            f"<dt>Review Outcome</dt><dd>{html.escape(self._evidence_outcome_label(record.review_outcome))}</dd>"
+            f"<dt>Evidence Expires</dt><dd>{datetime.fromtimestamp(record.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd>"
+            "</dl></aside>"
         )
         content = (
             self._masthead("Evidence Record", f"#{record.id}")
             + "<p class='back'><a href='/evidence'>← Evidence Log</a></p>"
-            + "<main><section class='message-panel'>"
-            + self._evidence_sections(payload)
-            + f"<div class='actions'>{actions}</div></section></main>"
+            + "<main class='review-grid'><section class='message-panel'>"
+            + self._evidence_sections(payload, context="evidence")
+            + f"<div class='actions'>{actions}</div></section>{review_context}</main>"
         )
-        return 200, {}, self._page(content, raw=True)
+        return 200, {}, self._page(content, raw=True, page_title=f"Evidence #{record.id}")
 
     @staticmethod
     def _evidence_outcome_label(outcome: str | None) -> str:
         return {
-            "correct": "Correct Enforcement",
-            "false_positive": "False Positive",
+            "correct": "Correct Assessment",
+            "false_positive": "Incorrect Assessment",
             "insufficient": "Insufficient Evidence",
         }.get(outcome or "", "Unreviewed")
 
@@ -483,7 +489,9 @@ class ReviewAdminServer:
             return "—"
         return ", ".join(str(item) for item in value)
 
-    def _evidence_sections(self, payload: dict[str, object]) -> str:
+    def _evidence_sections(
+        self, payload: dict[str, object], *, context: str
+    ) -> str:
         text = str(payload.get("text", ""))
         quote_text = str(payload.get("quote_text", ""))
         preview_text = str(payload.get("preview_text", ""))
@@ -499,16 +507,27 @@ class ReviewAdminServer:
         url_shape = self._json_block(payload.get("url_shape", {}))
         quote_url_shape = self._json_block(payload.get("quote_url_shape", {}))
         sections = (
-            self._text_block("Message Text Or Caption", text)
+            self._text_block("Message Text or Caption", text)
             + self._text_block("Quoted Context", quote_text, quote=True)
             + self._text_block("Telegram Webpage Preview", preview_text, quote=True)
         )
         if structural_only:
+            if context == "evidence":
+                guidance = (
+                    "Other retained evidence may include URLs, button text, detector signals, "
+                    "and structural metadata. Select Insufficient Evidence if the available "
+                    "record does not support an assessment."
+                )
+            else:
+                guidance = (
+                    "Review any available URLs, button text, detector signals, and structural "
+                    "metadata before deciding whether to allow the sender or leave the "
+                    "restriction unchanged."
+                )
             sections += (
-                "<div class='notice'><strong>Structural-Only Evidence.</strong> "
-                "No message, quoted, or preview text was retained. Review the detector "
-                "signals and structural metadata; choose Insufficient evidence when the "
-                "record is not enough.</div>"
+                "<div class='notice'><strong>Limited Textual Evidence.</strong> "
+                "No message text, quoted text, or webpage-preview text was retained. "
+                f"{guidance}</div>"
             )
         return (
             sections
@@ -519,7 +538,7 @@ class ReviewAdminServer:
             + f"<details><summary>Quoted-Context URLs</summary><pre>{quote_urls}</pre></details>"
             + f"<details><summary>Link Shape</summary><pre>{url_shape}</pre></details>"
             + f"<details><summary>Quoted-Context Link Shape</summary><pre>{quote_url_shape}</pre></details>"
-            + f"<details><summary>Encrypted Evidence Payload</summary><pre>{details}</pre></details>"
+            + f"<details><summary>Full Decrypted Evidence Payload</summary><pre>{details}</pre></details>"
         )
 
     async def _dispatch_enforcement(
@@ -571,8 +590,8 @@ class ReviewAdminServer:
         rows = "".join(
             f"<tr><td><a href='/cases/{item.sender_key}'>Open</a></td>"
             f"<td>{self._identity_cell(identities.get(item.sender_key))}</td>"
-            f"<td><span class='badge'>{html.escape(item.status)}</span></td>"
-            f"<td>{html.escape(item.reason)}</td>"
+            f"<td><span class='badge'>{html.escape(self._human_label(item.status))}</span></td>"
+            f"<td>{html.escape(self._human_label(item.reason))}</td>"
             f"<td>{html.escape(self._remaining(item))}</td>"
             f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
             for item in items
@@ -590,12 +609,13 @@ class ReviewAdminServer:
             f"{stats['unreviewable']} active case"
             f"{'s' if stats['unreviewable'] != 1 else ''} "
             f"{'have' if stats['unreviewable'] != 1 else 'has'} no encrypted snapshot "
-            "and cannot be opened here. Such states may predate evidence capture."
+            "and cannot be opened here. Its snapshot may have expired, failed capture, or predate "
+            "evidence capture."
             if stats["unreviewable"]
             else "Every active case currently has reviewable evidence."
         )
         content = (
-            self._masthead("Active Cases", f"{len(items)} reviewable")
+            self._masthead("Active Cases", f"{len(items)} Reviewable")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a> · <a href='/evidence'>Evidence Log</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
             + "<h2>Review Active Cases</h2>"
@@ -608,7 +628,9 @@ class ReviewAdminServer:
             + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Updated</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div></main>"
         )
-        return self._page(content, raw=True, refresh_seconds=10)
+        return self._page(
+            content, raw=True, refresh_seconds=10, page_title="Active Cases"
+        )
 
     async def _show_enforcement(
         self, item: EnforcementReview
@@ -640,39 +662,64 @@ class ReviewAdminServer:
                 )
             except Exception:
                 pass
-        rules = ", ".join(str(value) for value in payload.get("rule_codes", [])) or "—"
+        rules = ", ".join(
+            self._human_label(str(value)) for value in payload.get("rule_codes", [])
+        ) or "—"
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
         observed = datetime.fromtimestamp(item.created_at, timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
         )
         allow_action = (
             self._action_form(
-                item.sender_key, "allow", "Allow now", base="cases"
+                item.sender_key, "allow", "Allow Now", base="cases"
             )
             if user_id is not None
-            else "<button type='button' disabled>Allow unavailable</button>"
+            else "<button type='button' disabled>Allow Unavailable</button>"
+        )
+        snapshot = self.store.dialog_snapshot(item.sender_key)
+        if snapshot is not None:
+            allow_guidance = (
+                "Allow restores the saved folder and notification state before changing policy."
+            )
+        else:
+            allow_guidance = (
+                "No saved dialog state is available. Allow moves the conversation to the main "
+                "folder and enables notifications before changing policy."
+            )
+        release_pending = (
+            item.status == "suppressed"
+            and item.suppressed_until is not None
+            and item.suppressed_until <= int(time.time())
+        )
+        keep_label = (
+            "Record Without Extending Restriction"
+            if release_pending
+            else "Leave Restriction Unchanged"
         )
         content = f"""
-        {self._masthead("Active Cases", item.status)}
+        {self._masthead("Active Cases", self._human_label(item.status))}
         <p class="back"><a href="/cases">← Active Cases</a></p>
         <main class="review-grid"><section class="message-panel">
-          <p class="eyebrow">Encrypted Local Evidence</p>
+          <p class="eyebrow">Decrypted Local Evidence</p>
           <h2>{html.escape(identity)}</h2>
-          {self._evidence_sections(payload)}
+          <p class="refresh-note">Encrypted at rest; decrypted only for this owner-only view.</p>
+          {self._evidence_sections(payload, context="case")}
           {telegram_link}
         </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
-          <dl><dt>Status</dt><dd><span class="badge">{html.escape(item.status)}</span></dd>
-          <dt>Reason</dt><dd>{html.escape(item.reason)}</dd><dt>Rules</dt><dd>{html.escape(rules)}</dd>
+          <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
+          <dt>Reason</dt><dd>{html.escape(self._human_label(item.reason))}</dd><dt>Rules</dt><dd>{html.escape(rules)}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
           <dt>Evidence Expires</dt><dd>{datetime.fromtimestamp(item.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd></dl>
           <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
         </aside></main><section class="decision-panel"><p class="eyebrow">Operator Action</p>
-          <h2>Allow restores the saved folder and notification state before changing policy.</h2>
+          <h2>{html.escape(allow_guidance)}</h2>
           <div class="actions two">
             {allow_action}
-            {self._action_form(item.sender_key, "keep", "Keep current restriction", base="cases")}
+            {self._action_form(item.sender_key, "keep", keep_label, base="cases")}
           </div></section>"""
-        return 200, {}, self._page(content, raw=True)
+        return 200, {}, self._page(
+            content, raw=True, page_title=f"Active Case · {self._human_label(item.status)}"
+        )
 
     def _peer_from_item(self, item: ReviewItem) -> types.InputPeerUser:
         if item.reference is None:
@@ -783,69 +830,79 @@ class ReviewAdminServer:
             IDENTITY_CACHE_SECONDS,
         )
         identity = name + (f" (@{username})" if username else "")
-        rules = ", ".join(json.loads(item.rule_codes)) or "ordinary unknown sender"
+        rules = ", ".join(
+            self._human_label(value) for value in json.loads(item.rule_codes)
+        ) or "Ordinary Unknown Sender"
+        review_reason = self._human_label(item.classification)
         features = json.dumps(json.loads(item.features), indent=2, sort_keys=True)
         observed_at = datetime.fromtimestamp(item.updated_at, timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
         )
         if message is None:
             content = f"""
-            {self._masthead("Review item", f"Review #{item.id}")}
-            <p class="back"><a href="/">← Back to pending queue</a></p>
+            {self._masthead("Review Item", f"Review #{item.id}")}
+            <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
             <main class="review-grid">
               <section class="message-panel">
-                <p class="eyebrow">Telegram message unavailable</p>
+                <p class="eyebrow">Telegram Message Unavailable</p>
                 <h2>{html.escape(identity)}</h2>
                 <div class="empty-state"><strong>The referenced message no longer exists.</strong>
                 <p>The conversation may have been deleted in Telegram. This pending row is local
                 review state and is not removed automatically.</p></div>
               </section>
-              <aside class="case-file"><p class="eyebrow">Review details</p>
-                <dl><dt>Simulated decision</dt><dd><span class="badge">{html.escape(item.classification)}</span></dd>
+              <aside class="case-file"><p class="eyebrow">Review Details</p>
+                <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
                 <dt>Rules</dt><dd>{html.escape(rules)}</dd>
-                <dt>Messages observed</dt><dd>{item.message_count}</dd>
-                <dt>Last observed</dt><dd>{observed_at}</dd></dl>
+                <dt>Messages Observed</dt><dd>{item.message_count}</dd>
+                <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
               </aside>
             </main>
-            <section class="decision-panel"><p class="eyebrow">Resolve local record</p>
-              <h2>Remove this sender's pending review without changing Telegram or trust state.</h2>
+            <section class="decision-panel"><p class="eyebrow">Resolve Local Record</p>
+              <h2>Remove this sender's pending review and cancel pending Gatekeeper deletion jobs. Telegram and trust state are unchanged.</h2>
               <div class="actions one">
-                {self._action_form(item.id, "dismiss", "Resolve deleted conversation")}
+                {self._action_form(item.id, "dismiss", "Resolve and Cancel Pending Jobs")}
               </div>
             </section>
             """
-            return 200, {}, self._page(content, raw=True)
+            return 200, {}, self._page(
+                content, raw=True, page_title=f"Review #{item.id}"
+            )
         text = message.message or f"[Non-text message: {type(message.media).__name__}]"
         content = f"""
-        {self._masthead("Review item", f"Review #{item.id}")}
-        <p class="back"><a href="/">← Back to pending queue</a></p>
+        {self._masthead("Review Item", f"Review #{item.id}")}
+        <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
         <main class="review-grid">
           <section class="message-panel">
-            <p class="eyebrow">Fetched from Telegram · not stored locally</p>
+            <p class="eyebrow">Fetched from Telegram · Not Stored Locally</p>
             <h2>{html.escape(identity)}</h2>
             <pre class="message">{html.escape(text)}</pre>
             <a class="telegram-link" href="tg://user?id={user_id}">Open this conversation in Telegram ↗</a>
           </section>
           <aside class="case-file">
-            <p class="eyebrow">Review details</p>
-            <dl><dt>Simulated decision</dt><dd><span class="badge">{html.escape(item.classification)}</span></dd>
+            <p class="eyebrow">Review Details</p>
+            <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
             <dt>Rules</dt><dd>{html.escape(rules)}</dd>
             <dt>Telegram ID</dt><dd>{user_id}</dd>
-            <dt>Messages observed</dt><dd>{item.message_count}</dd>
-            <dt>Last observed</dt><dd>{observed_at}</dd></dl>
-            <details><summary>Structural features</summary><pre>{html.escape(features)}</pre></details>
+            <dt>Messages Observed</dt><dd>{item.message_count}</dd>
+            <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
+            <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
           </aside>
         </main>
-        <section class="decision-panel"><p class="eyebrow">Sender decision</p>
+        <section class="decision-panel"><p class="eyebrow">Sender Decision</p>
           <h2>This decision applies to all pending entries for this sender.</h2>
           <div class="actions">
-            {self._action_form(item.id, "legitimate", "Legitimate · allow sender")}
-            {self._action_form(item.id, "spam", "Spam · archive and mute", danger=True)}
-            {self._action_form(item.id, "dismiss", "Dismiss without action")}
+            {self._action_form(item.id, "legitimate", "Legitimate · Allow Sender")}
+            {self._action_form(item.id, "spam", "Spam · Archive and Mute", danger=True)}
+            {self._action_form(item.id, "dismiss", "Dismiss and Cancel Pending Jobs")}
           </div>
         </section>
         """
-        return 200, {}, self._page(content, raw=True, refresh_seconds=30)
+        return 200, {}, self._page(
+            content,
+            raw=True,
+            refresh_seconds=30,
+            page_title=f"Review #{item.id}",
+        )
 
     async def _archive_and_mute(
         self, peer: types.InputPeerUser, sender_key: str
@@ -929,7 +986,8 @@ class ReviewAdminServer:
 
     async def _dashboard_page(self) -> bytes:
         review_items = self.store.review_items()
-        active_cases = self.store.enforcement_reviews()
+        active_stats = self.store.enforcement_statistics()
+        active_restrictions = active_stats["quarantined"] + active_stats["suppressed"]
         evidence_total = 0
         if self.evidence_store is not None:
             evidence_total = self.evidence_store.statistics(
@@ -941,19 +999,26 @@ class ReviewAdminServer:
             + "<main><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
             "<h2>Operations Dashboard</h2>"
             "<p>Use Active Cases for recovery after a possible false positive. "
-            "Pending Reviews cover monitor-mode sender decisions. Evidence Log is short-lived encrypted audit evidence.</p>"
+            "Pending Reviews cover monitor-mode simulations and protect-mode exceptions. "
+            "Evidence Log is short-lived encrypted audit evidence.</p>"
             "<dl class='metric-grid'>"
-            f"<div><dt>Active Cases</dt><dd class='data-value'>{len(active_cases)}</dd></div>"
+            f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
+            f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
             f"<div><dt>Pending Reviews</dt><dd class='data-value'>{len(review_items)}</dd></div>"
             f"<div><dt>Evidence Records</dt><dd class='data-value'>{evidence_total}</dd></div>"
             "</dl></section>"
             "<div class='table-shell'><table><thead><tr><th>Area</th><th>Purpose</th><th>Open</th></tr></thead><tbody>"
-            "<tr><td>Active Cases</td><td>Restore or keep current quarantines and suppressions.</td><td><a href='/cases'>Open</a></td></tr>"
-            "<tr><td>Pending Reviews</td><td>Resolve monitor-mode or ordinary sender review items.</td><td><a href='/review'>Open</a></td></tr>"
+            "<tr><td>Active Cases</td><td>Review restrictions that still have an unexpired encrypted snapshot.</td><td><a href='/cases'>Open</a></td></tr>"
+            "<tr><td>Pending Reviews</td><td>Resolve monitor-mode simulations and protect-mode exception reviews.</td><td><a href='/review'>Open</a></td></tr>"
             "<tr><td>Evidence Log</td><td>Review short-lived encrypted evidence for rule audits and false-positive analysis.</td><td><a href='/evidence'>Open</a></td></tr>"
             "</tbody></table></div></main>"
         )
-        return self._page(content, raw=True, refresh_seconds=10)
+        return self._page(
+            content,
+            raw=True,
+            refresh_seconds=10,
+            page_title="Operations Dashboard",
+        )
 
     async def _review_queue_page(self) -> bytes:
         items = self.store.review_items()
@@ -961,8 +1026,8 @@ class ReviewAdminServer:
         rows = "".join(
             f"<tr><td><a href='/review/{item.id}'>#{item.id}</a></td>"
             f"<td>{self._identity_cell(identities.get(item.id))}</td>"
-            f"<td>{html.escape(item.classification)}</td>"
-            f"<td>{html.escape(', '.join(json.loads(item.rule_codes)) or '—')}</td>"
+            f"<td>{html.escape(self._human_label(item.classification))}</td>"
+            f"<td>{html.escape(', '.join(self._human_label(value) for value in json.loads(item.rule_codes)) or '—')}</td>"
             f"<td>{item.message_count}</td>"
             f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
             for item in items
@@ -970,7 +1035,7 @@ class ReviewAdminServer:
         if not rows:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
-            self._masthead("Pending Reviews", f"{len(items)} pending")
+            self._masthead("Pending Reviews", f"{len(items)} Pending")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a> · <a href='/evidence'>Evidence Log</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
             "<h2>Review Pending Senders</h2>"
@@ -980,11 +1045,12 @@ class ReviewAdminServer:
             "Open the row and resolve it when the referenced message is unavailable.</p>"
             "<p class='refresh-note'>This page checks the connection every 10 seconds and shows "
             "an error when the SSH tunnel is unavailable.</p></section>"
-            "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Simulation</th>"
+            "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Review Reason</th>"
             "<th>Rules</th><th>Messages</th>"
             f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
             raw=True,
             refresh_seconds=10,
+            page_title="Pending Reviews",
         )
 
     async def _live_identities(
@@ -1186,11 +1252,55 @@ class ReviewAdminServer:
 
     @staticmethod
     def _reason_label(reason: str) -> str:
-        return reason.replace("_", " ")
+        return ReviewAdminServer._human_label(reason)
+
+    @staticmethod
+    def _human_label(value: str) -> str:
+        labels = {
+            "would_challenge": "Simulated Challenge · Monitor",
+            "would_delete": "Planned Deletion · Monitor",
+            "would_quarantine": "Simulated Quarantine · Monitor",
+            "challenge_unavailable": "Challenge Unavailable · Protect",
+            "challenge_unavailable_action_failed": "Challenge and Archive Failed · Protect",
+            "restore_failed": "Restoration Failed · Protect",
+            "warning_failed": "Failure Warning Not Delivered · Protect",
+            "timeout_notice_failed": "Timeout Warning Not Delivered · Protect",
+            "critical_rule": "Critical Rule",
+            "manual_spam": "Manual Spam Review",
+            "attempts_exhausted": "Attempts Exhausted",
+            "challenge_timeout": "Challenge Timeout",
+            "challenge_pending": "Challenge Pending",
+            "reference_unavailable": "Telegram Reference Unavailable",
+            "reason_unavailable": "Reason Unavailable",
+            "spam_candidate": "Spam Candidate",
+            "legitimate_candidate": "Legitimate Candidate",
+            "not recorded": "Not Recorded",
+        }
+        if value in labels:
+            return labels[value]
+        if value == "uncertain":
+            return "Uncertain"
+        if value.endswith("_action_failed"):
+            action = value.removesuffix("_action_failed").replace("_", " ").title()
+            return f"{action} Action Failed · Protect"
+        prefix = ""
+        body = value
+        if value.startswith("HR-") and "_" in value:
+            prefix, body = value.split("_", 1)
+            prefix += " · "
+        label = body.replace("_", " ").strip().title()
+        label = label.replace("Url", "URL").replace("Vpn", "VPN")
+        label = label.replace("Webview", "WebView")
+        return prefix + label
 
     @classmethod
     def _page(
-        cls, content: str, *, raw: bool = False, refresh_seconds: int | None = None
+        cls,
+        content: str,
+        *,
+        raw: bool = False,
+        refresh_seconds: int | None = None,
+        page_title: str | None = None,
     ) -> bytes:
         if raw:
             body = content
@@ -1201,13 +1311,22 @@ class ReviewAdminServer:
                     "the tunnel helper again to generate a new one-time link."
                 ),
                 "Not Found": (
-                    "The page is unavailable or the dashboard session is missing. "
-                    "Open the one-time link printed by the tunnel helper."
+                    "The requested page is unavailable. Check the address or return to the "
+                    "dashboard."
+                ),
+                "Dashboard Session Missing": (
+                    "This browser does not have a valid dashboard session. Run the tunnel "
+                    "helper again and open its new one-time link."
                 ),
                 "Request Failed": (
                     "The request could not be completed. No dashboard action was confirmed."
                 ),
             }.get(content, "Check the request and return to the dashboard.")
+            return_action = (
+                ""
+                if content in {"Invalid Access Token", "Dashboard Session Missing"}
+                else "<a class='button-link' href='/'>Return to Dashboard</a>"
+            )
             body = (
                 cls._masthead("Error", "Request Not Completed")
                 + "<main class='error-layout'><section class='error-card'>"
@@ -1216,7 +1335,7 @@ class ReviewAdminServer:
                 + f"<h1>{html.escape(content)}</h1>"
                 + f"<p>{html.escape(guidance)}</p>"
                 + "<p class='error-command'><code>scripts/dashboard-tunnel.sh SSH_TARGET</code></p>"
-                + "<a class='button-link' href='/'>Return to dashboard</a>"
+                + return_action
                 + "</div></section></main>"
             )
         refresh = (
@@ -1224,9 +1343,12 @@ class ReviewAdminServer:
             if refresh_seconds is not None
             else ""
         )
+        document_title = page_title or (
+            "Gatekeeper Dashboard" if raw else f"Gatekeeper · {content}"
+        )
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-{refresh}<title>Gatekeeper Review</title><style>
+{refresh}<title>{html.escape(document_title)}</title><style>
 :root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#d84a28;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}}
 *{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}

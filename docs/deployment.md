@@ -1,36 +1,35 @@
-# Hardened deployment
+# Install and operate Gatekeeper
 
-This runbook covers a first installation, routine updates, schema migrations, dashboard access, and
-emergency session revocation on a dedicated Debian-compatible Docker host. Read
-[RELEASE.md](RELEASE.md) before publishing or deploying a change.
+This guide is for people installing or running Gatekeeper. You do not need to read the maintainer
+[release policy](RELEASE.md) unless you are publishing code changes to the project.
 
-Examples use a root maintenance login. Set the target once for the current shell and verify it before
-every operation:
+Examples use a root maintenance login. Set your server once in the current shell:
 
 ```shell
 export DEPLOY_HOST=root@server.example
 ```
 
-## Prerequisites
+## Before you start
 
-Trusted workstation:
+On your trusted computer you need:
 
 - Git, SSH, `curl`, and Python 3.14;
-- Telegram two-step verification enabled;
+- Telegram two-step verification;
 - an application API ID and hash from [Telegram's developer tools](https://my.telegram.org/apps); and
 - a dedicated Telegram account for the first end-to-end test.
 
-Deployment host:
+On the server you need a dedicated Debian-compatible Linux system with Docker Engine and the Compose
+plugin.
 
-- a dedicated Debian-compatible Linux system; and
-- Docker Engine with the Compose plugin.
+Gatekeeper controls a Telegram user session and can delete private dialogs in `protect` mode. Start
+in `monitor`, test with the dedicated account, and keep the generated session and key files out of
+chat, tickets, screenshots, shell commands, and general backups.
 
-Never paste credentials into shell commands, issues, pull requests, CI variables, or chat. Resource
-and network observations are point-in-time facts and must be checked again at deployment.
+## Install Gatekeeper
 
-## First installation
+### 1. Create the private files
 
-### Clone and initialize on the trusted workstation
+Run these commands on your trusted computer:
 
 ```shell
 git clone https://github.com/GeniusLv2006/tg-pm-gatekeeper.git
@@ -41,151 +40,304 @@ python3 -m venv .venv
 .venv/bin/python scripts/initialize.py
 ```
 
-The initializer prompts visibly for the API ID and phone number and uses hidden prompts for the API
-hash, login code, and 2FA password. It creates these owner-only files and refuses to overwrite any of
-them:
+The initializer signs in to Telegram and creates five files:
 
-- `telegram.session.secret`: the Telegram authorization session;
-- `hmac.key`: sender-identity and review-reference protection;
-- `evidence.key`: independent Evidence Log encryption;
-- `config.env`: environment entries consumed by Compose; and
-- `deny-domains.txt`: one normalized denied domain per line.
+- `telegram.session.secret`: authorization for the Telegram account;
+- `hmac.key`: protects local sender identifiers and review references;
+- `evidence.key`: encrypts optional evidence and Active Case content;
+- `config.env`: the service configuration; and
+- `deny-domains.txt`: your optional local domain denylist.
 
-The files initially use mode `0600`. Never print, commit, or share their contents. The evidence key
-is required at startup even while collection is disabled. It protects short-lived evidence records
-and derives a separate active-case content key; neither purpose reuses the state HMAC key. See
-[the example denylist](../deny-domains.example.txt) for the accepted format.
+The files start with owner-only permissions, and the initializer refuses to overwrite them. Transfer
+them only to the intended server over a trusted channel. The evidence key is required even when
+Evidence Log collection is off. See [deny-domains.example.txt](../deny-domains.example.txt) for the
+denylist format.
 
-### Prepare the host
+### 2. Prepare the server
 
-Run the bootstrap script as root. It creates a non-login UID/GID `10001` and the fixed directories,
-but no credentials:
+Create the service account and directories, then clone the public repository:
 
 ```shell
 ssh "$DEPLOY_HOST" 'sh -s' < deploy/bootstrap-host.sh
-```
-
-Clone the public repository anonymously:
-
-```shell
 ssh "$DEPLOY_HOST" 'git clone https://github.com/GeniusLv2006/tg-pm-gatekeeper.git /opt/tg-pm-gatekeeper'
 ```
 
-Transfer the generated files to temporary root-only locations, install them with the required
-ownership, and remove the temporary copies:
+The bootstrap script creates a non-login service user with UID/GID `10001`. It does not create or
+copy credentials.
+
+### 3. Transfer the private files
+
+Copy the generated files to a temporary root-only location:
 
 ```shell
 scp telegram.session.secret hmac.key evidence.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
-ssh "$DEPLOY_HOST" 'install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret && install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key && install -o 10001 -g 10001 -m 0600 /tmp/evidence.key /etc/tg-pm-gatekeeper/evidence.key && install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env && install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt && rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/evidence.key /tmp/config.env /tmp/deny-domains.txt'
 ```
 
-Do not include these files in a general server backup job.
-
-### Build and start
-
-Record the exact commit, then build and start the service:
+Install them with the ownership expected by Compose, then remove the temporary copies:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && git checkout main && git pull --ff-only && git rev-parse HEAD && docker compose build --pull && docker compose up -d'
+ssh "$DEPLOY_HOST" '
+set -eu
+install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret
+install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key
+install -o 10001 -g 10001 -m 0600 /tmp/evidence.key /etc/tg-pm-gatekeeper/evidence.key
+install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env
+install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt
+rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/evidence.key /tmp/config.env /tmp/deny-domains.txt
+'
 ```
 
-A fresh database starts in `monitor`. An existing database preserves its current mode across rebuilds.
-Check health, mode, and redacted status explicitly:
+Do not include `/etc/tg-pm-gatekeeper` or `/var/lib/tg-pm-gatekeeper` in a general server backup.
+
+### 4. Build and start
+
+Record the commit being installed, build the image, and start the service:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
+ssh "$DEPLOY_HOST" '
+cd /opt/tg-pm-gatekeeper
+git checkout main
+git pull --ff-only
+git rev-parse HEAD
+docker compose build --pull
+docker compose up -d
+'
 ```
 
-Open the [Operations Dashboard](#operations-dashboard), exercise the intended rules with a dedicated account,
-and verify the [deployment boundary](#verify-the-boundary). Enable protection only after those checks:
+A new database starts in `monitor`. Rebuilding later does not reset the mode.
+
+## Confirm the installation
+
+### 1. Check container health and mode
+
+```shell
+ssh "$DEPLOY_HOST" '
+cd /opt/tg-pm-gatekeeper
+docker compose ps
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+'
+```
+
+Continue when:
+
+- the `gatekeeper` container shows `healthy`;
+- the status output includes `"mode":"monitor"`;
+- `heartbeat` is a recent Unix timestamp; and
+- `action_failures` is `0`.
+
+If the container is not healthy, run:
+
+```shell
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose logs --tail=100 gatekeeper'
+```
+
+The logs intentionally use short event names instead of message text or raw sender identities.
+
+### 2. Open the dashboard
+
+From the local repository on your trusted computer:
+
+```shell
+scripts/dashboard-tunnel.sh "$DEPLOY_HOST"
+```
+
+Keep the terminal open. Press Enter when prompted to open the one-time login link, or pass `-o` to
+open it immediately. `Ctrl+C` closes the tunnel.
+
+### 3. Send a safe test
+
+While the service remains in `monitor`, send a private message from a separate Telegram account that
+is not yet trusted. Do not configure it as `TG_TEST_SENDER_ID` for this first check: that setting
+deliberately runs real Telegram actions even in `monitor`. The installation is behaving as expected
+when a row appears under **Pending Reviews** and Telegram has not been changed.
+
+### 4. Confirm the server is not exposing Gatekeeper
+
+Run the checks in [Confirm the security settings](#confirm-the-security-settings). They verify that
+the dashboard is not public and that the private files have the expected permissions.
+
+### 5. Enable protection when ready
+
+Only after the previous checks pass:
 
 ```shell
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode protect'
 ```
 
-Return to `monitor` at any time to cancel non-test pending destructive jobs without stopping update
-processing:
+Return to the safe observation mode at any time:
 
 ```shell
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor'
 ```
 
-## Routine updates
+Returning to `monitor` keeps message processing active but cancels non-test pending destructive jobs.
 
-Before updating, confirm the checkout is clean, record the current commit, check container health, and
-record the current mode. Do not assume that a rebuild changes the mode.
+## Dashboard and daily operation
 
-For runtime, dependency, Docker, or configuration changes:
+The dashboard has no public TCP listener. The tunnel helper connects local port `8765` to the
+owner-only Unix socket on the server and reads a one-time access token. The **Connected** timestamp
+updates when the page successfully reaches the running service.
+
+### Pending Reviews
+
+One row represents one sender. The row contains a consolidated message count and one encrypted
+reference, not a stored conversation history. Opening it fetches one referenced message and the
+sender from Telegram.
+
+- **Legitimate** restores a Gatekeeper-managed archive when needed and allows the sender.
+- **Spam** archives and mutes the dialog, then quarantines the sender.
+- **Dismiss and Cancel Pending Jobs** records no classification, performs no immediate Telegram
+  action, and cancels pending or failed Gatekeeper deletion jobs for that sender.
+
+If the referenced Telegram message has been deleted, use **Resolve and Cancel Pending Jobs**. This
+clears the local review without changing the current sender trust or restriction state.
+
+### Active Cases
+
+The summary counts all current quarantines and suppressions. The table contains only cases that still
+have an unexpired encrypted snapshot. **Allow Now** restores saved dialog settings when available;
+critical-rule cases without saved settings are moved to the main folder and notifications are
+enabled. The second action records that the restriction was left unchanged and does not extend a
+temporary suppression.
+
+Snapshots last at most seven days. Successful verification, rollback, or manual allowance removes
+them sooner. A temporary suppression is released when that sender next messages after expiry; the
+service does not wake up solely to remove it.
+
+### Tunnel options
+
+The SSH target can be an alias or `user@host`. Run `scripts/dashboard-tunnel.sh -h` for every option.
+Common workstation settings are:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && git status --short && git rev-parse HEAD && docker compose ps && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status && git pull --ff-only origin main && git rev-parse HEAD && docker compose up -d --build'
+TG_DASHBOARD_HOST=root@gatekeeper.example
+TG_DASHBOARD_PORT=18765
+TG_DASHBOARD_SOCKET=/srv/gatekeeper/review.sock
+TG_DASHBOARD_TOKEN=/srv/gatekeeper/review.access-token
+TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf"
 ```
 
-For host-only scripts or documentation, pull the reviewed commit without restarting a healthy
-container. Follow [RELEASE.md](RELEASE.md) for the authoritative rebuild classification.
+`TG_REVIEW_*` remains a deprecated alias. Never publish the Unix socket through Docker or a reverse
+proxy.
 
-After any runtime update, verify the deployed commit, health, restart count, mode, redacted status,
-logs, file permissions, Unix socket, and absence of unexpected port mappings.
+## Common commands
 
-### Schema-changing updates
-
-Before a state-schema migration:
-
-1. switch to `monitor`;
-2. require `challenged`, `challenge_issuing`, and `challenge_archiving` to be zero; and
-3. create a temporary remote-only SQLite backup with the online backup API.
+Run these from `/opt/tg-pm-gatekeeper` on the server:
 
 ```shell
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status'
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -c '\''import os, sqlite3; source=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3"); backup=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3"); source.backup(backup); backup.close(); source.close(); os.chmod("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3", 0o600)'\'''
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode protect
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli allow USER_ID
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
+docker compose logs --tail=100 gatekeeper
 ```
 
-After rebuilding, verify `PRAGMA user_version`, state counts, and logs. Delete
-`state.pre-migration.sqlite3` only after all checks pass. If migration fails, preserve the failed
-database for diagnosis and restore the backup together with the prior image.
+Use the dashboard rather than CLI `allow` for active challenges, quarantines, or suppressions because
+the CLI cannot restore their Telegram dialog state.
 
-## Configuration reference
+## Update an existing installation
 
-`scripts/initialize.py` writes the production defaults. [.env.example](../.env.example) is the public
-reference. Compose overrides the fixed container paths for the state database, session, keys,
-evidence store, and denylist; host files remain under `/etc/tg-pm-gatekeeper` and
-`/var/lib/tg-pm-gatekeeper`.
+Before updating, confirm that the server checkout is clean and record the current commit, container
+health, and mode:
 
-| Setting | Default | Constraint or purpose |
+```shell
+ssh "$DEPLOY_HOST" '
+cd /opt/tg-pm-gatekeeper
+git status --short
+git rev-parse HEAD
+docker compose ps
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+'
+```
+
+For a normal runtime update:
+
+```shell
+ssh "$DEPLOY_HOST" '
+cd /opt/tg-pm-gatekeeper
+git pull --ff-only origin main
+git rev-parse HEAD
+docker compose up -d --build
+docker compose ps
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+'
+```
+
+Check the logs after the update. The mode stored in the existing database is preserved.
+
+Documentation-only or host-script changes may require only `git pull --ff-only`; do not restart a
+healthy container unless runtime, configuration, Docker, or dependency inputs changed. Project
+maintainers can use [RELEASE.md](RELEASE.md) for the exact classification.
+
+### Advanced: schema-changing updates
+
+Most updates do not require this procedure. Use it only when release notes explicitly identify a
+state-database migration.
+
+1. Switch to `monitor`.
+2. Confirm `challenged`, `challenge_issuing`, and `challenge_archiving` are all zero.
+3. Create a temporary backup on the server with SQLite's online backup API.
+
+```shell
+ssh "$DEPLOY_HOST" '
+cd /opt/tg-pm-gatekeeper
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+'
+
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -' <<'PYTHON'
+import os
+import sqlite3
+
+source = sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3")
+backup = sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3")
+source.backup(backup)
+backup.close()
+source.close()
+os.chmod("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3", 0o600)
+PYTHON
+```
+
+After rebuilding, verify the schema version, state counts, and logs. Delete the temporary backup only
+after every check passes. Preserve the failed database for diagnosis if migration fails.
+
+## Configuration
+
+`scripts/initialize.py` writes the production defaults. [.env.example](../.env.example) lists every
+setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the container.
+
+| Setting | Default | Purpose |
 | --- | --- | --- |
-| `TG_CHALLENGE_TTL_SECONDS` | `60` | 30–600 seconds |
-| `TG_CHALLENGE_MAX_ATTEMPTS` | `2` | 1–5 numeric attempts |
-| `TG_OUTBOUND_LIMIT_PER_HOUR` | `10` | 1–100 Gatekeeper messages per hour |
-| `TG_AUDIT_RETENTION_DAYS` | `30` | Positive number of days |
-| `TG_REVIEW_RETENTION_DAYS` | `7` | Positive; runtime hard-caps it at 7 days |
-| `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only server Unix socket |
-| `TG_MUTE_DAYS` | `3650` | Positive quarantine mute duration |
-| `TG_EVIDENCE_COLLECTION` | `off` | `on` or `off`; legacy `TG_DATASET_COLLECTION` is accepted for one release |
-| `TG_EVIDENCE_RETENTION_DAYS` | `7` | 1–90 days |
-| `TG_EVIDENCE_MAX_RECORDS_PER_SENDER` | `3` | 1–10 unexpired records; not a rolling window |
-| `TG_TEST_SENDER_ID` | empty | Positive ID of a dedicated test account only |
+| `TG_CHALLENGE_TTL_SECONDS` | `60` | Time allowed for a direct reply; 30–600 seconds |
+| `TG_CHALLENGE_MAX_ATTEMPTS` | `2` | Numeric attempts; 1–5 |
+| `TG_OUTBOUND_LIMIT_PER_HOUR` | `10` | Gatekeeper messages per hour; 1–100 |
+| `TG_AUDIT_RETENTION_DAYS` | `30` | Local audit-event retention |
+| `TG_REVIEW_RETENTION_DAYS` | `7` | Pending and Active Case review retention; capped at 7 |
+| `TG_MUTE_DAYS` | `3650` | Quarantine mute duration |
+| `TG_EVIDENCE_COLLECTION` | `off` | Optional encrypted Evidence Log collection |
+| `TG_EVIDENCE_RETENTION_DAYS` | `7` | Evidence retention; 1–90 days |
+| `TG_EVIDENCE_MAX_RECORDS_PER_SENDER` | `3` | Unexpired records per sender; 1–10 |
+| `TG_TEST_SENDER_ID` | empty | Dedicated arithmetic-flow test account |
+| `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only dashboard Unix socket |
 
-Changing private configuration requires recreating the container. Invalid bounded settings stop
-startup instead of silently choosing a different value, except review retention above seven days is
-clamped to the hard maximum.
+Invalid bounded values stop startup instead of silently changing behavior. Review retention above
+seven days is clamped to seven.
 
 ### Dedicated test sender
 
-Add a dedicated account's positive numeric ID to `/etc/tg-pm-gatekeeper/config.env`, then recreate
-the container:
+Add the dedicated account's positive numeric ID to `config.env`, then recreate the container:
 
 ```shell
 TG_TEST_SENDER_ID=REPLACE_WITH_DEDICATED_TEST_ACCOUNT_ID
 ```
 
-This setting deliberately performs Telegram actions even in `monitor`, bypasses the normal outbound
-quota, and can delete the dedicated test dialog after exhausted attempts. Never use a real
-correspondent. Remove the value when testing is complete.
+This account runs the real arithmetic and cleanup flow even in `monitor`, bypasses the outbound
+quota, and can lose its entire test dialog after exhausted attempts. Remove the value after testing.
 
 ### Optional encrypted Evidence Log
 
-Collection is disabled by default. To retain eligible short-lived review evidence from at most three
-unexpired records per anonymous unknown sender for seven days:
+Collection is disabled by default. To enable it:
 
 ```shell
 TG_EVIDENCE_COLLECTION=on
@@ -193,97 +345,40 @@ TG_EVIDENCE_RETENTION_DAYS=7
 TG_EVIDENCE_MAX_RECORDS_PER_SENDER=3
 ```
 
-Eligible evidence includes text/caption, Telegram-provided quoted or webpage-preview text, detector
-signal-only structural records, button display text, full URLs, normalized domains, Telegram link
-kind, aggregate URL shape, detector signals, structural features, and planned/actual action. The
-service does not fetch webpage bodies, copy media, or save profile data. Message text, full URLs, and
-button text stay inside the encrypted envelope and are not written to logs or SQLite plaintext
-columns.
+Eligible records may include message/caption text, Telegram-provided quote and preview text, button
+text, full URLs, normalized domains, detector signals, and the planned and actual action. Those values
+stay inside an AES-256-GCM encrypted record and are not written to logs or plaintext database columns.
+Media, webpage bodies, profile data, raw IDs, access hashes, and the dedicated test sender are
+excluded.
 
-After the cap is reached, later records are ignored until one expires or is deleted; existing rows
-are not rotated to keep the newest three. Monitor mode can gradually fill the cap, while protect mode
-normally collects only the initial message before the sender changes state. The Evidence Log decrypts
-records only on a detail page and collapses full URLs by default. It also shows rolling
-collection/skip counts and supports Correct Enforcement, False Positive, and Insufficient Evidence
-outcomes plus individual deletion. Collection-disabled traffic is neither sampled nor counted. It
-does not train or run a model.
+After a sender reaches the configured cap, later records are skipped until one expires or is deleted.
+The dashboard supports Correct Assessment, Incorrect Assessment, Insufficient Evidence, and individual
+deletion. Collection-disabled traffic is neither sampled nor counted. Plaintext export is not
+provided.
 
-Old `training.sqlite3` Dataset files are not decrypted or migrated. When opened as the configured
-evidence database, legacy Dataset tables are discarded and a fresh Evidence schema is created.
+Old Dataset tables are discarded rather than decrypted or migrated if a legacy `training.sqlite3`
+file is opened as the Evidence database.
 
-Plaintext export is intentionally not provided. `samples export` returns an explicit error. Use
-`evidence purge --confirm DELETE-ALL-SAMPLES` to irreversibly delete every retained evidence record.
+## Troubleshooting
 
-## Operations Dashboard
+| Symptom | What to check |
+| --- | --- |
+| `docker compose` is not found | Install Docker Engine and the Compose plugin; the legacy `docker-compose` command is not used. |
+| Container stays unhealthy | Run `docker compose logs --tail=100 gatekeeper`; check for a missing private file, broad permissions, or an unauthorized Telegram session. |
+| `startup_failed` | Confirm the five private files exist, the session and keys are mode `0600`, and `config.env` contains real API values. |
+| Dashboard token or socket is missing | Confirm the container is healthy, then inspect `/var/lib/tg-pm-gatekeeper/review.sock` and `review.access-token`. |
+| Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
+| Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Resolve and Cancel Pending Jobs** if the sender decision no longer needs the message. |
+| Mode is still `monitor` after an update | This is expected; mode is stored in the database. Switch explicitly only after checking status. |
 
-The service has no TCP listener. From the local repository, open the supplied tunnel:
+If the problem involves a sender action, preserve the current status and logs before changing policy
+or deleting local state.
 
-```shell
-scripts/dashboard-tunnel.sh "$DEPLOY_HOST"
-```
+## Confirm the security settings
 
-The helper requires `ssh` and `curl`. It reads the short-lived owner-only `review.access-token`,
-starts a dedicated local forward with SSH connection sharing disabled, and prints a one-time login URL
-only after the authenticated dashboard responds. In an interactive terminal, press Enter to open that
-URL in the default browser. Use `-o` to open it immediately. Keep the terminal open; `Ctrl+C` closes
-the tunnel.
-
-The SSH target can be an alias or `user@host` and must be able to read the token and reach the remote
-socket. Defaults may come from environment variables or flags:
-
-```shell
-TG_DASHBOARD_HOST=root@gatekeeper.example \
-TG_DASHBOARD_PORT=18765 \
-TG_DASHBOARD_SOCKET=/srv/gatekeeper/review.sock \
-TG_DASHBOARD_TOKEN=/srv/gatekeeper/review.access-token \
-TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf" \
-scripts/dashboard-tunnel.sh
-```
-
-Prefer the corresponding `TG_DASHBOARD_*` workstation variables; `TG_REVIEW_*` remains a deprecated
-helper alias. `TG_DASHBOARD_SOCKET` configures the workstation helper;
-`TG_DASHBOARD_SOCKET_PATH` configures the service.
-If the service socket moves, update both values and keep the service path inside a writable mounted
-directory. Run `scripts/dashboard-tunnel.sh -h` for all flags.
-
-The default local URL is `http://127.0.0.1:8765/`. The queue checks the server every 10 seconds. The
-**Live connection** response timestamp and the next refresh—not a previously rendered page—show that
-the tunnel is still connected.
-
-The queue contains one row per sender and no message body. Telegram IDs come from encrypted pending
-references; names and usernames are resolved live. Opening a row fetches one referenced message, not
-conversation history. Available decisions are:
-
-- **Legitimate**: restore a Gatekeeper archive when necessary and allow the sender.
-- **Spam**: archive and mute the dialog, then quarantine the sender.
-- **Dismiss**: record no classification and take no new Telegram action.
-
-If the outbound challenge limit caused a quarantine, Legitimate restores the dialog, Spam preserves
-the existing quarantine without repeating Telegram actions, and Dismiss leaves it unchanged. Every
-decision erases all pending references for that sender. Stop the tunnel after review; never publish
-the socket through Docker or a reverse proxy.
-
-Manual Telegram deletion does not dismiss the corresponding local pending row. When its referenced
-message no longer exists, open the row and choose **Resolve deleted conversation**. This records a
-dismissed review and erases the encrypted reference without changing sender trust or enforcement
-state.
-
-The **Active Cases** page lists current quarantines and suppressions with reason and remaining
-duration. Opening a row decrypts the original triggering text/caption, quoted context, Telegram
-webpage preview, button text, full URLs, normalized domains, URL shape, and detector evidence from
-the short-lived local snapshot; it does not depend on the Telegram message still existing after
-dialog deletion. Full URLs are collapsed by default. **Allow now** restores the saved folder and
-notification settings before allowing the sender, while **Keep current restriction** records an
-operator decision and changes nothing. Missing or expired identity references prevent safe
-allowance. Snapshots expire after at most seven days and are erased earlier after success, rollback,
-allowance, or suppression expiry. Telegram block is not used. The summary reports total local
-quarantined/suppressed states separately from reviewable evidence. Legacy states without evidence
-remain in the totals, use the best available historical reason, and are explicitly reported as
-unavailable for detail review.
-
-## Verify the boundary
-
-The deployment is acceptable only when all checks pass:
+Run these checks once after installation and after changes to Docker, paths, permissions, or the
+dashboard. They confirm that Gatekeeper is not publicly exposed and that other server users cannot
+read its private files.
 
 ```shell
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
@@ -292,22 +387,39 @@ ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session
 ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock /var/lib/tg-pm-gatekeeper/review.access-token'
 ```
 
-Expected values:
+Everything is correct when:
 
-- user `10001:10001`, read-only root filesystem, all capabilities dropped, and
-  `no-new-privileges`;
-- no Docker port bindings and no application TCP listener;
-- session and key files mode `600`;
-- `config.env` and denylist mode `640`, owned by `root:10001`;
-- state directory mode `700`, owned by `10001:10001`; and
-- review socket and access token mode `600`, owned by `10001:10001`.
+- the container user is `10001:10001`;
+- the root filesystem is read-only, all capabilities are dropped, and `no-new-privileges` is set;
+- Docker shows no Gatekeeper port bindings;
+- session and key files are mode `600`;
+- `config.env` and the denylist are mode `640` and owned by `root:10001`;
+- the state directory is mode `700` and owned by `10001:10001`; and
+- the review socket and access token are mode `600` and owned by `10001:10001`.
 
-The access token is replaced on every service start.
+Stop and correct any mismatch before enabling `protect`. The dashboard access token is replaced on
+every service start.
 
-## Emergency revocation
+## Stop or remove Gatekeeper
 
-1. Stop the container over SSH: `docker compose stop gatekeeper`.
-2. Terminate the session from an official Telegram client.
-3. Remove `/etc/tg-pm-gatekeeper/telegram.session.secret`.
-4. Generate and provision a new session from a trusted workstation.
-5. Start the service only after confirming that the old authorization is absent from Telegram.
+To stop screening without deleting data:
+
+```shell
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose stop gatekeeper'
+```
+
+To permanently disconnect the Telegram session, stop the container, terminate the session from an
+official Telegram client, and remove the server-side session file. Remove the repository, state,
+configuration, and keys only after deciding whether any local audit information is still needed.
+
+## Emergency session revocation
+
+If the session may have leaked:
+
+1. Stop the container.
+2. Terminate the affected session from an official Telegram client.
+3. Delete `/etc/tg-pm-gatekeeper/telegram.session.secret` from the server.
+4. Generate and provision a new session from a trusted computer.
+5. Start the service only after confirming that the old Telegram authorization is gone.
+
+See [SECURITY.md](../SECURITY.md) for the complete incident checklist.

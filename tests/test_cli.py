@@ -62,6 +62,36 @@ class CliTests(unittest.TestCase):
             self.assertEqual(store.sender(sender_key).status, "challenge_issuing")
             store.close()
 
+    def test_allow_refuses_suppressed_sender_without_telegram_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.sqlite3"
+            key_file = root / "hmac_key"
+            key = b"k" * 32
+            key_file.write_bytes(key)
+            key_file.chmod(0o600)
+            sender_key = IdentifierProtector(key).sender_key(123456789)
+            store = StateStore(database)
+            store.suppress(
+                sender_key,
+                "critical_rule",
+                until=None,
+                reference=b"reference",
+            )
+            store.close()
+
+            environment = {
+                "TG_DB_PATH": str(database),
+                "TG_HMAC_KEY_FILE": str(key_file),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(ValueError, "dashboard review"):
+                    run(["allow", "123456789"])
+
+            store = StateStore(database)
+            self.assertEqual(store.sender(sender_key).status, "suppressed")
+            store.close()
+
     def test_evidence_status_purge_and_removed_samples_export(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

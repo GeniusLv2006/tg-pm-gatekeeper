@@ -9,6 +9,8 @@ config.env
 hmac.key
 secrets/
 /RELEASE.local.md
+/AGENT.md
+/AGENTS.md
 
 # Telegram authorization data
 *.session

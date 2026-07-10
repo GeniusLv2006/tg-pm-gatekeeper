@@ -117,24 +117,29 @@ browser memory and screenshots like any other displayed page.
 An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
 the local allowlist and are restored first when Gatekeeper previously archived the dialog. Confirmed
 spam is archived and muted unless the sender is already quarantined. Dismiss performs no new action
-and therefore leaves a rate-limit fallback quarantine in place. A decision immediately removes the
+through Telegram and therefore leaves a rate-limit fallback quarantine in place, but it cancels any
+pending or failed Gatekeeper deletion jobs for that sender. A decision immediately removes the
 encrypted reference. Pending references expire after no more than seven days, while non-reversible
 verdicts may remain for the normal audit retention period.
 Deleting a conversation in Telegram does not itself update the local queue. If the referenced
 message is no longer available, the detail page still exposes a resolve-only action that dismisses
-the local review and erases its reference without changing sender state.
+the local review, erases its reference, and cancels pending or failed Gatekeeper deletion jobs
+without changing sender state.
 
 Protect-mode terminal states have a separate **Active Cases** surface. The service captures the
 original triggering text/caption, Telegram-provided quote and preview, button text, full URLs,
 normalized domains, URL shape, and detector evidence before a challenge begins, encrypts it with the
 active-case review key, and exposes it only after the sender becomes quarantined or suppressed. A
-correct answer, challenge rollback, manual allowance, or suppression expiry erases the snapshot.
-Other snapshots expire after the configured review retention, capped at seven days. Allowing a
-sender first restores the saved Telegram folder and notification settings; failure leaves both
-policy state and snapshot unchanged. Keeping the restriction records an operator decision and
-changes nothing. Summary metrics count all active local states, while the case table includes only
-unexpired encrypted snapshots. Older states without snapshots remain visible as an unavailable count
-and derive a reason from historical verdicts when possible.
+correct answer, challenge rollback, or manual allowance erases the snapshot. Temporary suppression
+expiry is reconciled only when that sender next messages; otherwise the snapshot remains until its
+own deadline. Other snapshots expire after the configured review retention, capped at seven days.
+Allowing a sender first restores saved Telegram folder and notification settings when they exist. A
+critical-rule case without a dialog snapshot is moved to the main folder and notifications are
+enabled instead; failure leaves both policy state and snapshot unchanged. Leaving the restriction
+unchanged records an operator decision but does not extend a temporary suppression. Summary metrics
+count all active local states, while the case table includes only unexpired encrypted snapshots.
+Older states without snapshots remain visible as an unavailable count and derive a reason from
+historical verdicts when possible.
 
 ## Implemented action policy
 
@@ -172,8 +177,10 @@ Sender state, processed-message, review, and challenge records use an HMAC-SHA-2
 Telegram user ID. The server-local HMAC key must remain outside general backups. Audit records
 contain only the derived sender key, rule code, outcome, and timestamp and default to 30-day
 retention. Usernames, phone numbers, media, hidden URL entity targets, raw URLs, and raw user IDs are
-not persisted. Telegram message IDs are stored only with derived sender keys for idempotency, direct
-Reply binding, and identification of automated Gatekeeper messages. Names and usernames may exist
+not written to audit records or plaintext state columns. Raw URLs may exist only inside the
+short-lived encrypted Evidence Log and Active Case envelopes described below. Telegram message IDs
+are stored only with derived sender keys for idempotency, direct Reply binding, and identification of
+automated Gatekeeper messages. Names and usernames may exist
 briefly in the review process's bounded memory cache, and
 raw user IDs are rendered from authenticated encrypted references without being added to the
 database. Processed Telegram message IDs are retained for idempotency for the same audit-retention

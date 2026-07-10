@@ -96,6 +96,7 @@ def run(argv: list[str] | None = None) -> int:
                 "challenge_archiving",
                 "challenged",
                 "quarantined",
+                "suppressed",
             }:
                 raise ValueError(
                     "sender requires dashboard review to restore Telegram state"
