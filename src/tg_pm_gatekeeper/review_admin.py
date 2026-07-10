@@ -19,7 +19,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from telethon import functions, types
 
-from .evidence import EvidenceStore
 from .rules import URL_RE, normalized_domain, url_evidence, url_shape
 from .service import GatekeeperService
 from .store import DialogSnapshot, EnforcementReview, ReviewItem, StateStore
@@ -51,10 +50,6 @@ class ReviewAdminServer:
         *,
         mute_days: int,
         cancel_timeout: Callable[[str], None] = lambda _sender_key: None,
-        evidence_store: EvidenceStore | None = None,
-        evidence_collection: bool = False,
-        evidence_retention_days: int = 7,
-        evidence_max_records_per_sender: int = 3,
     ) -> None:
         self.socket_path = socket_path
         self.store = store
@@ -63,10 +58,6 @@ class ReviewAdminServer:
         self.telegram_client = telegram_client
         self.mute_days = mute_days
         self.cancel_timeout = cancel_timeout
-        self.evidence_store = evidence_store
-        self.evidence_collection = evidence_collection
-        self.evidence_retention_days = evidence_retention_days
-        self.evidence_max_records_per_sender = evidence_max_records_per_sender
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
         self._access_token = secrets.token_urlsafe(32)
@@ -214,19 +205,6 @@ class ReviewAdminServer:
             return 200, {}, await self._dashboard_page()
         if path == "/review" and method == "GET":
             return 200, {}, await self._review_queue_page()
-        if path == "/dataset" and method == "GET":
-            return 303, {"Location": "/evidence"}, b""
-        if path.startswith("/dataset/"):
-            suffix = path.removeprefix("/dataset/")
-            return 303, {"Location": f"/evidence/{suffix}"}, b""
-        if path == "/evidence" and method == "GET":
-            try:
-                page = max(1, int(parse_qs(parsed.query).get("page", ["1"])[0]))
-            except ValueError:
-                return 400, {}, self._page("Invalid Page")
-            return 200, {}, self._evidence_index_page(page)
-        if path.startswith("/evidence/"):
-            return self._dispatch_evidence(method, path, body)
         if path == "/enforcement" and method == "GET":
             return 303, {"Location": "/cases"}, b""
         if path.startswith("/enforcement/"):
@@ -292,7 +270,8 @@ class ReviewAdminServer:
                     self.store.activate_enforcement_review(
                         item.sender_key,
                         "manual_spam",
-                        int(time.time()) + self.service.review_retention_days * 86400,
+                        int(time.time())
+                        + self.service.active_case_retention_days * 86400,
                     )
                 self.cancel_timeout(item.sender_key)
                 self.store.decide_sender_reviews(item.sender_key, "spam")
@@ -329,146 +308,6 @@ class ReviewAdminServer:
                 return value
         return ""
 
-    def _evidence_index_page(self, page: int = 1) -> bytes:
-        if self.evidence_store is None:
-            return self._page("Evidence Collection Is Disabled")
-        stats = self.evidence_store.statistics(
-            retention_days=self.evidence_retention_days
-        )
-        records = self.evidence_store.summaries(limit=101, offset=(page - 1) * 100)
-        has_next = len(records) > 100
-        rows = (
-            "".join(
-                f"<tr><td><a href='/evidence/{record.id}'>#{record.id}</a></td>"
-                f"<td>Sender {html.escape(record.sender_token[:8])}&hellip;</td>"
-                f"<td>{html.escape(self._human_label(record.automatic_hint))}</td>"
-                f"<td>{html.escape(self._evidence_outcome_label(record.review_outcome))}</td>"
-                f"<td>{html.escape(self._relative_age(record.created_at))}</td></tr>"
-                for record in records[:100]
-            )
-            or "<tr><td colspan='5'>No retained evidence records.</td></tr>"
-        )
-        navigation = "<p class='back'>"
-        if page > 1:
-            navigation += f"<a href='/evidence?page={page - 1}'>← Newer</a> "
-        if has_next:
-            navigation += f"<a href='/evidence?page={page + 1}'>Older →</a>"
-        navigation += "</p>"
-        labeled = sum(
-            stats.get(label, 0)
-            for label in ("correct", "false_positive", "insufficient")
-        )
-        overview = (
-            "<dl class='metric-grid'>"
-            f"<div><dt>Total Evidence Records</dt><dd class='data-value'>{stats.get('total', 0)}</dd></div>"
-            f"<div><dt>Operator Reviewed</dt><dd class='data-value'>{labeled}</dd></div>"
-            f"<div><dt>Correct / Incorrect / Insufficient</dt><dd class='data-value'>"
-            f"{stats.get('correct', 0)} / {stats.get('false_positive', 0)} / "
-            f"{stats.get('insufficient', 0)}</dd></div>"
-            f"<div><dt>Spam / Legitimate / Uncertain Hints</dt><dd class='data-value'>"
-            f"{stats.get('hint_spam_candidate', 0)} / "
-            f"{stats.get('hint_legitimate_candidate', 0)} / "
-            f"{stats.get('hint_uncertain', 0)}</dd></div>"
-            f"<div><dt>Expiring Within 24 Hours</dt><dd class='data-value'>"
-            f"{stats.get('expiring_24h', 0)}</dd></div>"
-            f"<div><dt>Retention Window</dt><dd class='data-value'>"
-            f"{self.evidence_retention_days}d</dd></div>"
-            "</dl>"
-        )
-        activity = (
-            "<h3>Collection Activity</h3><p class='refresh-note'>"
-            f"UTC calendar-day totals within the current {self.evidence_retention_days}-day retention window.</p>"
-            "<dl class='metric-grid'>"
-            f"<div><dt>Content Evidence</dt><dd class='data-value'>{stats.get('collection_collected_content', 0)}</dd></div>"
-            f"<div><dt>Records Without Textual Evidence</dt><dd class='data-value'>{stats.get('collection_collected_structural', 0)}</dd></div>"
-            f"<div><dt>Skipped: No Usable Signal</dt><dd class='data-value'>{stats.get('collection_skipped_no_signal', 0)}</dd></div>"
-            f"<div><dt>Skipped: Duplicate</dt><dd class='data-value'>{stats.get('collection_skipped_duplicate', 0)}</dd></div>"
-            f"<div><dt>Skipped: Sender Cap</dt><dd class='data-value'>{stats.get('collection_skipped_sender_cap', 0)}</dd></div>"
-            "</dl>"
-        )
-        content = (
-            self._masthead("Evidence Log", f"{stats.get('total', 0)} Records")
-            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a> · <a href='/review'>Pending Reviews</a></p><main>"
-            + "<section class='queue-intro'><p class='eyebrow'>Short-Lived Audit Evidence</p>"
-            + "<h2>Evidence Log</h2>"
-            + f"<p>Collection {'enabled' if self.evidence_collection else 'disabled'} · "
-            + f"{self.evidence_retention_days}-day retention · "
-            + f"up to {self.evidence_max_records_per_sender} records per sender.</p>"
-            + "<p>Evidence is retained for short-term review and rule auditing, not model training. Eligible unknown-sender messages contain text, quoted text, Telegram preview text, or a detector signal.</p>"
-            + overview
-            + activity
-            + "</section>"
-            + "<div class='table-shell'><table><thead><tr><th>Evidence</th><th>Anonymous Sender</th>"
-            + "<th>Automatic Hint</th><th>Review Outcome</th><th>Age</th></tr></thead>"
-            + f"<tbody>{rows}</tbody></table></div>{navigation}</main>"
-        )
-        return self._page(content, raw=True, page_title="Evidence Log")
-
-    def _dispatch_evidence(
-        self, method: str, path: str, body: bytes
-    ) -> tuple[int, dict[str, str], bytes]:
-        if self.evidence_store is None:
-            return 404, {}, self._page("Evidence Collection Is Disabled")
-        try:
-            record_id = int(path.rsplit("/", 1)[-1])
-        except ValueError:
-            return 404, {}, self._page("Evidence Record Not Found")
-        record = self.evidence_store.record(record_id)
-        if record is None:
-            return 404, {}, self._page("Evidence Record Not Found")
-        if method == "POST":
-            values = parse_qs(body.decode("utf-8"), strict_parsing=True)
-            if not secrets.compare_digest(
-                values.get("token", [""])[0], self._csrf_token
-            ):
-                return 400, {}, self._page("Invalid Action Token")
-            action = values.get("action", [""])[0]
-            if action == "delete":
-                self.evidence_store.delete(record_id)
-            elif action in {"correct", "false_positive", "insufficient"}:
-                self.evidence_store.review(record_id, action)
-            else:
-                return 400, {}, self._page("Unknown Action")
-            return 303, {"Location": "/evidence"}, b""
-        if method != "GET":
-            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
-        payload = record.payload
-        actions = "".join(
-            self._action_form(record_id, label, display, base="evidence")
-            for label, display in (
-                ("correct", "Correct Assessment"),
-                ("false_positive", "Incorrect Assessment"),
-                ("insufficient", "Insufficient Evidence"),
-            )
-        ) + self._action_form(
-            record_id, "delete", "Delete Evidence", danger=True, base="evidence"
-        )
-        review_context = (
-            "<aside class='case-file'><p class='eyebrow'>Assessment Context</p><dl>"
-            f"<dt>Automatic Hint</dt><dd>{html.escape(self._human_label(record.automatic_hint))}</dd>"
-            f"<dt>Planned Action</dt><dd>{html.escape(self._human_label(str(payload.get('planned_action') or 'not recorded')))}</dd>"
-            f"<dt>Actual Action</dt><dd>{html.escape(self._human_label(str(payload.get('actual_action') or 'not recorded')))}</dd>"
-            f"<dt>Review Outcome</dt><dd>{html.escape(self._evidence_outcome_label(record.review_outcome))}</dd>"
-            f"<dt>Evidence Expires</dt><dd>{datetime.fromtimestamp(record.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd>"
-            "</dl></aside>"
-        )
-        content = (
-            self._masthead("Evidence Record", f"#{record.id}")
-            + "<p class='back'><a href='/evidence'>← Evidence Log</a></p>"
-            + "<main class='review-grid'><section class='message-panel'>"
-            + self._evidence_sections(payload, context="evidence")
-            + f"<div class='actions'>{actions}</div></section>{review_context}</main>"
-        )
-        return 200, {}, self._page(content, raw=True, page_title=f"Evidence #{record.id}")
-
-    @staticmethod
-    def _evidence_outcome_label(outcome: str | None) -> str:
-        return {
-            "correct": "Correct Assessment",
-            "false_positive": "Incorrect Assessment",
-            "insufficient": "Insufficient Evidence",
-        }.get(outcome or "", "Unreviewed")
-
     @staticmethod
     def _json_block(value: object) -> str:
         return html.escape(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
@@ -489,9 +328,7 @@ class ReviewAdminServer:
             return "—"
         return ", ".join(str(item) for item in value)
 
-    def _evidence_sections(
-        self, payload: dict[str, object], *, context: str
-    ) -> str:
+    def _review_sections(self, payload: dict[str, object]) -> str:
         text = str(payload.get("text", ""))
         quote_text = str(payload.get("quote_text", ""))
         preview_text = str(payload.get("preview_text", ""))
@@ -512,22 +349,12 @@ class ReviewAdminServer:
             + self._text_block("Telegram Webpage Preview", preview_text, quote=True)
         )
         if structural_only:
-            if context == "evidence":
-                guidance = (
-                    "Other retained evidence may include URLs, button text, detector signals, "
-                    "and structural metadata. Select Insufficient Evidence if the available "
-                    "record does not support an assessment."
-                )
-            else:
-                guidance = (
-                    "Review any available URLs, button text, detector signals, and structural "
-                    "metadata before deciding whether to allow the sender or leave the "
-                    "restriction unchanged."
-                )
             sections += (
                 "<div class='notice'><strong>Limited Textual Evidence.</strong> "
                 "No message text, quoted text, or webpage-preview text was retained. "
-                f"{guidance}</div>"
+                "Review any available URLs, button text, matched HR rules, and structural "
+                "metadata before deciding whether to allow the sender or leave the "
+                "restriction unchanged.</div>"
             )
         return (
             sections
@@ -538,8 +365,19 @@ class ReviewAdminServer:
             + f"<details><summary>Quoted-Context URLs</summary><pre>{quote_urls}</pre></details>"
             + f"<details><summary>Link Shape</summary><pre>{url_shape}</pre></details>"
             + f"<details><summary>Quoted-Context Link Shape</summary><pre>{quote_url_shape}</pre></details>"
-            + f"<details><summary>Full Decrypted Evidence Payload</summary><pre>{details}</pre></details>"
+            + f"<details><summary>Full Decrypted Case Payload</summary><pre>{details}</pre></details>"
         )
+
+    @staticmethod
+    def _severity_label(payload: dict[str, object], reason: str) -> str:
+        severity = str(payload.get("severity") or "").strip().casefold()
+        if severity in {"none", "signal", "high", "critical"}:
+            return severity.title()
+        if severity == "manual":
+            return "Manual Decision"
+        if reason == "critical_rule":
+            return "Critical"
+        return "Not Recorded"
 
     async def _dispatch_enforcement(
         self, method: str, path: str, body: bytes
@@ -610,13 +448,13 @@ class ReviewAdminServer:
             f"{'s' if stats['unreviewable'] != 1 else ''} "
             f"{'have' if stats['unreviewable'] != 1 else 'has'} no encrypted snapshot "
             "and cannot be opened here. Its snapshot may have expired, failed capture, or predate "
-            "evidence capture."
+            "snapshot capture."
             if stats["unreviewable"]
             else "Every active case currently has reviewable evidence."
         )
         content = (
             self._masthead("Active Cases", f"{len(items)} Reviewable")
-            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a> · <a href='/evidence'>Evidence Log</a></p>"
+            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
             + "<h2>Review Active Cases</h2>"
             + "<p>Encrypted evidence preserves the triggering message, links, buttons, and quoted context for short-term operator review. Telegram block is not used.</p>"
@@ -635,12 +473,10 @@ class ReviewAdminServer:
     async def _show_enforcement(
         self, item: EnforcementReview
     ) -> tuple[int, dict[str, str], bytes]:
-        if self.service.review_content_protector is None:
+        if self.service.active_case_protector is None:
             return 500, {}, self._page("Encrypted Review Content Is Unavailable")
         try:
-            payload = self.service.review_content_protector.open_enforcement(
-                item.envelope
-            )
+            payload = self.service.active_case_protector.open(item.envelope)
         except ValueError:
             return 500, {}, self._page("Encrypted Review Content Is Unavailable")
         identity = "Identity unavailable"
@@ -703,11 +539,13 @@ class ReviewAdminServer:
           <p class="eyebrow">Decrypted Local Evidence</p>
           <h2>{html.escape(identity)}</h2>
           <p class="refresh-note">Encrypted at rest; decrypted only for this owner-only view.</p>
-          {self._evidence_sections(payload, context="case")}
+          {self._review_sections(payload)}
           {telegram_link}
         </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
           <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
-          <dt>Reason</dt><dd>{html.escape(self._human_label(item.reason))}</dd><dt>Rules</dt><dd>{html.escape(rules)}</dd>
+          <dt>Restriction Cause</dt><dd>{html.escape(self._human_label(item.reason))}</dd>
+          <dt>Severity</dt><dd>{html.escape(self._severity_label(payload, item.reason))}</dd>
+          <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
           <dt>Evidence Expires</dt><dd>{datetime.fromtimestamp(item.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd></dl>
           <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
@@ -730,7 +568,7 @@ class ReviewAdminServer:
     async def _capture_manual_enforcement(
         self, item: ReviewItem, peer: types.InputPeerUser
     ) -> None:
-        if self.service.review_content_protector is None or item.reference is None:
+        if self.service.active_case_protector is None or item.reference is None:
             return
         try:
             _, _, message_id = self.protector.open_review_reference(item.reference)
@@ -789,12 +627,7 @@ class ReviewAdminServer:
                 "quote_domains": list(quote_domains[:3]),
                 "url_shape": url_shape(url_values),
                 "quote_url_shape": url_shape(quote_urls),
-                "signals": [],
-                "severity": "high",
-                "score": None,
-                "model_version": None,
-                "planned_action": "manual_spam",
-                "actual_action": "active_case",
+                "severity": "manual",
                 "policy": "manual_review",
                 "rule_codes": json.loads(item.rule_codes),
                 "features": json.loads(item.features),
@@ -803,11 +636,9 @@ class ReviewAdminServer:
             self.store.save_enforcement_review(
                 item.sender_key,
                 reference=item.reference,
-                envelope=self.service.review_content_protector.seal_enforcement(
-                    payload
-                ),
+                envelope=self.service.active_case_protector.seal(payload),
                 reason="manual_spam",
-                expires_at=now + self.service.review_retention_days * 86400,
+                expires_at=now + self.service.active_case_retention_days * 86400,
                 now=now,
             )
         except Exception:
@@ -852,7 +683,7 @@ class ReviewAdminServer:
               </section>
               <aside class="case-file"><p class="eyebrow">Review Details</p>
                 <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-                <dt>Rules</dt><dd>{html.escape(rules)}</dd>
+                <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
                 <dt>Messages Observed</dt><dd>{item.message_count}</dd>
                 <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
               </aside>
@@ -881,7 +712,7 @@ class ReviewAdminServer:
           <aside class="case-file">
             <p class="eyebrow">Review Details</p>
             <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-            <dt>Rules</dt><dd>{html.escape(rules)}</dd>
+            <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
             <dt>Telegram ID</dt><dd>{user_id}</dd>
             <dt>Messages Observed</dt><dd>{item.message_count}</dd>
             <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
@@ -988,29 +819,21 @@ class ReviewAdminServer:
         review_items = self.store.review_items()
         active_stats = self.store.enforcement_statistics()
         active_restrictions = active_stats["quarantined"] + active_stats["suppressed"]
-        evidence_total = 0
-        if self.evidence_store is not None:
-            evidence_total = self.evidence_store.statistics(
-                retention_days=self.evidence_retention_days
-            ).get("total", 0)
         mode = self.store.get_mode()
         content = (
             self._masthead("Operations Dashboard", mode.title())
             + "<main><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
             "<h2>Operations Dashboard</h2>"
             "<p>Use Active Cases for recovery after a possible false positive. "
-            "Pending Reviews cover monitor-mode simulations and protect-mode exceptions. "
-            "Evidence Log is short-lived encrypted audit evidence.</p>"
+            "Pending Reviews cover monitor-mode simulations and protect-mode exceptions.</p>"
             "<dl class='metric-grid'>"
             f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
             f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
             f"<div><dt>Pending Reviews</dt><dd class='data-value'>{len(review_items)}</dd></div>"
-            f"<div><dt>Evidence Records</dt><dd class='data-value'>{evidence_total}</dd></div>"
             "</dl></section>"
             "<div class='table-shell'><table><thead><tr><th>Area</th><th>Purpose</th><th>Open</th></tr></thead><tbody>"
             "<tr><td>Active Cases</td><td>Review restrictions that still have an unexpired encrypted snapshot.</td><td><a href='/cases'>Open</a></td></tr>"
             "<tr><td>Pending Reviews</td><td>Resolve monitor-mode simulations and protect-mode exception reviews.</td><td><a href='/review'>Open</a></td></tr>"
-            "<tr><td>Evidence Log</td><td>Review short-lived encrypted evidence for rule audits and false-positive analysis.</td><td><a href='/evidence'>Open</a></td></tr>"
             "</tbody></table></div></main>"
         )
         return self._page(
@@ -1036,7 +859,7 @@ class ReviewAdminServer:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
             self._masthead("Pending Reviews", f"{len(items)} Pending")
-            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a> · <a href='/evidence'>Evidence Log</a></p>"
+            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
             "<h2>Review Pending Senders</h2>"
             "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
@@ -1046,7 +869,7 @@ class ReviewAdminServer:
             "<p class='refresh-note'>This page checks the connection every 10 seconds and shows "
             "an error when the SSH tunnel is unavailable.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Review Reason</th>"
-            "<th>Rules</th><th>Messages</th>"
+            "<th>Matched HR Rules</th><th>Messages</th>"
             f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
             raw=True,
             refresh_seconds=10,
@@ -1265,7 +1088,7 @@ class ReviewAdminServer:
             "restore_failed": "Restoration Failed · Protect",
             "warning_failed": "Failure Warning Not Delivered · Protect",
             "timeout_notice_failed": "Timeout Warning Not Delivered · Protect",
-            "critical_rule": "Critical Rule",
+            "critical_rule": "Critical HR Match",
             "manual_spam": "Manual Spam Review",
             "attempts_exhausted": "Attempts Exhausted",
             "challenge_timeout": "Challenge Timeout",

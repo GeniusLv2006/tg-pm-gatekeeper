@@ -15,9 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .crypto import IdentifierProtector
-from .evidence import EvidenceProtector, EvidenceStore
-from .policy import DetectionResult, PolicyEngine
+from .crypto import ActiveCaseProtector, IdentifierProtector
+from .policy import DetectionResult, PolicyEngine, Severity
 from .rules import MessageFacts, evaluate_hard_rules, url_evidence, url_shape
 from .store import SenderState, StateStore
 
@@ -57,7 +56,7 @@ TEST_VERIFICATION_TIMEOUT_TEXT = (
 FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
-MAX_EVIDENCE_BUTTON_TEXTS = 10
+MAX_REVIEW_BUTTON_TEXTS = 10
 
 
 class MessageActions(Protocol):
@@ -222,14 +221,11 @@ class GatekeeperService:
         challenge_ttl_seconds: int = 60,
         challenge_max_attempts: int = 2,
         outbound_limit_per_hour: int = 10,
-        review_retention_days: int = 7,
+        pending_review_retention_days: int = 7,
+        active_case_retention_days: int = 30,
         denylist: frozenset[str] = frozenset(),
         test_sender_id: int | None = None,
-        evidence_store: EvidenceStore | None = None,
-        review_content_protector: EvidenceProtector | None = None,
-        evidence_collection: bool = True,
-        evidence_retention_days: int = 30,
-        evidence_max_records_per_sender: int = 3,
+        active_case_protector: ActiveCaseProtector | None = None,
         challenge_factory=new_challenge,
         clock=lambda: int(time.time()),
     ) -> None:
@@ -238,17 +234,14 @@ class GatekeeperService:
         self.challenge_ttl_seconds = challenge_ttl_seconds
         self.challenge_max_attempts = challenge_max_attempts
         self.outbound_limit_per_hour = outbound_limit_per_hour
-        self.review_retention_days = min(review_retention_days, 7)
+        self.pending_review_retention_days = min(pending_review_retention_days, 7)
+        self.active_case_retention_days = min(active_case_retention_days, 30)
         self.denylist = denylist
         self.test_sender_id = test_sender_id
         self.test_sender_key = (
             protector.sender_key(test_sender_id) if test_sender_id is not None else None
         )
-        self.evidence_store = evidence_store
-        self.review_content_protector = review_content_protector
-        self.evidence_collection = evidence_collection
-        self.evidence_retention_days = evidence_retention_days
-        self.evidence_max_records_per_sender = evidence_max_records_per_sender
+        self.active_case_protector = active_case_protector
         self.policy = PolicyEngine()
         self.challenge_factory = challenge_factory
         self.clock = clock
@@ -332,12 +325,6 @@ class GatekeeperService:
 
             detection = decision.detection_result()
             policy = self.policy.decide(detection)
-            evidence_id: int | None = None
-            if state.status == "unknown" and not is_test_sender:
-                evidence_id = self._collect_evidence(
-                    message, detection, policy.planned_action, now
-                )
-
             if decision.severity == "critical" and not is_test_sender:
                 for rule in decision.rule_codes:
                     self.store.audit(sender_key, rule, "matched", now)
@@ -346,29 +333,18 @@ class GatekeeperService:
                     self._enqueue_review(
                         sender_key, message, outcome, decision.rule_codes, now
                     )
-                    if evidence_id is not None:
-                        self._update_evidence_action(
-                            evidence_id,
-                            automatic_hint="spam_candidate",
-                            actual_action=outcome,
-                        )
                 else:
                     self._capture_enforcement_review(
                         sender_key,
                         message,
                         reason="critical_rule",
                         rule_codes=decision.rule_codes,
+                        severity=decision.severity,
                         now=now,
                     )
                     outcome = self._schedule_critical_delete(
                         sender_key, message, actions, now
                     )
-                    if evidence_id is not None:
-                        self._update_evidence_action(
-                            evidence_id,
-                            automatic_hint="spam_candidate",
-                            actual_action=outcome,
-                        )
                 self._record_decision(
                     sender_key, detection, policy.planned_action, outcome, now
                 )
@@ -387,24 +363,19 @@ class GatekeeperService:
                 self.store.audit(sender_key, "CHALLENGE_REQUIRED", "observed", now)
                 outcome = "would_challenge"
                 self._enqueue_review(sender_key, message, outcome, (), now)
-                if evidence_id is not None:
-                    self._update_evidence_action(
-                        evidence_id,
-                        automatic_hint="uncertain",
-                        actual_action=outcome,
-                    )
                 self._record_decision(
                     sender_key, detection, policy.planned_action, outcome, now
                 )
                 return outcome
 
-            outcome = await self._issue_challenge(sender_key, message, actions, now)
-            if evidence_id is not None:
-                self._update_evidence_action(
-                    evidence_id,
-                    automatic_hint="uncertain",
-                    actual_action=outcome,
-                )
+            outcome = await self._issue_challenge(
+                sender_key,
+                message,
+                actions,
+                now,
+                rule_codes=decision.rule_codes,
+                severity=decision.severity,
+            )
             self._record_decision(
                 sender_key, detection, policy.planned_action, outcome, now
             )
@@ -416,78 +387,20 @@ class GatekeeperService:
         finally:
             self.store.finish_message(sender_key, message.message_id, outcome)
 
-    def _collect_evidence(
-        self,
-        message: IncomingMessage,
-        detection: DetectionResult,
-        planned_action: str,
-        now: int,
-    ) -> int | None:
-        if self.evidence_store is None or not self.evidence_collection:
-            return None
-        facts = message.facts
-        has_content = bool(
-            message.text.strip()
-            or facts.quote_text.strip()
-            or facts.preview_text.strip()
-        )
-        if not has_content and not detection.signals:
-            try:
-                self.evidence_store.record_no_signal(now)
-            except Exception:
-                LOG.error("evidence_collection_failed")
-                self.store.audit(
-                    self.protector.sender_key(message.sender_id),
-                    "EVIDENCE_COLLECTION",
-                    "action_failed",
-                    now,
-                )
-            return None
-        payload = self._evidence_payload(
-            message,
-            detection=detection,
-            planned_action=planned_action,
-            actual_action="pending",
-        )
-        try:
-            result = self.evidence_store.collect(
-                sender_id=message.sender_id,
-                message_id=message.message_id,
-                payload=payload,
-                automatic_hint="uncertain",
-                retention_days=self.evidence_retention_days,
-                max_per_sender=self.evidence_max_records_per_sender,
-                sample_kind="content" if has_content else "structural",
-                now=now,
-            )
-            return result.record_id
-        except Exception:
-            LOG.error("evidence_collection_failed")
-            self.store.audit(
-                self.protector.sender_key(message.sender_id),
-                "EVIDENCE_COLLECTION",
-                "action_failed",
-                now,
-            )
-        return None
-
-    def _evidence_payload(
+    def _active_case_payload(
         self,
         message: IncomingMessage,
         *,
-        detection: DetectionResult | None = None,
-        planned_action: str | None = None,
-        actual_action: str | None = None,
         rule_codes: tuple[str, ...] = (),
+        severity: Severity = "none",
     ) -> dict[str, object]:
         facts = message.facts
-        signals = list(detection.signals if detection is not None else rule_codes)
         return {
             "schema_version": 4,
             "text": message.text,
             "quote_text": facts.quote_text,
             "preview_text": facts.preview_text,
-            "button_texts": list(facts.button_texts[:MAX_EVIDENCE_BUTTON_TEXTS]),
+            "button_texts": list(facts.button_texts[:MAX_REVIEW_BUTTON_TEXTS]),
             "urls": url_evidence(
                 facts.urls,
                 button_urls=facts.button_urls,
@@ -512,13 +425,8 @@ class GatekeeperService:
                 "url_count": min(len(set(facts.urls)), 2),
                 "via_bot": facts.via_bot,
             },
-            "detector": detection.detector if detection is not None else "hard_rules",
-            "signals": signals,
-            "severity": detection.severity if detection is not None else None,
-            "score": detection.score if detection is not None else None,
-            "model_version": detection.model_version if detection is not None else None,
-            "planned_action": planned_action,
-            "actual_action": actual_action,
+            "rule_codes": list(rule_codes),
+            "severity": severity,
             "policy_version": "rules-v2",
         }
 
@@ -529,28 +437,27 @@ class GatekeeperService:
         *,
         reason: str,
         rule_codes: tuple[str, ...] = (),
+        severity: Severity = "none",
         now: int,
     ) -> None:
         if (
-            self.review_content_protector is None
+            self.active_case_protector is None
             or sender_key == self.test_sender_key
         ):
             return
-        payload = self._evidence_payload(
+        payload = self._active_case_payload(
             message,
-            planned_action=None,
-            actual_action="active_case",
             rule_codes=rule_codes,
+            severity=severity,
         )
-        payload["rule_codes"] = list(rule_codes)
         try:
-            envelope = self.review_content_protector.seal_enforcement(payload)
+            envelope = self.active_case_protector.seal(payload)
             self.store.save_enforcement_review(
                 sender_key,
                 reference=message.review_reference,
                 envelope=envelope,
                 reason=reason,
-                expires_at=now + self.review_retention_days * 86400,
+                expires_at=now + self.active_case_retention_days * 86400,
                 now=now,
             )
         except Exception:
@@ -574,7 +481,7 @@ class GatekeeperService:
             self.store.activate_enforcement_review(
                 sender_key,
                 reason,
-                now + self.review_retention_days * 86400,
+                now + self.active_case_retention_days * 86400,
                 reference=reference,
                 now=now,
             )
@@ -586,34 +493,6 @@ class GatekeeperService:
                 )
             except Exception:
                 pass
-
-    def _update_evidence_action(
-        self, evidence_id: int, *, automatic_hint: str, actual_action: str
-    ) -> None:
-        if self.evidence_store is None:
-            return
-        try:
-            self.evidence_store.update_record_action(
-                evidence_id,
-                automatic_hint=automatic_hint,
-                actual_action=actual_action,
-            )
-        except Exception:
-            LOG.error("evidence_update_failed")
-
-    def _finalize_challenged_evidence(
-        self, sender_id: int, *, automatic_hint: str, actual_action: str
-    ) -> None:
-        if self.evidence_store is None:
-            return
-        try:
-            self.evidence_store.finalize_challenged_record(
-                sender_id,
-                automatic_hint=automatic_hint,
-                actual_action=actual_action,
-            )
-        except Exception:
-            LOG.error("evidence_update_failed")
 
     def _record_decision(
         self,
@@ -706,9 +585,17 @@ class GatekeeperService:
         message: IncomingMessage,
         actions: MessageActions,
         now: int,
+        *,
+        rule_codes: tuple[str, ...] = (),
+        severity: Severity = "none",
     ) -> str:
         self._capture_enforcement_review(
-            sender_key, message, reason="challenge_pending", now=now
+            sender_key,
+            message,
+            reason="challenge_pending",
+            rule_codes=rule_codes,
+            severity=severity,
+            now=now,
         )
         if not self._claim_outbound_slot(sender_key, now):
             return await self._rate_limit_fallback(sender_key, message, actions, now)
@@ -850,7 +737,7 @@ class GatekeeperService:
             classification,
             json.dumps(rule_codes, separators=(",", ":")),
             json.dumps(features, sort_keys=True, separators=(",", ":")),
-            now + self.review_retention_days * 86400,
+            now + self.pending_review_retention_days * 86400,
             now,
         )
 
@@ -911,12 +798,6 @@ class GatekeeperService:
                 return "fail_safe"
             self.store.mark_provisional(sender_key, now)
             self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
-            if self.evidence_store is not None and sender_key != self.test_sender_key:
-                self._finalize_challenged_evidence(
-                    message.sender_id,
-                    automatic_hint="legitimate_candidate",
-                    actual_action="provisional",
-                )
             actions.cancel_timeout(sender_key)
             passed_message_id = await self._send_notice(
                 sender_key,
@@ -1018,12 +899,6 @@ class GatekeeperService:
                     now,
                     reference=reference,
                 )
-                if self.evidence_store is not None:
-                    self._finalize_challenged_evidence(
-                        message.sender_id,
-                        automatic_hint="spam_candidate",
-                        actual_action="suppressed",
-                    )
             action_id = self.store.schedule_action(
                 sender_key,
                 reason="attempts_exhausted",
@@ -1159,7 +1034,7 @@ class GatekeeperService:
                         "timeout_notice_failed",
                         "[]",
                         "{}",
-                        now + self.review_retention_days * 86400,
+                        now + self.pending_review_retention_days * 86400,
                         now,
                     )
                 self.store.quarantine(sender_key, now)

@@ -12,14 +12,13 @@ services:
       TG_DB_PATH: /var/lib/tg-pm-gatekeeper/state.sqlite3
       TG_SESSION_FILE: /run/secrets/telegram_session
       TG_HMAC_KEY_FILE: /run/secrets/hmac_key
-      TG_EVIDENCE_KEY_FILE: /run/secrets/evidence_key
-      TG_EVIDENCE_PATH: /var/lib/tg-pm-gatekeeper/evidence.sqlite3
+      TG_REVIEW_KEY_FILE: /run/secrets/review_key
       TG_DENYLIST_FILE: /run/config/deny-domains.txt
     volumes:
       - /var/lib/tg-pm-gatekeeper:/var/lib/tg-pm-gatekeeper:rw
       - /etc/tg-pm-gatekeeper/telegram.session.secret:/run/secrets/telegram_session:ro
       - /etc/tg-pm-gatekeeper/hmac.key:/run/secrets/hmac_key:ro
-      - /etc/tg-pm-gatekeeper/evidence.key:/run/secrets/evidence_key:ro
+      - /etc/tg-pm-gatekeeper/review.key:/run/secrets/review_key:ro
       - /etc/tg-pm-gatekeeper/deny-domains.txt:/run/config/deny-domains.txt:ro
     read_only: true
     tmpfs:

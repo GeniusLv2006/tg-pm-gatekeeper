@@ -8,8 +8,7 @@ import logging
 import os
 
 from .config import ConfigurationError, Settings, read_private_file
-from .crypto import IdentifierProtector
-from .evidence import EvidenceProtector, EvidenceStore
+from .crypto import ActiveCaseProtector, IdentifierProtector
 from .logging_config import configure_logging
 from .service import GatekeeperService
 from .store import StateStore
@@ -22,30 +21,25 @@ async def async_main() -> None:
         read_private_file(settings.hmac_key_file, minimum_bytes=32)
     )
     store = StateStore(settings.database_path)
-    evidence_protector = EvidenceProtector(
-        read_private_file(settings.evidence_key_file, minimum_bytes=32)
+    review_protector = ActiveCaseProtector(
+        read_private_file(settings.review_key_file, minimum_bytes=32)
     )
-    evidence_store = EvidenceStore(settings.evidence_path, evidence_protector)
     service = GatekeeperService(
         store,
         protector,
         challenge_ttl_seconds=settings.challenge_ttl_seconds,
         challenge_max_attempts=settings.challenge_max_attempts,
         outbound_limit_per_hour=settings.outbound_limit_per_hour,
-        review_retention_days=settings.review_retention_days,
+        pending_review_retention_days=settings.pending_review_retention_days,
+        active_case_retention_days=settings.active_case_retention_days,
         denylist=load_denylist(settings.denylist_file),
         test_sender_id=settings.test_sender_id,
-        evidence_store=evidence_store,
-        review_content_protector=evidence_protector,
-        evidence_collection=settings.evidence_collection,
-        evidence_retention_days=settings.evidence_retention_days,
-        evidence_max_records_per_sender=settings.evidence_max_records_per_sender,
+        active_case_protector=review_protector,
     )
-    adapter = TelegramAdapter(settings, store, service, evidence_store=evidence_store)
+    adapter = TelegramAdapter(settings, store, service)
     try:
         await adapter.run()
     finally:
-        evidence_store.close()
         store.close()
 
 

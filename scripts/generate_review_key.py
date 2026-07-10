@@ -10,13 +10,13 @@ from pathlib import Path
 
 
 def main() -> None:
-    destination = Path("evidence.key")
+    destination = Path("review.key")
     if destination.exists():
-        raise SystemExit("refusing to overwrite evidence.key")
+        raise SystemExit("refusing to overwrite review.key")
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "wb") as output:
         output.write(secrets.token_bytes(32))
-    print("Evidence key written to evidence.key with mode 0600; never commit it.")
+    print("Active Case review key written to review.key with mode 0600; never commit it.")
 
 
 if __name__ == "__main__":

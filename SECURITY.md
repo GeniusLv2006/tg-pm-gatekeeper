@@ -6,8 +6,8 @@ itself: Telegram two-step verification does not invalidate a session that has al
 ## If you run Gatekeeper
 
 - Use a dedicated server and restrict administrator access.
-- Keep the Telegram session, HMAC key, evidence key, configuration, state, and backups out of source
-  control and general backup jobs.
+- Keep the Telegram session, HMAC key, Active Case review key, configuration, state, and backups out
+  of source control and general backup jobs.
 - Keep the dashboard behind the supplied SSH tunnel. Do not publish its Unix socket through Docker or
   a reverse proxy.
 - Start in `monitor` and use a dedicated account for the first destructive-flow test.
@@ -67,20 +67,14 @@ flow, see [Architecture](docs/architecture.md).
 
 ### Encrypted review content
 
-- Active quarantines and suppressions may retain an AES-256-GCM encrypted snapshot for at most seven
+- Active quarantines and suppressions may retain an AES-256-GCM encrypted snapshot for at most 30
   days. It can include text/caption, Telegram-provided quoted and preview text, button text, full URLs,
   normalized domains, URL shape, matched rules, and structural features.
-- Optional Evidence Log records use a separate owner-only database and independent evidence key.
-  Eligible encrypted content can include message/caption, Telegram-provided quote and preview text,
-  button text, full URLs, normalized domains, Telegram link kind, URL-shape metadata, detector signals,
-  and structural features.
-- Webpage bodies, media, profile data, raw IDs, access hashes, and the dedicated test sender are not
-  included in Evidence Log records.
-- The evidence key derives a separate Active Case review key through HKDF. Evidence Log and Active
-  Case records use different authenticated-data domains and tables.
-- Evidence collection is capped per anonymous sender, defaults to seven-day retention, and is bounded
-  to 90 days. Daily collection statistics contain counts only.
-- Plaintext evidence export is not provided. Dashboard responses use `Cache-Control: no-store`, but
+- The dedicated `review.key` secret derives the Active Case encryption key through HKDF. It is
+  separate from the Telegram session and state HMAC key.
+- Webpage bodies, media, profile data, raw IDs, access hashes, and verification answers are not
+  included in Active Case snapshots.
+- Plaintext Active Case export is not provided. Dashboard responses use `Cache-Control: no-store`, but
   decrypted content is still visible to the owner and can be captured by browser memory, screenshots,
   or a compromised workstation.
 

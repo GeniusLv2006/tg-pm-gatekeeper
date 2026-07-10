@@ -44,14 +44,14 @@ The initializer signs in to Telegram and creates five files:
 
 - `telegram.session.secret`: authorization for the Telegram account;
 - `hmac.key`: protects local sender identifiers and review references;
-- `evidence.key`: encrypts optional evidence and Active Case content;
+- `review.key`: encrypts Active Case snapshots;
 - `config.env`: the service configuration; and
 - `deny-domains.txt`: your optional local domain denylist.
 
 The files start with owner-only permissions, and the initializer refuses to overwrite them. Transfer
-them only to the intended server over a trusted channel. The evidence key is required even when
-Evidence Log collection is off. See [deny-domains.example.txt](../deny-domains.example.txt) for the
-denylist format.
+them only to the intended server over a trusted channel. The review key encrypts Active Case
+snapshots and must remain separate from the HMAC key. See
+[deny-domains.example.txt](../deny-domains.example.txt) for the denylist format.
 
 ### 2. Prepare the server
 
@@ -70,7 +70,7 @@ copy credentials.
 Copy the generated files to a temporary root-only location:
 
 ```shell
-scp telegram.session.secret hmac.key evidence.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
+scp telegram.session.secret hmac.key review.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
 ```
 
 Install them with the ownership expected by Compose, then remove the temporary copies:
@@ -80,10 +80,10 @@ ssh "$DEPLOY_HOST" '
 set -eu
 install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret
 install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key
-install -o 10001 -g 10001 -m 0600 /tmp/evidence.key /etc/tg-pm-gatekeeper/evidence.key
+install -o 10001 -g 10001 -m 0600 /tmp/review.key /etc/tg-pm-gatekeeper/review.key
 install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env
 install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt
-rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/evidence.key /tmp/config.env /tmp/deny-domains.txt
+rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/review.key /tmp/config.env /tmp/deny-domains.txt
 '
 ```
 
@@ -196,11 +196,14 @@ clears the local review without changing the current sender trust or restriction
 
 The summary counts all current quarantines and suppressions. The table contains only cases that still
 have an unexpired encrypted snapshot. **Allow Now** restores saved dialog settings when available;
-critical-rule cases without saved settings are moved to the main folder and notifications are
-enabled. The second action records that the restriction was left unchanged and does not extend a
+HR cases with `critical` severity and no saved settings are moved to the main folder and notifications
+are enabled. The second action records that the restriction was left unchanged and does not extend a
 temporary suppression.
 
-Snapshots last at most seven days. Successful verification, rollback, or manual allowance removes
+The detail page separates **Restriction Cause**, **Severity**, and **Matched HR Rules**. HR identifies
+the deterministic rule family; `critical` is one severity within that family, not another rule name.
+
+Snapshots last at most 30 days. Successful verification, rollback, or manual allowance removes
 them sooner. A temporary suppression is released when that sender next messages after expiry; the
 service does not wake up solely to remove it.
 
@@ -313,16 +316,14 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 | `TG_CHALLENGE_MAX_ATTEMPTS` | `2` | Numeric attempts; 1–5 |
 | `TG_OUTBOUND_LIMIT_PER_HOUR` | `10` | Gatekeeper messages per hour; 1–100 |
 | `TG_AUDIT_RETENTION_DAYS` | `30` | Local audit-event retention |
-| `TG_REVIEW_RETENTION_DAYS` | `7` | Pending and Active Case review retention; capped at 7 |
+| `TG_PENDING_REVIEW_RETENTION_DAYS` | `7` | Pending Review retention; 1–7 days |
+| `TG_ACTIVE_CASE_RETENTION_DAYS` | `30` | Active Case snapshot retention; 1–30 days |
 | `TG_MUTE_DAYS` | `3650` | Quarantine mute duration |
-| `TG_EVIDENCE_COLLECTION` | `off` | Optional encrypted Evidence Log collection |
-| `TG_EVIDENCE_RETENTION_DAYS` | `7` | Evidence retention; 1–90 days |
-| `TG_EVIDENCE_MAX_RECORDS_PER_SENDER` | `3` | Unexpired records per sender; 1–10 |
+| `TG_REVIEW_KEY_FILE` | `/run/secrets/review_key` | Active Case snapshot encryption key |
 | `TG_TEST_SENDER_ID` | empty | Dedicated arithmetic-flow test account |
 | `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only dashboard Unix socket |
 
-Invalid bounded values stop startup instead of silently changing behavior. Review retention above
-seven days is clamped to seven.
+Invalid bounded values stop startup instead of silently changing behavior.
 
 ### Dedicated test sender
 
@@ -334,30 +335,6 @@ TG_TEST_SENDER_ID=REPLACE_WITH_DEDICATED_TEST_ACCOUNT_ID
 
 This account runs the real arithmetic and cleanup flow even in `monitor`, bypasses the outbound
 quota, and can lose its entire test dialog after exhausted attempts. Remove the value after testing.
-
-### Optional encrypted Evidence Log
-
-Collection is disabled by default. To enable it:
-
-```shell
-TG_EVIDENCE_COLLECTION=on
-TG_EVIDENCE_RETENTION_DAYS=7
-TG_EVIDENCE_MAX_RECORDS_PER_SENDER=3
-```
-
-Eligible records may include message/caption text, Telegram-provided quote and preview text, button
-text, full URLs, normalized domains, detector signals, and the planned and actual action. Those values
-stay inside an AES-256-GCM encrypted record and are not written to logs or plaintext database columns.
-Media, webpage bodies, profile data, raw IDs, access hashes, and the dedicated test sender are
-excluded.
-
-After a sender reaches the configured cap, later records are skipped until one expires or is deleted.
-The dashboard supports Correct Assessment, Incorrect Assessment, Insufficient Evidence, and individual
-deletion. Collection-disabled traffic is neither sampled nor counted. Plaintext export is not
-provided.
-
-Old Dataset tables are discarded rather than decrypted or migrated if a legacy `training.sqlite3`
-file is opened as the Evidence database.
 
 ## Troubleshooting
 
@@ -383,7 +360,7 @@ read its private files.
 ```shell
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh "$DEPLOY_HOST" 'ss -lnt'
-ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/evidence.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
+ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/review.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
 ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock /var/lib/tg-pm-gatekeeper/review.access-token'
 ```
 
