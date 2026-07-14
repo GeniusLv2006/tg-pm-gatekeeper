@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -35,6 +35,7 @@ CREATE TABLE sender_state (
     challenge_message_id INTEGER,
     challenge_prompt TEXT,
     challenge_action_reference BLOB,
+    restriction_reference BLOB,
     guidance_sent INTEGER NOT NULL DEFAULT 0 CHECK (guidance_sent IN (0, 1)),
     attempts INTEGER NOT NULL DEFAULT 0,
     suppression_reason TEXT,
@@ -155,6 +156,7 @@ class SenderState:
     challenge_message_id: int | None
     challenge_prompt: str | None
     challenge_action_reference: bytes | None
+    restriction_reference: bytes | None
     guidance_sent: bool
     attempts: int
     suppression_reason: str | None
@@ -194,6 +196,19 @@ class EnforcementReview:
     expires_at: int
     status: str
     suppressed_until: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRestriction:
+    sender_key: str
+    reference: bytes | None
+    status: str
+    reason: str
+    suppressed_until: int | None
+    updated_at: int
+    envelope: bytes | None
+    evidence_created_at: int | None
+    evidence_expires_at: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,11 +261,17 @@ class StateStore:
         if version == 0:
             self._migrate_v0_to_v1()
             version = SCHEMA_VERSION
-        if version == 1:
+        elif version == 1:
             self._migrate_v1_to_v2()
-        elif version == 2:
-            self._migrate_v2_to_v3()
-        elif version != SCHEMA_VERSION:
+            version = SCHEMA_VERSION
+        else:
+            if version == 2:
+                self._migrate_v2_to_v3()
+                version = 3
+            if version == 3:
+                self._migrate_v3_to_v4()
+                version = 4
+        if version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
 
@@ -291,6 +312,25 @@ class StateStore:
                 "WHEN 'observe' THEN 'monitor' WHEN 'enforce' THEN 'protect' "
                 "ELSE value END WHERE key='mode'"
             )
+            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _migrate_v3_to_v4(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(sender_state)")
+            }
+            if "restriction_reference" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE sender_state ADD COLUMN restriction_reference BLOB"
+                )
             self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         except Exception:
             if self._connection.in_transaction:
@@ -349,7 +389,7 @@ class StateStore:
                 "CREATE INDEX enforcement_reviews_expiry_idx "
                 "ON enforcement_reviews(expires_at)"
             )
-            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version=3")
         except Exception:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -486,7 +526,7 @@ class StateStore:
             row = self._connection.execute(
                 "SELECT status, challenge_id, answer_digest, challenge_expires_at, "
                 "challenge_message_id, challenge_prompt, challenge_action_reference, "
-                "guidance_sent, attempts, suppression_reason, suppressed_until, "
+                "restriction_reference, guidance_sent, attempts, suppression_reason, suppressed_until, "
                 "revision, updated_at "
                 "FROM sender_state WHERE sender_key=?",
                 (sender_key,),
@@ -494,6 +534,7 @@ class StateStore:
         if not row:
             return SenderState(
                 "unknown",
+                None,
                 None,
                 None,
                 None,
@@ -515,6 +556,7 @@ class StateStore:
             row["challenge_message_id"],
             row["challenge_prompt"],
             row["challenge_action_reference"],
+            row["restriction_reference"],
             bool(row["guidance_sent"]),
             row["attempts"],
             row["suppression_reason"],
@@ -532,6 +574,7 @@ class StateStore:
         answer_digest: str | None = None,
         expires_at: int | None = None,
         attempts: int = 0,
+        restriction_reference: bytes | None = None,
         now: int | None = None,
     ) -> None:
         if status not in SENDER_STATUSES:
@@ -541,14 +584,14 @@ class StateStore:
             self._connection.execute(
                 "INSERT INTO sender_state(sender_key, status, challenge_id, answer_digest, "
                 "challenge_expires_at, challenge_message_id, challenge_prompt, "
-                "challenge_action_reference, guidance_sent, attempts, suppression_reason, "
+                "challenge_action_reference, restriction_reference, guidance_sent, attempts, suppression_reason, "
                 "suppressed_until, revision, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, NULL, NULL, 1, ?) "
+                "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, 0, ?, NULL, NULL, 1, ?) "
                 "ON CONFLICT(sender_key) DO UPDATE SET status=excluded.status, "
                 "challenge_id=excluded.challenge_id, answer_digest=excluded.answer_digest, "
                 "challenge_expires_at=excluded.challenge_expires_at, attempts=excluded.attempts, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
-                "challenge_action_reference=NULL, guidance_sent=0, "
+                "challenge_action_reference=NULL, restriction_reference=excluded.restriction_reference, guidance_sent=0, "
                 "suppression_reason=NULL, suppressed_until=NULL, "
                 "revision=sender_state.revision+1, updated_at=excluded.updated_at",
                 (
@@ -557,6 +600,7 @@ class StateStore:
                     challenge_id,
                     answer_digest,
                     expires_at,
+                    restriction_reference,
                     attempts,
                     timestamp,
                 ),
@@ -590,7 +634,7 @@ class StateStore:
                 "UPDATE sender_state SET status='unknown', challenge_id=NULL, "
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
-                "challenge_action_reference=NULL, guidance_sent=0, attempts=0, "
+                "challenge_action_reference=NULL, restriction_reference=NULL, guidance_sent=0, attempts=0, "
                 "suppression_reason=NULL, suppressed_until=NULL, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND updated_at=? "
                 "AND status IN ('provisional', 'quarantined', 'suppressed')",
@@ -601,8 +645,19 @@ class StateStore:
             return True
         return False
 
-    def quarantine(self, sender_key: str, now: int | None = None) -> None:
-        self._set_state(sender_key, "quarantined", now=now)
+    def quarantine(
+        self,
+        sender_key: str,
+        now: int | None = None,
+        *,
+        restriction_reference: bytes | None = None,
+    ) -> None:
+        self._set_state(
+            sender_key,
+            "quarantined",
+            restriction_reference=restriction_reference,
+            now=now,
+        )
 
     def suppress(
         self,
@@ -611,22 +666,32 @@ class StateStore:
         *,
         until: int | None,
         reference: bytes | None = None,
+        restriction_reference: bytes | None = None,
         now: int | None = None,
     ) -> SenderState:
         timestamp = int(time.time()) if now is None else now
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT INTO sender_state(sender_key,status,suppression_reason,"
-                "suppressed_until,challenge_action_reference,revision,updated_at) "
-                "VALUES (?,'suppressed',?,?,?,1,?) ON CONFLICT(sender_key) DO UPDATE SET "
+                "suppressed_until,challenge_action_reference,restriction_reference,revision,updated_at) "
+                "VALUES (?,'suppressed',?,?,?,?,1,?) ON CONFLICT(sender_key) DO UPDATE SET "
                 "status='suppressed',challenge_id=NULL,answer_digest=NULL,"
                 "challenge_expires_at=NULL,challenge_message_id=NULL,challenge_prompt=NULL,"
                 "challenge_action_reference=COALESCE(excluded.challenge_action_reference,"
-                "sender_state.challenge_action_reference),guidance_sent=0,attempts=0,"
+                "sender_state.challenge_action_reference),"
+                "restriction_reference=COALESCE(excluded.restriction_reference,"
+                "sender_state.restriction_reference),guidance_sent=0,attempts=0,"
                 "suppression_reason=excluded.suppression_reason,"
                 "suppressed_until=excluded.suppressed_until,revision=sender_state.revision+1,"
                 "updated_at=excluded.updated_at",
-                (sender_key, reason, until, reference, timestamp),
+                (
+                    sender_key,
+                    reason,
+                    until,
+                    reference,
+                    restriction_reference,
+                    timestamp,
+                ),
             )
         return self.sender(sender_key)
 
@@ -637,7 +702,8 @@ class StateStore:
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
-                "suppressed_until=NULL,challenge_action_reference=NULL,revision=revision+1,"
+                "suppressed_until=NULL,challenge_action_reference=NULL,"
+                "restriction_reference=NULL,revision=revision+1,"
                 "updated_at=? WHERE sender_key=? AND status='suppressed' "
                 "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
                 (timestamp, sender_key, timestamp),
@@ -668,6 +734,7 @@ class StateStore:
                 "challenge_expires_at=excluded.challenge_expires_at, "
                 "challenge_message_id=excluded.challenge_message_id, "
                 "challenge_prompt=NULL, challenge_action_reference=NULL, "
+                "restriction_reference=NULL, "
                 "guidance_sent=0, attempts=0, updated_at=excluded.updated_at",
                 (
                     sender_key,
@@ -702,7 +769,8 @@ class StateStore:
                 "challenge_expires_at=excluded.challenge_expires_at, "
                 "challenge_message_id=NULL, challenge_prompt=excluded.challenge_prompt, "
                 "challenge_action_reference=excluded.challenge_action_reference, "
-                "guidance_sent=0, attempts=0, updated_at=excluded.updated_at",
+                "restriction_reference=NULL, guidance_sent=0, attempts=0, "
+                "updated_at=excluded.updated_at",
                 (
                     sender_key,
                     challenge_id,
@@ -747,7 +815,8 @@ class StateStore:
                 "UPDATE sender_state SET status='unknown', challenge_id=NULL, "
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
-                "challenge_action_reference=NULL, guidance_sent=0, attempts=0, "
+                "challenge_action_reference=NULL, restriction_reference=NULL, "
+                "guidance_sent=0, attempts=0, "
                 "updated_at=? WHERE sender_key=? AND status IN "
                 "('challenge_issuing', 'challenge_archiving')",
                 (timestamp, sender_key),
@@ -896,6 +965,79 @@ class StateStore:
             ).fetchall()
         return [EnforcementReview(**dict(row)) for row in rows]
 
+    def active_restriction(
+        self, sender_key: str, *, now: int | None = None
+    ) -> ActiveRestriction | None:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock:
+            row = self._connection.execute(
+                self._active_restriction_select()
+                + " WHERE sender.sender_key=? AND sender.status IN "
+                "('quarantined','suppressed')",
+                (timestamp, sender_key),
+            ).fetchone()
+        return ActiveRestriction(**dict(row)) if row else None
+
+    def active_restrictions(
+        self, *, limit: int | None = None, now: int | None = None
+    ) -> list[ActiveRestriction]:
+        timestamp = int(time.time()) if now is None else now
+        query = (
+            self._active_restriction_select()
+            + " WHERE sender.status IN ('quarantined','suppressed') "
+            "ORDER BY sender.updated_at DESC"
+        )
+        parameters: tuple[int, ...] = (timestamp,)
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters = (timestamp, limit)
+        with self._lock:
+            rows = self._connection.execute(query, parameters).fetchall()
+        return [ActiveRestriction(**dict(row)) for row in rows]
+
+    @staticmethod
+    def _active_restriction_select() -> str:
+        return (
+            "SELECT sender.sender_key,sender.restriction_reference AS reference,"
+            "sender.status,COALESCE(sender.suppression_reason,review.reason,"
+            "CASE WHEN EXISTS (SELECT 1 FROM review_queue AS verdict "
+            "WHERE verdict.sender_key=sender.sender_key AND verdict.status='spam') "
+            "THEN 'manual_spam' ELSE 'reason_unavailable' END) AS reason,"
+            "sender.suppressed_until,sender.updated_at,review.envelope,"
+            "review.created_at AS evidence_created_at,"
+            "review.expires_at AS evidence_expires_at FROM sender_state AS sender "
+            "LEFT JOIN enforcement_reviews AS review ON "
+            "review.sender_key=sender.sender_key AND review.expires_at>?"
+        )
+
+    def legacy_restriction_references(self) -> list[tuple[str, bytes]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sender.sender_key,COALESCE(sender.challenge_action_reference,"
+                "(SELECT review.reference FROM enforcement_reviews AS review "
+                "WHERE review.sender_key=sender.sender_key AND review.reference IS NOT NULL),"
+                "(SELECT queue.reference FROM review_queue AS queue "
+                "WHERE queue.sender_key=sender.sender_key AND queue.reference IS NOT NULL "
+                "ORDER BY queue.updated_at DESC LIMIT 1)) AS reference "
+                "FROM sender_state AS sender WHERE sender.status IN "
+                "('quarantined','suppressed') AND sender.restriction_reference IS NULL"
+            ).fetchall()
+        return [
+            (str(row["sender_key"]), bytes(row["reference"]))
+            for row in rows
+            if row["reference"] is not None
+        ]
+
+    def save_restriction_reference(self, sender_key: str, reference: bytes) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET restriction_reference=? WHERE sender_key=? "
+                "AND status IN ('quarantined','suppressed') "
+                "AND restriction_reference IS NULL",
+                (reference, sender_key),
+            )
+        return cursor.rowcount == 1
+
     def delete_enforcement_review(self, sender_key: str) -> bool:
         with self._lock, self._connection:
             cursor = self._connection.execute(
@@ -931,10 +1073,24 @@ class StateStore:
                     (timestamp,),
                 ).fetchone()[0]
             )
-        result = {"quarantined": 0, "suppressed": 0, "reviewable": reviewable}
+            identifiable = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM sender_state WHERE status IN "
+                    "('quarantined','suppressed') AND restriction_reference IS NOT NULL"
+                ).fetchone()[0]
+            )
+        result = {
+            "quarantined": 0,
+            "suppressed": 0,
+            "reviewable": reviewable,
+            "identifiable": identifiable,
+        }
         result.update({str(row["status"]): int(row["count"]) for row in rows})
         result["unreviewable"] = (
             result["quarantined"] + result["suppressed"] - reviewable
+        )
+        result["unidentified"] = (
+            result["quarantined"] + result["suppressed"] - identifiable
         )
         result.update(
             {f"reason:{row['reason']}": int(row["count"]) for row in reasons}
@@ -942,7 +1098,13 @@ class StateStore:
         return result
 
     def expire_challenge(
-        self, sender_key: str, expires_at: int, now: int | None = None
+        self,
+        sender_key: str,
+        expires_at: int,
+        now: int | None = None,
+        *,
+        suppression_seconds: int = 2 * 3600,
+        restriction_reference: bytes | None = None,
     ) -> bool:
         timestamp = now or int(time.time())
         with self._lock, self._connection:
@@ -951,10 +1113,16 @@ class StateStore:
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
                 "guidance_sent=0, attempts=0, suppression_reason='challenge_timeout', "
-                "suppressed_until=?, revision=revision+1, "
+                "suppressed_until=?, restriction_reference=?, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND status='challenged' "
                 "AND challenge_expires_at=?",
-                (timestamp + 86400, timestamp, sender_key, expires_at),
+                (
+                    timestamp + suppression_seconds,
+                    restriction_reference,
+                    timestamp,
+                    sender_key,
+                    expires_at,
+                ),
             )
         return cursor.rowcount == 1
 

@@ -16,7 +16,7 @@ from telethon import functions
 from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
 from tg_pm_gatekeeper.review_admin import ReviewAdminServer
 from tg_pm_gatekeeper.service import GatekeeperService
-from tg_pm_gatekeeper.store import StateStore
+from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 
 
 class FakeTelegramClient:
@@ -373,9 +373,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "critical_rule",
             until=None,
             reference=reference,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
         )
 
-        item = self.store.enforcement_review(sender_key)
+        item = self.store.active_restriction(sender_key)
         status, _, detail = await self.server._show_enforcement(item)
 
         self.assertEqual(status, 200)
@@ -421,13 +424,16 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "attempts_exhausted",
             until=int(time.time()) + 700,
             reference=reference,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
         )
         index = await self.server._enforcement_index_page()
         self.assertIn(b"Active Cases", index)
         self.assertIn(b"Test Sender (@testsender)", index)
         self.assertIn(b"Reviewable Evidence", index)
         self.assertIn(b"State Reasons:", index)
-        self.assertIn(b"Every active case currently has reviewable evidence", index)
+        self.assertIn(b"Every active restriction currently has reviewable evidence", index)
         self.assertNotIn(b"<dt>Reasons</dt>", index)
         self.assertNotIn(b"enforcement-private-canary", index)
         status, _, detail = await self.server._dispatch_enforcement(
@@ -482,14 +488,92 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "challenge_timeout",
             until=int(time.time()) - 1,
             reference=reference,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
         )
 
-        item = self.store.enforcement_review(sender_key)
+        item = self.store.active_restriction(sender_key)
         status, _, detail = await self.server._show_enforcement(item)
 
         self.assertEqual(status, 200)
         self.assertIn(b"Release pending", detail)
         self.assertIn(b"Record Without Extending Restriction", detail)
+
+    async def test_expired_evidence_remains_listed_and_restorable(self) -> None:
+        user_id = 123456789
+        sender_key = self.protector.sender_key(user_id)
+        review_reference = self.protector.seal_review_reference(
+            user_id, -987654321, 42
+        )
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=review_reference,
+            envelope=self.review_protector.seal(
+                {"schema_version": 4, "text": "expired-private-canary"}
+            ),
+            reason="critical_rule",
+            expires_at=int(time.time()) - 1,
+        )
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            restriction_reference=self.protector.seal_restriction_reference(
+                user_id, -987654321
+            ),
+        )
+
+        index = await self.server._enforcement_index_page()
+        self.assertIn(b"Test Sender (@testsender)", index)
+        self.assertIn(b"Expired or unavailable", index)
+        self.assertNotIn(b"expired-private-canary", index)
+
+        status, _, detail = await self.server._dispatch_enforcement(
+            "GET", f"/cases/{sender_key}", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"Evidence expired or unavailable", detail)
+        self.assertIn(b"Allow Now", detail)
+        self.assertNotIn(b"expired-private-canary", detail)
+
+        body = urlencode(
+            {"token": self.server._csrf_token, "action": "allow"}
+        ).encode()
+        status, headers, _ = await self.server._dispatch_enforcement(
+            "POST", f"/cases/{sender_key}", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases")
+        self.assertEqual(self.store.sender(sender_key).status, "allowed")
+        self.assertIsNone(self.store.sender(sender_key).restriction_reference)
+
+    async def test_invalid_evidence_does_not_block_allow_action(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=self.protector.seal_review_reference(
+                123456789, -987654321, 42
+            ),
+            envelope=b"invalid-encrypted-evidence",
+            reason="critical_rule",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+
+        item = self.store.active_restriction(sender_key)
+        status, _, detail = await self.server._show_enforcement(item)
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"failed authentication", detail)
+        self.assertIn(b"Allow Now", detail)
 
     async def test_active_enforcement_disables_allow_without_identity(self) -> None:
         sender_key = self.protector.sender_key(987654321)
@@ -504,7 +588,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             expires_at=int(time.time()) + 700,
         )
         self.store.quarantine(sender_key)
-        item = self.store.enforcement_review(sender_key)
+        item = self.store.active_restriction(sender_key)
         status, _, detail = await self.server._show_enforcement(item)
         self.assertEqual(status, 200)
         self.assertIn(b"Allow Unavailable", detail)
@@ -526,9 +610,126 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         page = await self.server._enforcement_index_page()
         self.assertIn(b"Manual Spam Review 1", page)
-        self.assertIn(b"1 active case", page)
-        self.assertIn(b"has no encrypted snapshot", page)
-        self.assertIn(b"No active cases", page)
+        self.assertIn(b"1 restriction has no reviewable evidence", page)
+        self.assertIn(b"Identity unavailable", page)
+        self.assertIn(b"Expired or unavailable", page)
+        self.assertIn(b"Allow an unidentified restricted sender by Telegram User ID", page)
+        self.assertIn(b"Allow Future Messages Without Restore", page)
+        self.assertNotIn(b'http-equiv="refresh" content="10"', page)
+
+    async def test_expired_case_can_be_allowed_by_user_id_without_restore(self) -> None:
+        user_id = 771_234_567
+        sender_key = self.protector.sender_key(user_id)
+        state = self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            reference=b"expired-reference",
+        )
+        self.store.schedule_action(
+            sender_key,
+            reason="critical_rule",
+            reference=b"expired-reference",
+            execute_at=int(time.time()) + 600,
+            expected_revision=state.revision,
+        )
+        self.store.save_dialog_snapshot(
+            sender_key,
+            DialogSnapshot(folder_id=1, silent=True, mute_until=None),
+        )
+
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": str(user_id)}
+        ).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases")
+        self.assertEqual(self.store.sender(sender_key).status, "allowed")
+        self.assertIsNone(self.store.dialog_snapshot(sender_key))
+        self.assertEqual(self.store.pending_actions(), [])
+        self.assertEqual(self.cancelled, [sender_key])
+        self.assertEqual(self.client.requests, [])
+        database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
+        self.assertNotIn(str(user_id).encode(), database)
+
+    async def test_release_by_user_id_allows_legacy_quarantine(self) -> None:
+        user_id = 771_234_568
+        sender_key = self.protector.sender_key(user_id)
+        self.store.quarantine(sender_key)
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": str(user_id)}
+        ).encode()
+
+        status, headers, _ = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases")
+        self.assertEqual(self.store.sender(sender_key).status, "allowed")
+
+    async def test_release_by_user_id_requires_existing_restriction(self) -> None:
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": "771234570"}
+        ).encode()
+
+        status, _, response = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn(b"Restricted Sender Not Found", response)
+
+    async def test_release_by_user_id_rejects_identifiable_restriction(self) -> None:
+        user_id = 771_234_571
+        sender_key = self.protector.sender_key(user_id)
+        restriction_reference = self.protector.seal_restriction_reference(
+            user_id, 123456789
+        )
+        self.store.quarantine(
+            sender_key, restriction_reference=restriction_reference
+        )
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": str(user_id)}
+        ).encode()
+
+        status, _, response = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn(b"Use Active Case Allow Now", response)
+        state = self.store.sender(sender_key)
+        self.assertEqual(state.status, "quarantined")
+        self.assertEqual(state.restriction_reference, restriction_reference)
+
+    async def test_release_by_user_id_rejects_invalid_input(self) -> None:
+        for value in ("not-a-number", "0", "-1", "+1", "１"):
+            body = urlencode(
+                {"token": self.server._csrf_token, "user_id": value}
+            ).encode()
+            status, _, response = await self.server._dispatch(
+                "POST", "/cases/release", body
+            )
+            self.assertEqual(status, 400)
+            self.assertIn(b"Invalid Telegram User ID", response)
+
+    async def test_release_by_user_id_requires_valid_csrf(self) -> None:
+        user_id = 771_234_569
+        sender_key = self.protector.sender_key(user_id)
+        self.store.suppress(sender_key, "critical_rule", until=None)
+        body = urlencode({"token": "invalid", "user_id": str(user_id)}).encode()
+
+        status, _, response = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(b"Invalid Action Token", response)
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
         body = urlencode(
@@ -582,6 +783,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.client.requests[1], functions.folders.EditPeerFoldersRequest
         )
         self.assertEqual(self.store.sender("sender").status, "quarantined")
+        self.assertIsNotNone(self.store.sender("sender").restriction_reference)
         item = self.store.enforcement_review("sender")
         self.assertIsNotNone(item)
         self.assertEqual(item.reason, "manual_spam")

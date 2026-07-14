@@ -21,7 +21,7 @@ from telethon import functions, types
 
 from .rules import URL_RE, normalized_domain, url_evidence, url_shape
 from .service import GatekeeperService
-from .store import DialogSnapshot, EnforcementReview, ReviewItem, StateStore
+from .store import ActiveRestriction, DialogSnapshot, ReviewItem, StateStore
 
 
 LOG = logging.getLogger("gatekeeper.review")
@@ -212,6 +212,8 @@ class ReviewAdminServer:
             return 303, {"Location": f"/cases/{suffix}"}, b""
         if path == "/cases" and method == "GET":
             return 200, {}, await self._enforcement_index_page()
+        if path == "/cases/release":
+            return await self._dispatch_legacy_release(method, body)
         if path.startswith("/cases/"):
             return await self._dispatch_enforcement(method, path, body)
         if not path.startswith("/review/"):
@@ -263,9 +265,19 @@ class ReviewAdminServer:
                             {},
                             self._page("Telegram Action Failed; Item Was Not Changed"),
                         )
-                    self.store.quarantine(item.sender_key)
+                    self.store.quarantine(
+                        item.sender_key,
+                        restriction_reference=self.service.restriction_reference(
+                            item.reference
+                        ),
+                    )
                 elif state.status == "challenged":
-                    self.store.quarantine(item.sender_key)
+                    self.store.quarantine(
+                        item.sender_key,
+                        restriction_reference=self.service.restriction_reference(
+                            item.reference
+                        ),
+                    )
                 if self.store.sender(item.sender_key).status == "quarantined":
                     self.store.activate_enforcement_review(
                         item.sender_key,
@@ -385,7 +397,7 @@ class ReviewAdminServer:
         sender_key = path.rsplit("/", 1)[-1]
         if len(sender_key) != 64 or any(char not in "0123456789abcdef" for char in sender_key):
             return 404, {}, self._page("Active Case Not Found")
-        item = self.store.enforcement_review(sender_key)
+        item = self.store.active_restriction(sender_key)
         if item is None:
             return 404, {}, self._page("Active Case Not Found")
         if method == "GET":
@@ -402,13 +414,13 @@ class ReviewAdminServer:
         if action != "allow":
             return 400, {}, self._page("Unknown Action")
         async with self.service.sender_lock(sender_key):
-            item = self.store.enforcement_review(sender_key)
+            item = self.store.active_restriction(sender_key)
             if item is None:
-                return 409, {}, self._page("This Active Case Has Expired")
+                return 409, {}, self._page("This Restriction Is No Longer Active")
             if item.reference is None:
                 return 409, {}, self._page("Telegram Identity Is Unavailable")
             try:
-                user_id, access_hash, _ = self.protector.open_review_reference(
+                user_id, access_hash = self.protector.open_restriction_reference(
                     item.reference
                 )
             except ValueError:
@@ -421,8 +433,41 @@ class ReviewAdminServer:
             self._identity_cache.pop(sender_key, None)
         return 303, {"Location": "/cases"}, b""
 
+    async def _dispatch_legacy_release(
+        self, method: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        if method != "POST":
+            return 405, {"Allow": "POST"}, self._page("Method Not Allowed")
+        values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+        if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid Action Token")
+        user_id_text = values.get("user_id", [""])[0]
+        if not user_id_text.isascii() or not user_id_text.isdecimal():
+            return 400, {}, self._page("Invalid Telegram User ID")
+        user_id = int(user_id_text)
+        if user_id <= 0 or user_id > (2**63 - 1):
+            return 400, {}, self._page("Invalid Telegram User ID")
+        sender_key = self.protector.sender_key(user_id)
+        async with self.service.sender_lock(sender_key):
+            state = self.store.sender(sender_key)
+            if state.status not in {"quarantined", "suppressed"}:
+                return 409, {}, self._page("Restricted Sender Not Found")
+            if state.restriction_reference is not None:
+                return 409, {}, self._page("Use Active Case Allow Now")
+            self.store.allow(sender_key)
+            self.store.clear_dialog_snapshot(sender_key)
+            self.cancel_timeout(sender_key)
+            self._identity_cache.pop(sender_key, None)
+            self.store.audit(
+                sender_key,
+                "OPERATOR_ALLOW_WITHOUT_RESTORE",
+                "allowed",
+                int(time.time()),
+            )
+        return 303, {"Location": "/cases"}, b""
+
     async def _enforcement_index_page(self) -> bytes:
-        items = self.store.enforcement_reviews()
+        items = self.store.active_restrictions()
         identities = await self._live_enforcement_identities(items)
         stats = self.store.enforcement_statistics()
         rows = "".join(
@@ -431,9 +476,10 @@ class ReviewAdminServer:
             f"<td><span class='badge'>{html.escape(self._human_label(item.status))}</span></td>"
             f"<td>{html.escape(self._human_label(item.reason))}</td>"
             f"<td>{html.escape(self._remaining(item))}</td>"
+            f"<td>{'Available' if item.envelope is not None else 'Expired or unavailable'}</td>"
             f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
             for item in items
-        ) or "<tr><td colspan='6'>No active cases.</td></tr>"
+        ) or "<tr><td colspan='7'>No active restrictions.</td></tr>"
         reason_counts = sorted(
             (key.removeprefix("reason:"), value)
             for key, value in stats.items()
@@ -444,47 +490,78 @@ class ReviewAdminServer:
             for reason, count in reason_counts
         ) or "No active reasons"
         snapshot_note = (
-            f"{stats['unreviewable']} active case"
+            f"{stats['unreviewable']} restriction"
             f"{'s' if stats['unreviewable'] != 1 else ''} "
-            f"{'have' if stats['unreviewable'] != 1 else 'has'} no encrypted snapshot "
-            "and cannot be opened here. Its snapshot may have expired, failed capture, or predate "
-            "snapshot capture."
+            f"{'have' if stats['unreviewable'] != 1 else 'has'} no reviewable evidence; "
+            "the restriction remains visible and manageable."
             if stats["unreviewable"]
-            else "Every active case currently has reviewable evidence."
+            else "Every active restriction currently has reviewable evidence."
+        )
+        identity_note = (
+            f" {stats['unidentified']} legacy restriction"
+            f"{'s' if stats['unidentified'] != 1 else ''} still require"
+            f"{'s' if stats['unidentified'] == 1 else ''} manual ID recovery."
+            if stats["unidentified"]
+            else " Every active restriction has a retained encrypted control identity."
         )
         content = (
-            self._masthead("Active Cases", f"{len(items)} Reviewable")
+            self._masthead("Active Cases", f"{len(items)} Restrictions")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
             + "<main><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
-            + "<h2>Review Active Cases</h2>"
-            + "<p>Encrypted evidence preserves the triggering message, links, buttons, and quoted context for short-term operator review. Telegram block is not used.</p>"
+            + "<h2>Review Active Restrictions</h2>"
+            + "<p>Every restriction remains manageable for its full lifetime. Encrypted evidence is retained separately for short-term review. Telegram block is not used.</p>"
             + "<dl class='metric-grid'>"
             + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
             + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
             + f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
-            + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}</p></section>"
-            + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Updated</th></tr></thead>"
+            + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></section>"
+            + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Evidence</th><th>Updated</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div></main>"
+            + "<section class='decision-panel'><p class='eyebrow'>Legacy Recovery</p>"
+            + "<h2>Allow an unidentified restricted sender by Telegram User ID</h2>"
+            + "<p>Use this only for a legacy restriction created before encrypted control "
+            + "identities were retained. This removes the "
+            + "Gatekeeper restriction and cancels pending deletion jobs, but cannot restore "
+            + "saved Telegram folder or notification state without a peer reference. "
+            + "The entered ID is used only to "
+            + "derive the existing sender key and is not stored.</p>"
+            + "<form class='manual-release' method='post' action='/cases/release'>"
+            + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
+            + "<label for='release-user-id'>Telegram User ID</label>"
+            + "<input id='release-user-id' name='user_id' type='text' inputmode='numeric' "
+            + "pattern='[0-9]+' autocomplete='off' required>"
+            + "<button class='danger' type='submit'>Allow Future Messages Without Restore</button>"
+            + "</form></section>"
         )
         return self._page(
-            content, raw=True, refresh_seconds=10, page_title="Active Cases"
+            content, raw=True, page_title="Active Cases"
         )
 
     async def _show_enforcement(
-        self, item: EnforcementReview
+        self, item: ActiveRestriction
     ) -> tuple[int, dict[str, str], bytes]:
-        if self.service.active_case_protector is None:
-            return 500, {}, self._page("Encrypted Review Content Is Unavailable")
-        try:
-            payload = self.service.active_case_protector.open(item.envelope)
-        except ValueError:
-            return 500, {}, self._page("Encrypted Review Content Is Unavailable")
+        payload: dict[str, object] = {}
+        evidence_available = False
+        unavailable_note = "No message evidence is retained."
+        if item.envelope is not None:
+            if self.service.active_case_protector is None:
+                unavailable_note = "Encrypted evidence cannot be opened by this runtime."
+            else:
+                try:
+                    payload = self.service.active_case_protector.open(item.envelope)
+                    evidence_available = True
+                except ValueError:
+                    unavailable_note = "Encrypted evidence failed authentication and was not shown."
+                    LOG.error(
+                        "active_case_evidence_invalid",
+                        extra={"sender_key": item.sender_key},
+                    )
         identity = "Identity unavailable"
         telegram_link = ""
         user_id: int | None = None
         if item.reference is not None:
             try:
-                user_id, access_hash, _ = self.protector.open_review_reference(
+                user_id, access_hash = self.protector.open_restriction_reference(
                     item.reference
                 )
                 sender = await self.telegram_client.get_entity(
@@ -502,8 +579,35 @@ class ReviewAdminServer:
             self._human_label(str(value)) for value in payload.get("rule_codes", [])
         ) or "—"
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
-        observed = datetime.fromtimestamp(item.created_at, timezone.utc).strftime(
+        observed_at = item.evidence_created_at or item.updated_at
+        observed = datetime.fromtimestamp(observed_at, timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
+        )
+        evidence_content = (
+            self._review_sections(payload)
+            if evidence_available
+            else (
+                "<div class='empty-state'><strong>Evidence expired or unavailable.</strong> "
+                "The encrypted control identity is retained only so this restriction remains "
+                "visible and reversible.</div>"
+            )
+        )
+        evidence_expiry = (
+            datetime.fromtimestamp(item.evidence_expires_at, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+            if item.evidence_expires_at is not None
+            else "Expired or unavailable"
+        )
+        evidence_heading = (
+            "Decrypted Local Evidence"
+            if evidence_available
+            else "Restriction Control"
+        )
+        evidence_note = (
+            "Encrypted at rest; decrypted only for this owner-only view."
+            if evidence_available
+            else unavailable_note + " Only the encrypted control identity remains available."
         )
         allow_action = (
             self._action_form(
@@ -536,10 +640,10 @@ class ReviewAdminServer:
         {self._masthead("Active Cases", self._human_label(item.status))}
         <p class="back"><a href="/cases">← Active Cases</a></p>
         <main class="review-grid"><section class="message-panel">
-          <p class="eyebrow">Decrypted Local Evidence</p>
+          <p class="eyebrow">{evidence_heading}</p>
           <h2>{html.escape(identity)}</h2>
-          <p class="refresh-note">Encrypted at rest; decrypted only for this owner-only view.</p>
-          {self._review_sections(payload)}
+          <p class="refresh-note">{evidence_note}</p>
+          {evidence_content}
           {telegram_link}
         </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
           <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
@@ -547,7 +651,7 @@ class ReviewAdminServer:
           <dt>Severity</dt><dd>{html.escape(self._severity_label(payload, item.reason))}</dd>
           <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
-          <dt>Evidence Expires</dt><dd>{datetime.fromtimestamp(item.expires_at, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</dd></dl>
+          <dt>Evidence Expires</dt><dd>{evidence_expiry}</dd></dl>
           <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
         </aside></main><section class="decision-panel"><p class="eyebrow">Operator Action</p>
           <h2>{html.escape(allow_guidance)}</h2>
@@ -832,7 +936,7 @@ class ReviewAdminServer:
             f"<div><dt>Pending Reviews</dt><dd class='data-value'>{len(review_items)}</dd></div>"
             "</dl></section>"
             "<div class='table-shell'><table><thead><tr><th>Area</th><th>Purpose</th><th>Open</th></tr></thead><tbody>"
-            "<tr><td>Active Cases</td><td>Review restrictions that still have an unexpired encrypted snapshot.</td><td><a href='/cases'>Open</a></td></tr>"
+            "<tr><td>Active Cases</td><td>Review every current restriction; evidence availability is shown separately.</td><td><a href='/cases'>Open</a></td></tr>"
             "<tr><td>Pending Reviews</td><td>Resolve monitor-mode simulations and protect-mode exception reviews.</td><td><a href='/review'>Open</a></td></tr>"
             "</tbody></table></div></main>"
         )
@@ -941,14 +1045,14 @@ class ReviewAdminServer:
         return identities
 
     async def _live_enforcement_identities(
-        self, items: list[EnforcementReview]
+        self, items: list[ActiveRestriction]
     ) -> dict[str, LiveIdentity]:
         identities: dict[str, LiveIdentity] = {}
         for item in items:
             if item.reference is None:
                 continue
             try:
-                user_id, access_hash, _ = self.protector.open_review_reference(
+                user_id, access_hash = self.protector.open_restriction_reference(
                     item.reference
                 )
                 cached = self._identity_cache.get(item.sender_key)
@@ -1059,7 +1163,7 @@ class ReviewAdminServer:
         return f"{seconds // 86400}d"
 
     @staticmethod
-    def _remaining(item: EnforcementReview) -> str:
+    def _remaining(item: ActiveRestriction) -> str:
         if item.status == "quarantined":
             return "Manual review required"
         if item.suppressed_until is None:
@@ -1197,6 +1301,7 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
 .actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .actions.one{{grid-template-columns:minmax(0,24rem)}}.notice,.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
+.manual-release{{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(16rem,1.4fr);gap:.75rem;align-items:end;margin-top:1.5rem}}.manual-release label{{grid-column:1/-1;font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}.manual-release input{{min-height:3.25rem;width:100%;padding:.8rem 1rem;border:1px solid var(--ink);background:var(--panel);color:var(--ink);font:700 .9rem/1.35 var(--font-data)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{width:100%;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
-@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
+@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid,.manual-release{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")

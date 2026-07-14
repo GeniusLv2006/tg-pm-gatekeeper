@@ -28,6 +28,16 @@ class CryptoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.protector.open_review_reference(bytes(sealed))
 
+    def test_restriction_reference_is_minimal_and_domain_separated(self) -> None:
+        sealed = self.protector.seal_restriction_reference(123456789, -987654321)
+        self.assertNotIn(b"123456789", sealed)
+        self.assertEqual(
+            self.protector.open_restriction_reference(sealed),
+            (123456789, -987654321),
+        )
+        with self.assertRaises(ValueError):
+            self.protector.open_review_reference(sealed)
+
     def test_active_case_content_round_trip_and_tamper_rejection(self) -> None:
         protector = ActiveCaseProtector(b"r" * 32)
         payload = {"text": "private-canary", "severity": "critical"}

@@ -114,7 +114,8 @@ scripts/dashboard-tunnel.sh root@server.example
 
 It has two main areas:
 
-- **Active Cases**: review current restrictions with encrypted snapshots retained for up to 30 days;
+- **Active Cases**: review every current restriction; encrypted control identities remain available
+  for the restriction lifetime, while message evidence is retained for up to 30 days;
 - **Pending Reviews**: resolve monitor-mode simulations and protect-mode exceptions.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
@@ -134,8 +135,8 @@ incoming private message
   -> otherwise archive and mute, then send an arithmetic challenge
       -> correct direct Reply: restore the dialog
       -> owner replies later: trust the sender
-      -> timeout: warn, delete after 10 seconds, suppress for 24 hours
-      -> attempts exhausted: warn, delete after 10 seconds, suppress for 7 days
+      -> timeout: warn, delete after 10 seconds, suppress for 2 hours
+      -> attempts exhausted: warn, delete after 10 seconds, suppress for 24 hours
       -> outbound limit reached: keep archived and send to manual review
 ```
 
@@ -159,8 +160,11 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 
 Returning to `monitor` cancels non-test pending destructive jobs. The CLI refuses `allow` for active
 challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use
-**Legitimate · Allow Sender** in the dashboard instead. A raw user ID supplied on the command line
-may remain in shell history.
+**Legitimate · Allow Sender** or **Allow Now** in the dashboard instead. If Active Case evidence has
+expired, the restriction remains listed and **Allow Now** continues to work through a separate
+encrypted control identity. A manual User ID form remains only for legacy restrictions that predate
+that identity record. The entered ID is used only to derive the existing sender key and is not
+stored. A raw user ID supplied on the command line may remain in shell history.
 
 ## Optional features
 

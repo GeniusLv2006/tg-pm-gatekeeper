@@ -315,8 +315,13 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
                 adapter.service = SimpleNamespace(protector=protector)
                 peer = types.InputPeerUser(user_id=123, access_hash=456)
                 reference = protector.seal_review_reference(123, 456, 1)
+                restriction_reference = protector.seal_restriction_reference(123, 456)
                 state = store.suppress(
-                    "sender", "critical_rule", until=None, reference=reference
+                    "sender",
+                    "critical_rule",
+                    until=None,
+                    reference=reference,
+                    restriction_reference=restriction_reference,
                 )
                 action_id = store.schedule_action(
                     "sender",
@@ -330,6 +335,9 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
                 await adapter._dialog_deletion_worker(action_id, 0)
 
                 client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
+                retained = store.sender("sender")
+                self.assertIsNone(retained.challenge_action_reference)
+                self.assertEqual(retained.restriction_reference, restriction_reference)
             finally:
                 store.close()
 

@@ -77,7 +77,8 @@ identities, messages, credentials, URLs, databases, or logs.
 
 ### Pull-request path
 
-1. Create a narrow `codex/<description>` branch from current `main`.
+1. Create a narrow branch from current `main` with a change-type prefix such as `fix/`, `feat/`,
+   `docs/`, `refactor/`, `ci/`, or `chore/`.
 2. Commit only the intended scope with a Conventional Commit.
 3. Push the branch over SSH.
 4. Open a ready-for-review PR. Use Draft only while work is genuinely incomplete.
