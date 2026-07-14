@@ -85,6 +85,11 @@ flow, see [Architecture](docs/architecture.md).
 - Plaintext Active Case export is not provided. Dashboard responses use `Cache-Control: no-store`, but
   decrypted content is still visible to the owner and can be captured by browser memory, screenshots,
   or a compromised workstation.
+- Dashboard JavaScript and the lightweight status endpoint require the existing authenticated
+  dashboard session and remain behind the owner-only Unix socket and SSH tunnel. The status response
+  contains only an opaque page-state fingerprint and check time; it does not contain message content,
+  Telegram identity, encrypted references, or evidence. Content Security Policy permits scripts and
+  connection checks only from the same origin; no external browser dependency is loaded.
 
 ### Actions and failure handling
 

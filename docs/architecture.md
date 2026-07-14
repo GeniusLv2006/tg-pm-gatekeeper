@@ -138,6 +138,16 @@ failed lookups are retried after 30 seconds. Review decisions evict the matching
 Responses use `Cache-Control: no-store`, although rendered identity remains visible in the owner's
 browser memory and screenshots like any other displayed page.
 
+Authenticated dashboard pages load a same-origin script that checks `/dashboard/status` every 15
+seconds while the tab is visible. The status response contains only an opaque fingerprint of the
+current page state and a check time; it contains no message content, Telegram identity, encrypted
+reference, or evidence. When a list or overview fingerprint changes, the browser fetches the current
+page and replaces only its marked live regions while preserving current form input and focus. Detail
+pages instead disable stale decision controls and require an explicit reload after their underlying
+record changes. Hidden tabs stop checking until visible again, and the manual control can request an
+immediate check. The script and status route use the existing dashboard session and remain behind the
+same owner-only Unix socket and SSH tunnel.
+
 An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
 the local allowlist and are restored first when Gatekeeper previously archived the dialog. Confirmed
 spam is archived and muted unless the sender is already quarantined. Dismiss performs no new action

@@ -175,8 +175,18 @@ Returning to `monitor` keeps message processing active but cancels non-test pend
 ## Dashboard and daily operation
 
 The dashboard has no public TCP listener. The tunnel helper connects local port `8765` to the
-owner-only Unix socket on the server and reads a one-time access token. The **Connected** timestamp
-updates when the page successfully reaches the running service.
+owner-only Unix socket on the server and reads a one-time access token. While the tab is visible, the
+browser performs an authenticated lightweight connection check every 15 seconds; checks pause while
+the tab is hidden. The indicator changes between **Connected** and **Disconnected**, and its
+**Checked** timestamp updates without reloading the page. Use the adjacent refresh control to check
+immediately.
+
+Overview and list pages update their marked regions in place only when the service reports a changed
+state fingerprint. Current form input and focus are preserved during those updates. Detail pages do
+not replace evidence or decision controls in the background: if the underlying review or restriction
+changes, the dashboard disables the stale actions and asks the operator to load the current state.
+Losing the SSH tunnel leaves the current page visible while the connection indicator reports the
+failure.
 
 ### Pending Reviews
 
