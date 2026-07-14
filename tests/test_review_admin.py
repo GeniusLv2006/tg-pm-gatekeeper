@@ -16,7 +16,7 @@ from telethon import functions
 from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
 from tg_pm_gatekeeper.review_admin import ReviewAdminServer
 from tg_pm_gatekeeper.service import GatekeeperService
-from tg_pm_gatekeeper.store import StateStore
+from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 
 
 class FakeTelegramClient:
@@ -529,6 +529,84 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"1 active case", page)
         self.assertIn(b"has no encrypted snapshot", page)
         self.assertIn(b"No active cases", page)
+        self.assertIn(b"Allow a suppressed sender by Telegram User ID", page)
+        self.assertIn(b"Allow Future Messages Without Restore", page)
+        self.assertNotIn(b'http-equiv="refresh" content="10"', page)
+
+    async def test_expired_case_can_be_allowed_by_user_id_without_restore(self) -> None:
+        user_id = 771_234_567
+        sender_key = self.protector.sender_key(user_id)
+        state = self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            reference=b"expired-reference",
+        )
+        self.store.schedule_action(
+            sender_key,
+            reason="critical_rule",
+            reference=b"expired-reference",
+            execute_at=int(time.time()) + 600,
+            expected_revision=state.revision,
+        )
+        self.store.save_dialog_snapshot(
+            sender_key,
+            DialogSnapshot(folder_id=1, silent=True, mute_until=None),
+        )
+
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": str(user_id)}
+        ).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases")
+        self.assertEqual(self.store.sender(sender_key).status, "allowed")
+        self.assertIsNone(self.store.dialog_snapshot(sender_key))
+        self.assertEqual(self.store.pending_actions(), [])
+        self.assertEqual(self.cancelled, [sender_key])
+        self.assertEqual(self.client.requests, [])
+        database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
+        self.assertNotIn(str(user_id).encode(), database)
+
+    async def test_release_by_user_id_requires_existing_suppression(self) -> None:
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": "771234568"}
+        ).encode()
+
+        status, _, response = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn(b"Suppressed Sender Not Found", response)
+
+    async def test_release_by_user_id_rejects_invalid_input(self) -> None:
+        for value in ("not-a-number", "0", "-1", "+1", "１"):
+            body = urlencode(
+                {"token": self.server._csrf_token, "user_id": value}
+            ).encode()
+            status, _, response = await self.server._dispatch(
+                "POST", "/cases/release", body
+            )
+            self.assertEqual(status, 400)
+            self.assertIn(b"Invalid Telegram User ID", response)
+
+    async def test_release_by_user_id_requires_valid_csrf(self) -> None:
+        user_id = 771_234_569
+        sender_key = self.protector.sender_key(user_id)
+        self.store.suppress(sender_key, "critical_rule", until=None)
+        body = urlencode({"token": "invalid", "user_id": str(user_id)}).encode()
+
+        status, _, response = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(b"Invalid Action Token", response)
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
         body = urlencode(

@@ -134,8 +134,8 @@ incoming private message
   -> otherwise archive and mute, then send an arithmetic challenge
       -> correct direct Reply: restore the dialog
       -> owner replies later: trust the sender
-      -> timeout: warn, delete after 10 seconds, suppress for 24 hours
-      -> attempts exhausted: warn, delete after 10 seconds, suppress for 7 days
+      -> timeout: warn, delete after 10 seconds, suppress for 2 hours
+      -> attempts exhausted: warn, delete after 10 seconds, suppress for 24 hours
       -> outbound limit reached: keep archived and send to manual review
 ```
 
@@ -159,8 +159,11 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 
 Returning to `monitor` cancels non-test pending destructive jobs. The CLI refuses `allow` for active
 challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use
-**Legitimate · Allow Sender** in the dashboard instead. A raw user ID supplied on the command line
-may remain in shell history.
+**Legitimate · Allow Sender** or **Allow Now** in the dashboard instead. If an Active Case has
+expired, the Active Cases page can allow future messages by Telegram User ID without restoring the
+saved folder or notification snapshot after its peer reference is gone. The ID is used only to
+derive the existing sender key and is not stored. A raw user ID supplied on the command line may
+remain in shell history.
 
 ## Optional features
 

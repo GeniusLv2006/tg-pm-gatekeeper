@@ -64,6 +64,9 @@ flow, see [Architecture](docs/architecture.md).
 - The runtime database may store Telegram message IDs, generated challenge text while delivery is
   incomplete, and authenticated encrypted short-lived references needed for review and recovery.
 - Raw user IDs, usernames, profile names, and message content are not stored in plaintext.
+- The owner may enter a raw Telegram user ID in the dashboard to release a suppression after its
+  evidence expires. The value is HMAC-derived in memory, is not persisted, and is accepted only when
+  it matches an existing `suppressed` sender state.
 
 ### Encrypted review content
 

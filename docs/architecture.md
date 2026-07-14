@@ -78,8 +78,8 @@ later manual reply from the account owner, an explicit review, or a safe operato
    Telegram message ID.
 6. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
    the verification exchange. After two incorrect numeric answers, warn that deletion is pending,
-   wait 10 seconds, then delete the entire private conversation and suppress the sender for seven
-   days. A timeout follows the same warned deletion flow with a 24-hour suppression.
+   wait 10 seconds, then delete the entire private conversation and suppress the sender for 24
+   hours. A timeout follows the same warned deletion flow with a two-hour suppression.
 
 In protect mode the challenge is written in English and defaults to 60 seconds. Its title is
 `⚠️ Verification Required`; Telegram-native bold entities emphasize the title, deadline, expression,
@@ -163,6 +163,13 @@ unchanged records an operator decision but does not extend a temporary suppressi
 count all active local states, while the case table includes only unexpired encrypted snapshots.
 Older states without snapshots remain visible as an unavailable count and derive a reason from
 historical verdicts when possible.
+
+Evidence retention does not define the lifetime of operator control. When an Active Case snapshot
+or its encrypted Telegram reference is unavailable, the owner can enter the Telegram User ID to
+allow future messages. Gatekeeper HMAC-derives the sender key, verifies that the matching state is
+currently suppressed, changes it to allowed, cancels pending deletion jobs, and discards any stale
+dialog snapshot. The raw ID is not persisted. Because a numeric user ID cannot replace the expired
+Telegram peer reference, this recovery path cannot apply saved folder or notification settings.
 
 ## Implemented action policy
 

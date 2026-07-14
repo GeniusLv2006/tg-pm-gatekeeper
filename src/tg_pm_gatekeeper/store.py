@@ -942,7 +942,12 @@ class StateStore:
         return result
 
     def expire_challenge(
-        self, sender_key: str, expires_at: int, now: int | None = None
+        self,
+        sender_key: str,
+        expires_at: int,
+        now: int | None = None,
+        *,
+        suppression_seconds: int = 2 * 3600,
     ) -> bool:
         timestamp = now or int(time.time())
         with self._lock, self._connection:
@@ -954,7 +959,12 @@ class StateStore:
                 "suppressed_until=?, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND status='challenged' "
                 "AND challenge_expires_at=?",
-                (timestamp + 86400, timestamp, sender_key, expires_at),
+                (
+                    timestamp + suppression_seconds,
+                    timestamp,
+                    sender_key,
+                    expires_at,
+                ),
             )
         return cursor.rowcount == 1
 

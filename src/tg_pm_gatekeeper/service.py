@@ -36,11 +36,11 @@ VERIFICATION_PASSED_TEXT = (
 VERIFICATION_FAILED_TEXT = (
     "⛔ Verification Failed\n\nThis conversation remains archived and muted.\n\n"
     "This conversation will be deleted in 10 seconds. New messages will be removed "
-    "for 7 days."
+    "for 24 hours."
 )
 VERIFICATION_TIMEOUT_TEXT = (
     "⛔ Verification Failed\n\nThe verification window expired.\n\n"
-    "This conversation will be deleted in 10 seconds. Try again in 24 hours."
+    "This conversation will be deleted in 10 seconds. Try again in 2 hours."
 )
 TEST_VERIFICATION_FAILED_TEXT = (
     "⛔ Verification Failed\n\nThis test conversation remains archived and muted.\n\n"
@@ -54,6 +54,8 @@ TEST_VERIFICATION_TIMEOUT_TEXT = (
     "after 60 seconds."
 )
 FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
+VERIFICATION_FAILED_SUPPRESSION_SECONDS = 24 * 3600
+VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS = 2 * 3600
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
 MAX_REVIEW_BUTTON_TEXTS = 10
@@ -889,7 +891,7 @@ class GatekeeperService:
                 terminal = self.store.suppress(
                     sender_key,
                     "attempts_exhausted",
-                    until=now + 7 * 86400,
+                    until=now + VERIFICATION_FAILED_SUPPRESSION_SECONDS,
                     reference=reference,
                     now=now,
                 )
@@ -1091,7 +1093,12 @@ class GatekeeperService:
         async with self.sender_lock(sender_key):
             timestamp = self.clock() if now is None else now
             state = self.store.sender(sender_key)
-            expired = self.store.expire_challenge(sender_key, expires_at, timestamp)
+            expired = self.store.expire_challenge(
+                sender_key,
+                expires_at,
+                timestamp,
+                suppression_seconds=VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
+            )
             if expired:
                 if sender_key != self.test_sender_key:
                     self._activate_enforcement_review(

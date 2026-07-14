@@ -207,6 +207,13 @@ Snapshots last at most 30 days. Successful verification, rollback, or manual all
 them sooner. A temporary suppression is released when that sender next messages after expiry; the
 service does not wake up solely to remove it.
 
+If the encrypted snapshot has expired or was never captured, enter the sender's numeric Telegram
+User ID in **Expired Evidence Recovery**. Gatekeeper uses it only to derive the existing HMAC sender
+key and does not store the raw ID. **Allow Future Messages Without Restore** changes a matching
+`suppressed` state to `allowed` and cancels pending deletion jobs. It cannot restore an expired
+Telegram peer reference, so it discards rather than applies any saved folder or notification
+snapshot. Use the case-specific **Allow Now** action whenever it is still available.
+
 ### Tunnel options
 
 The SSH target can be an alias or `user@host`. Run `scripts/dashboard-tunnel.sh -h` for every option.

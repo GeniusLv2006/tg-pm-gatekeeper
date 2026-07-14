@@ -19,7 +19,9 @@ from tg_pm_gatekeeper.service import (
     TEST_VERIFICATION_FAILED_TEXT,
     TEST_VERIFICATION_TIMEOUT_TEXT,
     VERIFICATION_FAILED_TEXT,
+    VERIFICATION_FAILED_SUPPRESSION_SECONDS,
     VERIFICATION_TIMEOUT_TEXT,
+    VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
     Challenge,
     GatekeeperService,
     IncomingMessage,
@@ -638,6 +640,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((first, second), ("challenge_incorrect", "suppressed"))
         self.assertEqual(self.store.sender(sender_key).status, "suppressed")
+        self.assertEqual(
+            self.store.sender(sender_key).suppressed_until,
+            self.now + VERIFICATION_FAILED_SUPPRESSION_SECONDS,
+        )
         self.assertEqual(actions.quarantines, 0)
         self.assertEqual(actions.deleted_dialogs, 0)
         self.assertEqual(actions.dialog_deletions, [(1, self.now + 10)])
@@ -843,6 +849,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(self.store.sender(sender_key).status, "suppressed")
+        self.assertEqual(
+            self.store.sender(sender_key).suppressed_until,
+            self.now + 65 + VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
+        )
 
     async def test_dedicated_test_sender_timeout_uses_failure_cleanup(self) -> None:
         service = self.make_service(test_sender_id=TEST_SENDER_ID)

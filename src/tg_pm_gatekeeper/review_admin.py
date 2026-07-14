@@ -212,6 +212,8 @@ class ReviewAdminServer:
             return 303, {"Location": f"/cases/{suffix}"}, b""
         if path == "/cases" and method == "GET":
             return 200, {}, await self._enforcement_index_page()
+        if path == "/cases/release":
+            return await self._dispatch_suppression_release(method, body)
         if path.startswith("/cases/"):
             return await self._dispatch_enforcement(method, path, body)
         if not path.startswith("/review/"):
@@ -421,6 +423,36 @@ class ReviewAdminServer:
             self._identity_cache.pop(sender_key, None)
         return 303, {"Location": "/cases"}, b""
 
+    async def _dispatch_suppression_release(
+        self, method: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        if method != "POST":
+            return 405, {"Allow": "POST"}, self._page("Method Not Allowed")
+        values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+        if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid Action Token")
+        user_id_text = values.get("user_id", [""])[0]
+        if not user_id_text.isascii() or not user_id_text.isdecimal():
+            return 400, {}, self._page("Invalid Telegram User ID")
+        user_id = int(user_id_text)
+        if user_id <= 0 or user_id > (2**63 - 1):
+            return 400, {}, self._page("Invalid Telegram User ID")
+        sender_key = self.protector.sender_key(user_id)
+        async with self.service.sender_lock(sender_key):
+            if self.store.sender(sender_key).status != "suppressed":
+                return 409, {}, self._page("Suppressed Sender Not Found")
+            self.store.allow(sender_key)
+            self.store.clear_dialog_snapshot(sender_key)
+            self.cancel_timeout(sender_key)
+            self._identity_cache.pop(sender_key, None)
+            self.store.audit(
+                sender_key,
+                "OPERATOR_ALLOW_WITHOUT_RESTORE",
+                "allowed",
+                int(time.time()),
+            )
+        return 303, {"Location": "/cases"}, b""
+
     async def _enforcement_index_page(self) -> bytes:
         items = self.store.enforcement_reviews()
         identities = await self._live_enforcement_identities(items)
@@ -465,9 +497,23 @@ class ReviewAdminServer:
             + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}</p></section>"
             + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Updated</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div></main>"
+            + "<section class='decision-panel'><p class='eyebrow'>Expired Evidence Recovery</p>"
+            + "<h2>Allow a suppressed sender by Telegram User ID</h2>"
+            + "<p>Use this when the encrypted Active Case is unavailable. This removes the "
+            + "Gatekeeper suppression and cancels pending deletion jobs, but cannot restore "
+            + "saved Telegram folder or notification state without the expired peer reference. "
+            + "The entered ID is used only to "
+            + "derive the existing sender key and is not stored.</p>"
+            + "<form class='manual-release' method='post' action='/cases/release'>"
+            + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
+            + "<label for='release-user-id'>Telegram User ID</label>"
+            + "<input id='release-user-id' name='user_id' type='text' inputmode='numeric' "
+            + "pattern='[0-9]+' autocomplete='off' required>"
+            + "<button class='danger' type='submit'>Allow Future Messages Without Restore</button>"
+            + "</form></section>"
         )
         return self._page(
-            content, raw=True, refresh_seconds=10, page_title="Active Cases"
+            content, raw=True, page_title="Active Cases"
         )
 
     async def _show_enforcement(
@@ -1197,6 +1243,7 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
 .actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .actions.one{{grid-template-columns:minmax(0,24rem)}}.notice,.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
+.manual-release{{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(16rem,1.4fr);gap:.75rem;align-items:end;margin-top:1.5rem}}.manual-release label{{grid-column:1/-1;font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}.manual-release input{{min-height:3.25rem;width:100%;padding:.8rem 1rem;border:1px solid var(--ink);background:var(--panel);color:var(--ink);font:700 .9rem/1.35 var(--font-data)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{width:100%;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
-@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid{{grid-template-columns:1fr}}}}
+@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid,.manual-release{{grid-template-columns:1fr}}}}
 </style></head><body>{body}</body></html>""".encode("utf-8")
