@@ -327,7 +327,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -365,7 +365,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                3,
+                4,
             )
         finally:
             reopened.close()
@@ -399,7 +399,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.sender("sender").revision, 0)
             self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 3
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 4
             )
         finally:
             store.close()
@@ -419,7 +419,31 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 3
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 4
+            )
+        finally:
+            reopened.close()
+
+    def test_v3_database_adds_restriction_reference(self) -> None:
+        store = StateStore(self.path)
+        store._connection.execute(
+            "ALTER TABLE sender_state DROP COLUMN restriction_reference"
+        )
+        store._connection.execute("PRAGMA user_version=3")
+        store._connection.commit()
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            columns = {
+                row["name"]
+                for row in reopened._connection.execute(
+                    "PRAGMA table_info(sender_state)"
+                )
+            }
+            self.assertIn("restriction_reference", columns)
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 4
             )
         finally:
             reopened.close()

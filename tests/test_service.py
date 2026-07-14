@@ -328,6 +328,41 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"original-private-canary", database)
         self.assertNotIn(b"quoted-private-canary", database)
 
+    def test_service_backfills_control_identity_from_legacy_case_reference(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        review_reference = self.protector.seal_review_reference(123456789, 456, 1)
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=review_reference,
+            envelope=self.review_protector.seal(
+                {"schema_version": 4, "text": "private-canary"}
+            ),
+            reason="critical_rule",
+            expires_at=self.now - 1,
+            now=self.now - 100,
+        )
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            reference=None,
+            now=self.now,
+        )
+
+        GatekeeperService(
+            self.store,
+            self.protector,
+            active_case_protector=self.review_protector,
+            clock=lambda: self.now,
+        )
+
+        self.assertEqual(
+            self.protector.open_restriction_reference(
+                self.store.sender(sender_key).restriction_reference
+            ),
+            (123456789, 456),
+        )
+
     async def test_successful_verification_erases_review_snapshot(self) -> None:
         self.store.set_mode("protect")
         actions = FakeActions()
@@ -393,6 +428,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "suppressed")
         self.assertEqual(
             self.store.sender(sender_key).suppression_reason, "critical_rule"
+        )
+        self.assertEqual(
+            self.protector.open_restriction_reference(
+                self.store.sender(sender_key).restriction_reference
+            ),
+            (123456789, 987654321),
         )
         self.assertEqual(actions.sent, [])
         self.assertEqual(actions.dialog_deletions, [(1, self.now)])
@@ -644,6 +685,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.store.sender(sender_key).suppressed_until,
             self.now + VERIFICATION_FAILED_SUPPRESSION_SECONDS,
         )
+        self.assertEqual(
+            self.protector.open_restriction_reference(
+                self.store.sender(sender_key).restriction_reference
+            ),
+            (123456789, 987654321),
+        )
         self.assertEqual(actions.quarantines, 0)
         self.assertEqual(actions.deleted_dialogs, 0)
         self.assertEqual(actions.dialog_deletions, [(1, self.now + 10)])
@@ -853,7 +900,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.store.sender(sender_key).suppressed_until,
             self.now + 65 + VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
         )
-
     async def test_dedicated_test_sender_timeout_uses_failure_cleanup(self) -> None:
         service = self.make_service(test_sender_id=TEST_SENDER_ID)
         sender_key = self.set_active_challenge(sender_id=TEST_SENDER_ID)

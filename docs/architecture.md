@@ -19,6 +19,8 @@
   not Telegram block.
 - **Review item**: one sender-level pending decision with a count and one encrypted Telegram reference,
   not a stored conversation transcript.
+- **Control identity**: a restriction-lifetime encrypted Telegram user ID and access hash used to
+  keep a quarantine or suppression visible and reversible after message evidence expires.
 - **HR**: the deterministic Hard Rule identifier family. An HR match has `signal`, `high`, or
   `critical` severity.
 - **Critical**: the highest HR severity, not a separate rule family. An HR match with `critical`
@@ -148,28 +150,24 @@ message is no longer available, the detail page still exposes a resolve-only act
 the local review, erases its reference, and cancels pending or failed Gatekeeper deletion jobs
 without changing sender state.
 
-Protect-mode terminal states have a separate **Active Cases** surface. The service captures the
+Protect-mode terminal states have a separate **Active Cases** surface. It lists every current
+quarantine and suppression, independent of evidence availability. The service captures the
 original triggering text/caption, Telegram-provided quote and preview, button text, full URLs,
 normalized domains, URL shape, matched HR identifiers, and severity before a challenge begins,
 encrypts it with the active-case review key, and exposes it only after the sender becomes quarantined
-or suppressed. A
-correct answer, challenge rollback, or manual allowance erases the snapshot. Temporary suppression
-expiry is reconciled only when that sender next messages; otherwise the snapshot remains until its
-own deadline. Other snapshots expire after the configured Active Case retention, capped at 30 days.
-Allowing a sender first restores saved Telegram folder and notification settings when they exist. An
-HR case with `critical` severity and no dialog snapshot is moved to the main folder and notifications
-are enabled instead; failure leaves both policy state and snapshot unchanged. Leaving the restriction
-unchanged records an operator decision but does not extend a temporary suppression. Summary metrics
-count all active local states, while the case table includes only unexpired encrypted snapshots.
-Older states without snapshots remain visible as an unavailable count and derive a reason from
-historical verdicts when possible.
+or suppressed. A correct answer, challenge rollback, or manual allowance erases the evidence.
+Temporary suppression expiry is reconciled only when that sender next messages; otherwise the
+evidence remains until its own deadline. Other evidence expires after the configured Active Case
+retention, capped at 30 days.
 
-Evidence retention does not define the lifetime of operator control. When an Active Case snapshot
-or its encrypted Telegram reference is unavailable, the owner can enter the Telegram User ID to
-allow future messages. Gatekeeper HMAC-derives the sender key, verifies that the matching state is
-currently suppressed, changes it to allowed, cancels pending deletion jobs, and discards any stale
-dialog snapshot. The raw ID is not persisted. Because a numeric user ID cannot replace the expired
-Telegram peer reference, this recovery path cannot apply saved folder or notification settings.
+Each active restriction separately retains an authenticated encrypted control identity containing
+only Telegram user ID and access hash. It contains no message ID or evidence and remains until the
+restriction is allowed, revoked, or automatically released. Active Cases uses it to resolve the live
+identity and restore saved Telegram folder and notification settings even after evidence expires. An
+HR case with no dialog snapshot is moved to the main folder and notifications are enabled instead;
+failure leaves policy state unchanged. Leaving the restriction unchanged records an operator
+decision but does not extend a temporary suppression. A manual numeric-ID recovery form is retained
+only for legacy states without a control identity; the ID is HMAC-derived in memory and not stored.
 
 ## Implemented action policy
 
@@ -196,10 +194,11 @@ are not implemented.
 
 The persistent store contains sender state, challenge metadata, generated challenge prompts while
 delivery is incomplete, rule identifiers, timestamps, action outcomes, structural review features,
-automated outgoing message IDs, encrypted short-lived Telegram references, and the prior archive and
-notification settings needed to reverse a Gatekeeper action, pending action jobs, suppression state,
-privacy-safe detector decisions, and encrypted Active Case envelopes. The state
-database does not store message bodies, quoted text, raw identities, or profile data in plaintext.
+automated outgoing message IDs, encrypted short-lived Telegram references, the prior archive and
+notification settings needed to reverse a Gatekeeper action, encrypted restriction-lifetime control
+identities, pending action jobs, suppression state, privacy-safe detector decisions, and encrypted
+Active Case envelopes. The state database does not store message bodies, quoted text, raw
+identities, or profile data in plaintext.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
@@ -211,16 +210,21 @@ not written to audit records or plaintext state columns. Raw URLs may exist only
 encrypted Active Case snapshots. Telegram message IDs
 are stored only with derived sender keys for idempotency, direct Reply binding, and identification of
 automated Gatekeeper messages. Names and usernames may exist
-briefly in the review process's bounded memory cache, and
-raw user IDs are rendered from authenticated encrypted references without being added to the
-database. Processed Telegram message IDs are retained for idempotency for the same audit-retention
-window.
+briefly in the review process's bounded memory cache. Raw user IDs are never stored in plaintext;
+they are rendered from authenticated encrypted references. Processed Telegram message IDs are
+retained for idempotency for the same audit-retention window.
 
 Review references use AES-256-CTR with independent HMAC-SHA-256 authentication and keys derived for
 those separate purposes from the server-local HMAC secret. The encrypted envelope is useful only
 while that secret and the Telegram authorization remain available. Its lifetime is configurable up
 to a hard maximum of seven days and it is erased immediately on a review decision. Runtime state,
 including these envelopes, must not be included in general backups.
+
+Restriction control references use the same authenticated encryption construction with separate
+encryption and authentication domains. Their payload contains only Telegram user ID and access hash,
+not a message ID. They remain for the lifetime of a quarantine or suppression so evidence retention
+cannot remove the owner's ability to identify and allow the sender. They are erased when the
+restriction ends.
 
 The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
 authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.

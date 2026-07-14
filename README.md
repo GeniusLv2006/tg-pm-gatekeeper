@@ -114,7 +114,8 @@ scripts/dashboard-tunnel.sh root@server.example
 
 It has two main areas:
 
-- **Active Cases**: review current restrictions with encrypted snapshots retained for up to 30 days;
+- **Active Cases**: review every current restriction; encrypted control identities remain available
+  for the restriction lifetime, while message evidence is retained for up to 30 days;
 - **Pending Reviews**: resolve monitor-mode simulations and protect-mode exceptions.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
@@ -159,11 +160,11 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 
 Returning to `monitor` cancels non-test pending destructive jobs. The CLI refuses `allow` for active
 challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use
-**Legitimate · Allow Sender** or **Allow Now** in the dashboard instead. If an Active Case has
-expired, the Active Cases page can allow future messages by Telegram User ID without restoring the
-saved folder or notification snapshot after its peer reference is gone. The ID is used only to
-derive the existing sender key and is not stored. A raw user ID supplied on the command line may
-remain in shell history.
+**Legitimate · Allow Sender** or **Allow Now** in the dashboard instead. If Active Case evidence has
+expired, the restriction remains listed and **Allow Now** continues to work through a separate
+encrypted control identity. A manual User ID form remains only for legacy restrictions that predate
+that identity record. The entered ID is used only to derive the existing sender key and is not
+stored. A raw user ID supplied on the command line may remain in shell history.
 
 ## Optional features
 

@@ -62,11 +62,16 @@ flow, see [Architecture](docs/architecture.md).
   phone numbers are not retained in a Telethon entity cache.
 - Sender state uses an HMAC-derived identifier rather than a raw Telegram user ID.
 - The runtime database may store Telegram message IDs, generated challenge text while delivery is
-  incomplete, and authenticated encrypted short-lived references needed for review and recovery.
+  incomplete, authenticated encrypted short-lived references needed for message review, and a
+  separate encrypted control identity containing only Telegram user ID and access hash for each
+  active quarantine or suppression.
 - Raw user IDs, usernames, profile names, and message content are not stored in plaintext.
-- The owner may enter a raw Telegram user ID in the dashboard to release a suppression after its
-  evidence expires. The value is HMAC-derived in memory, is not persisted, and is accepted only when
-  it matches an existing `suppressed` sender state.
+- The control identity uses keys domain-separated from message-review references. It remains only
+  while the restriction remains active and is erased on allowance, revocation, or temporary
+  suppression release. Evidence expiry does not erase this operator control path.
+- The owner may enter a raw Telegram user ID only to recover a legacy restriction without a control
+  identity. The value is HMAC-derived in memory, is not persisted, and is accepted only when it
+  matches an existing quarantined or suppressed sender state.
 
 ### Encrypted review content
 

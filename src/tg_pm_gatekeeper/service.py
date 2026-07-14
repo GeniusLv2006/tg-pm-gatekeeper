@@ -248,9 +248,29 @@ class GatekeeperService:
         self.challenge_factory = challenge_factory
         self.clock = clock
         self.sender_locks = SenderLockPool()
+        self._backfill_restriction_references()
 
     def sender_lock(self, sender_key: str) -> asyncio.Lock:
         return self.sender_locks.lock(sender_key)
+
+    def restriction_reference(self, review_reference: bytes | None) -> bytes | None:
+        if review_reference is None:
+            return None
+        try:
+            user_id, access_hash, _ = self.protector.open_review_reference(
+                review_reference
+            )
+            return self.protector.seal_restriction_reference(user_id, access_hash)
+        except ValueError:
+            return None
+
+    def _backfill_restriction_references(self) -> None:
+        for sender_key, review_reference in self.store.legacy_restriction_references():
+            restriction_reference = self.restriction_reference(review_reference)
+            if restriction_reference is not None:
+                self.store.save_restriction_reference(
+                    sender_key, restriction_reference
+                )
 
     async def handle(self, message: IncomingMessage, actions: MessageActions) -> str:
         sender_key = self.protector.sender_key(message.sender_id)
@@ -535,6 +555,9 @@ class GatekeeperService:
             "critical_rule",
             until=None,
             reference=message.review_reference,
+            restriction_reference=self.restriction_reference(
+                message.review_reference
+            ),
             now=now,
         )
         self._activate_enforcement_review(
@@ -691,7 +714,13 @@ class GatekeeperService:
         except Exception:
             archived = False
         if archived:
-            self.store.quarantine(sender_key, now)
+            self.store.quarantine(
+                sender_key,
+                now,
+                restriction_reference=self.restriction_reference(
+                    message.review_reference
+                ),
+            )
             self._activate_enforcement_review(
                 sender_key,
                 "challenge_unavailable",
@@ -857,7 +886,13 @@ class GatekeeperService:
                 ),
             )
             if warning_message_id is None:
-                self.store.quarantine(sender_key, now)
+                self.store.quarantine(
+                    sender_key,
+                    now,
+                    restriction_reference=self.restriction_reference(
+                        message.review_reference
+                    ),
+                )
                 self._activate_enforcement_review(
                     sender_key,
                     "warning_failed",
@@ -893,6 +928,7 @@ class GatekeeperService:
                     "attempts_exhausted",
                     until=now + VERIFICATION_FAILED_SUPPRESSION_SECONDS,
                     reference=reference,
+                    restriction_reference=self.restriction_reference(reference),
                     now=now,
                 )
                 self._activate_enforcement_review(
@@ -1039,7 +1075,11 @@ class GatekeeperService:
                         now + self.pending_review_retention_days * 86400,
                         now,
                     )
-                self.store.quarantine(sender_key, now)
+                self.store.quarantine(
+                    sender_key,
+                    now,
+                    restriction_reference=self.restriction_reference(reference),
+                )
                 self._activate_enforcement_review(
                     sender_key,
                     "timeout_notice_failed",
@@ -1098,6 +1138,9 @@ class GatekeeperService:
                 expires_at,
                 timestamp,
                 suppression_seconds=VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
+                restriction_reference=self.restriction_reference(
+                    state.challenge_action_reference
+                ),
             )
             if expired:
                 if sender_key != self.test_sender_key:

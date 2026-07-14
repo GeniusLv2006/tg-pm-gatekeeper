@@ -43,7 +43,7 @@ python3 -m venv .venv
 The initializer signs in to Telegram and creates five files:
 
 - `telegram.session.secret`: authorization for the Telegram account;
-- `hmac.key`: protects local sender identifiers and review references;
+- `hmac.key`: protects local sender identifiers, review references, and restriction control identities;
 - `review.key`: encrypts Active Case snapshots;
 - `config.env`: the service configuration; and
 - `deny-domains.txt`: your optional local domain denylist.
@@ -194,25 +194,26 @@ clears the local review without changing the current sender trust or restriction
 
 ### Active Cases
 
-The summary counts all current quarantines and suppressions. The table contains only cases that still
-have an unexpired encrypted snapshot. **Allow Now** restores saved dialog settings when available;
-HR cases with `critical` severity and no saved settings are moved to the main folder and notifications
-are enabled. The second action records that the restriction was left unchanged and does not extend a
-temporary suppression.
+The table contains every current quarantine and suppression. A separate encrypted control identity
+keeps each restriction identifiable and reversible for its full lifetime, even after its evidence
+expires. **Allow Now** restores saved dialog settings when available; cases with no saved settings
+are moved to the main folder and notifications are enabled. The second action records that the
+restriction was left unchanged and does not extend a temporary suppression.
 
 The detail page separates **Restriction Cause**, **Severity**, and **Matched HR Rules**. HR identifies
 the deterministic rule family; `critical` is one severity within that family, not another rule name.
 
-Snapshots last at most 30 days. Successful verification, rollback, or manual allowance removes
-them sooner. A temporary suppression is released when that sender next messages after expiry; the
-service does not wake up solely to remove it.
+Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance
+removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but
+does not remove the row, identity, or **Allow Now** action. The minimal encrypted control identity is
+removed only when the restriction ends. A temporary suppression is released when that sender next
+messages after expiry; the service does not wake up solely to remove it.
 
-If the encrypted snapshot has expired or was never captured, enter the sender's numeric Telegram
-User ID in **Expired Evidence Recovery**. Gatekeeper uses it only to derive the existing HMAC sender
-key and does not store the raw ID. **Allow Future Messages Without Restore** changes a matching
-`suppressed` state to `allowed` and cancels pending deletion jobs. It cannot restore an expired
-Telegram peer reference, so it discards rather than applies any saved folder or notification
-snapshot. Use the case-specific **Allow Now** action whenever it is still available.
+**Legacy Recovery** is only for restrictions created before control identities were retained and
+which cannot be backfilled from an older encrypted reference. Entering a numeric Telegram User ID
+HMAC-derives the existing sender key without storing the ID. A matching quarantine or suppression is
+allowed and pending deletion jobs are cancelled, but Telegram settings cannot be restored without a
+control identity.
 
 ### Tunnel options
 
@@ -353,6 +354,8 @@ quota, and can lose its entire test dialog after exhausted attempts. Remove the 
 | Dashboard token or socket is missing | Confirm the container is healthy, then inspect `/var/lib/tg-pm-gatekeeper/review.sock` and `review.access-token`. |
 | Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
 | Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Resolve and Cancel Pending Jobs** if the sender decision no longer needs the message. |
+| Active Case says evidence is unavailable | The evidence retention window ended; the restriction remains listed and **Allow Now** still uses its encrypted control identity. |
+| Active Case says identity is unavailable | Use **Legacy Recovery** with the numeric Telegram User ID; only pre-control-identity states should need this. |
 | Mode is still `monitor` after an update | This is expected; mode is stored in the database. Switch explicitly only after checking status. |
 
 If the problem involves a sender action, preserve the current status and logs before changing policy
