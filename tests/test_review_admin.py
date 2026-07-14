@@ -548,6 +548,33 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "allowed")
         self.assertIsNone(self.store.sender(sender_key).restriction_reference)
 
+    async def test_invalid_evidence_does_not_block_allow_action(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=self.protector.seal_review_reference(
+                123456789, -987654321, 42
+            ),
+            envelope=b"invalid-encrypted-evidence",
+            reason="critical_rule",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+
+        item = self.store.active_restriction(sender_key)
+        status, _, detail = await self.server._show_enforcement(item)
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"failed authentication", detail)
+        self.assertIn(b"Allow Now", detail)
+
     async def test_active_enforcement_disables_allow_without_identity(self) -> None:
         sender_key = self.protector.sender_key(987654321)
         envelope = self.review_protector.seal(
@@ -655,6 +682,29 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 409)
         self.assertIn(b"Restricted Sender Not Found", response)
+
+    async def test_release_by_user_id_rejects_identifiable_restriction(self) -> None:
+        user_id = 771_234_571
+        sender_key = self.protector.sender_key(user_id)
+        restriction_reference = self.protector.seal_restriction_reference(
+            user_id, 123456789
+        )
+        self.store.quarantine(
+            sender_key, restriction_reference=restriction_reference
+        )
+        body = urlencode(
+            {"token": self.server._csrf_token, "user_id": str(user_id)}
+        ).encode()
+
+        status, _, response = await self.server._dispatch(
+            "POST", "/cases/release", body
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn(b"Use Active Case Allow Now", response)
+        state = self.store.sender(sender_key)
+        self.assertEqual(state.status, "quarantined")
+        self.assertEqual(state.restriction_reference, restriction_reference)
 
     async def test_release_by_user_id_rejects_invalid_input(self) -> None:
         for value in ("not-a-number", "0", "-1", "+1", "１"):

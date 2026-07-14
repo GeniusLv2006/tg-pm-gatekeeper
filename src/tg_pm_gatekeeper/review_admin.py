@@ -449,8 +449,11 @@ class ReviewAdminServer:
             return 400, {}, self._page("Invalid Telegram User ID")
         sender_key = self.protector.sender_key(user_id)
         async with self.service.sender_lock(sender_key):
-            if self.store.sender(sender_key).status not in {"quarantined", "suppressed"}:
+            state = self.store.sender(sender_key)
+            if state.status not in {"quarantined", "suppressed"}:
                 return 409, {}, self._page("Restricted Sender Not Found")
+            if state.restriction_reference is not None:
+                return 409, {}, self._page("Use Active Case Allow Now")
             self.store.allow(sender_key)
             self.store.clear_dialog_snapshot(sender_key)
             self.cancel_timeout(sender_key)
@@ -538,13 +541,21 @@ class ReviewAdminServer:
         self, item: ActiveRestriction
     ) -> tuple[int, dict[str, str], bytes]:
         payload: dict[str, object] = {}
+        evidence_available = False
+        unavailable_note = "No message evidence is retained."
         if item.envelope is not None:
             if self.service.active_case_protector is None:
-                return 500, {}, self._page("Encrypted Review Content Is Unavailable")
-            try:
-                payload = self.service.active_case_protector.open(item.envelope)
-            except ValueError:
-                return 500, {}, self._page("Encrypted Review Content Is Unavailable")
+                unavailable_note = "Encrypted evidence cannot be opened by this runtime."
+            else:
+                try:
+                    payload = self.service.active_case_protector.open(item.envelope)
+                    evidence_available = True
+                except ValueError:
+                    unavailable_note = "Encrypted evidence failed authentication and was not shown."
+                    LOG.error(
+                        "active_case_evidence_invalid",
+                        extra={"sender_key": item.sender_key},
+                    )
         identity = "Identity unavailable"
         telegram_link = ""
         user_id: int | None = None
@@ -574,7 +585,7 @@ class ReviewAdminServer:
         )
         evidence_content = (
             self._review_sections(payload)
-            if item.envelope is not None
+            if evidence_available
             else (
                 "<div class='empty-state'><strong>Evidence expired or unavailable.</strong> "
                 "The encrypted control identity is retained only so this restriction remains "
@@ -590,13 +601,13 @@ class ReviewAdminServer:
         )
         evidence_heading = (
             "Decrypted Local Evidence"
-            if item.envelope is not None
+            if evidence_available
             else "Restriction Control"
         )
         evidence_note = (
             "Encrypted at rest; decrypted only for this owner-only view."
-            if item.envelope is not None
-            else "No message evidence is retained; only the encrypted control identity remains."
+            if evidence_available
+            else unavailable_note + " Only the encrypted control identity remains available."
         )
         allow_action = (
             self._action_form(
