@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import stat
 import time
@@ -100,7 +101,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"transient-canary", response)
         self.assertIn(b"Telegram ID", response)
         self.assertIn(b"123456789", response)
-        self.assertIn(b'http-equiv="refresh" content="30"', response)
+        self.assertNotIn(b'http-equiv="refresh"', response)
+        self.assertIn(b'data-live-refresh="notice"', response)
+        self.assertIn(b"Actions are paused to prevent a stale decision", response)
         self.assertIn(b"Connected", response)
         database = (Path(self.temp.name) / "state.sqlite3").read_bytes()
         self.assertNotIn(b"transient-canary", database)
@@ -219,16 +222,65 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                     self.store.review_item(self.review_id).status, "pending"
                 )
 
-    async def test_queue_page_exposes_fresh_connection_feedback(self) -> None:
+    async def test_queue_page_uses_in_place_connection_feedback(self) -> None:
         response = await self.server._review_queue_page()
-        self.assertIn(b'http-equiv="refresh" content="10"', response)
+        self.assertNotIn(b'http-equiv="refresh"', response)
+        self.assertIn(b'data-live-refresh="replace"', response)
+        self.assertIn(b'<script src="/dashboard.js" defer></script>', response)
         self.assertIn(b"Connected", response)
-        self.assertIn(b"Updated ", response)
-        self.assertIn(b"checks the connection every 10 seconds", response)
+        self.assertIn(b"Checked ", response)
+        self.assertIn(b"checked quietly while this tab is visible", response)
+        self.assertIn(b"updates in place only when review state changes", response)
         self.assertIn(b"Test Sender (@testsender)", response)
         self.assertIn(b"ID 123456789", response)
         self.assertIn(b"Review Reason", response)
         self.assertNotIn(b">Simulation<", response)
+
+    async def test_masthead_places_page_indicator_before_connection(self) -> None:
+        response = await self.server._enforcement_index_page()
+        section = response.index(b"data-section-indicator")
+        connection = response.index(b"data-connection data-state")
+        self.assertLess(section, connection)
+
+    async def test_dashboard_script_pauses_hidden_tabs_and_replaces_regions(self) -> None:
+        status, headers, response = await self.server._dispatch(
+            "GET", "/dashboard.js", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+        self.assertIn(b"document.visibilityState", response)
+        self.assertIn(b"region.replaceWith(replacement)", response)
+
+    async def test_status_version_changes_without_exposing_review_content(self) -> None:
+        status, headers, response = await self.server._dispatch(
+            "GET", "/dashboard/status?path=%2Freview", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertNotIn(b"transient-canary", response)
+        first = response
+
+        self.store.enqueue_review(
+            "sender",
+            self.protector.seal_review_reference(123456789, -987654321, 43),
+            "would_quarantine",
+            '[]',
+            '{}',
+            int(time.time()) + 700,
+            101,
+        )
+        _, _, second = await self.server._dispatch(
+            "GET", "/dashboard/status?path=%2Freview", b""
+        )
+        self.assertNotEqual(first, second)
+
+    async def test_status_endpoint_rejects_unknown_page(self) -> None:
+        status, headers, response = await self.server._dispatch(
+            "GET", "/dashboard/status?path=%2Funknown", b""
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(response, b"{}")
 
     async def test_queue_labels_protect_mode_exception_as_real_review_reason(
         self,
@@ -296,6 +348,20 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 stat.S_IMODE(self.server.socket_path.stat().st_mode), 0o600
             )
+            reader, writer = await asyncio.open_unix_connection(self.server.socket_path)
+            writer.write(
+                (
+                    "GET /dashboard.js HTTP/1.1\r\n"
+                    "Host: 127.0.0.1:8765\r\n"
+                    f"Cookie: gatekeeper_session={self.server._session_token}\r\n\r\n"
+                ).encode("ascii")
+            )
+            await writer.drain()
+            response = await reader.read()
+            writer.close()
+            await writer.wait_closed()
+            self.assertIn(b"Content-Type: text/javascript; charset=utf-8", response)
+            self.assertIn(b"script-src 'self'; connect-src 'self'", response)
         finally:
             await self.server.stop()
 
@@ -306,6 +372,17 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 404)
         self.assertIn(b"Dashboard Session Missing", response)
         self.assertNotIn(b"Return to Dashboard", response)
+        for protected_path in (
+            "/dashboard.js",
+            "/dashboard/status?path=%2Freview",
+        ):
+            protected_status, _, _ = await self.server._dispatch(
+                "GET",
+                protected_path,
+                b"",
+                request_headers={"host": "127.0.0.1:8765"},
+            )
+            self.assertEqual(protected_status, 404)
         login_token = self.server._access_token
         status, headers, _ = await self.server._dispatch(
             "GET",
@@ -330,6 +407,20 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             request_headers={"host": "127.0.0.1:8765", "cookie": cookie},
         )
         self.assertEqual(status, 200)
+        for protected_path in (
+            "/dashboard.js",
+            "/dashboard/status?path=%2Freview",
+        ):
+            protected_status, _, _ = await self.server._dispatch(
+                "GET",
+                protected_path,
+                b"",
+                request_headers={
+                    "host": "127.0.0.1:8765",
+                    "cookie": cookie,
+                },
+            )
+            self.assertEqual(protected_status, 200)
 
     async def test_legacy_enforcement_routes_redirect(self) -> None:
         status, headers, _ = await self.server._dispatch("GET", "/enforcement", b"")

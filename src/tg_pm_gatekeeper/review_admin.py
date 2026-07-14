@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -31,6 +32,129 @@ IDENTITY_CACHE_SECONDS = 5 * 60
 IDENTITY_FAILURE_CACHE_SECONDS = 30
 IDENTITY_BATCH_SIZE = 100
 IDENTITY_FETCH_TIMEOUT_SECONDS = 5
+DASHBOARD_POLL_SECONDS = 15
+
+
+DASHBOARD_SCRIPT = r"""(() => {
+  const root = document.body;
+  const mode = root.dataset.liveRefresh;
+  let version = root.dataset.pageVersion;
+  let timer;
+  let checking = false;
+
+  const connection = document.querySelector('[data-connection]');
+  const connectionLabel = document.querySelector('[data-connection-label]');
+  const checkedAt = document.querySelector('[data-checked-at]');
+  const refreshButton = document.querySelector('[data-dashboard-refresh]');
+  const changeNotice = document.querySelector('[data-change-notice]');
+
+  if (!mode || !version || !connection || !connectionLabel || !checkedAt) return;
+
+  const setConnection = (state, label, timestamp) => {
+    connection.dataset.state = state;
+    connectionLabel.textContent = label;
+    if (timestamp) checkedAt.textContent = `Checked ${timestamp}`;
+  };
+
+  const replaceLiveRegions = async () => {
+    const response = await fetch(location.pathname, {
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: {'X-Dashboard-Refresh': '1'},
+    });
+    if (!response.ok) throw new Error(`page refresh failed: ${response.status}`);
+    const nextDocument = new DOMParser().parseFromString(await response.text(), 'text/html');
+    const nextRegions = new Map(
+      Array.from(nextDocument.querySelectorAll('[data-live-region]')).map(
+        (region) => [region.dataset.liveRegion, region]
+      )
+    );
+    document.querySelectorAll('[data-live-region]').forEach((region) => {
+      const replacement = nextRegions.get(region.dataset.liveRegion);
+      if (!replacement) return;
+      region.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach((control) => {
+        const key = control.id || control.name;
+        if (!key) return;
+        const nextControl = Array.from(
+          replacement.querySelectorAll('input:not([type="hidden"]), textarea, select')
+        ).find((candidate) => (candidate.id || candidate.name) === key);
+        if (nextControl) nextControl.value = control.value;
+      });
+      const active = region.contains(document.activeElement) ? document.activeElement : null;
+      const activeKey = active && (active.id || active.name);
+      region.replaceWith(replacement);
+      if (activeKey) {
+        const nextActive = Array.from(replacement.querySelectorAll('input, textarea, select, button, a'))
+          .find((candidate) => (candidate.id || candidate.name) === activeKey);
+        nextActive?.focus({preventScroll: true});
+      }
+    });
+    const currentSection = document.querySelector('[data-section-indicator]');
+    const nextSection = nextDocument.querySelector('[data-section-indicator]');
+    if (currentSection && nextSection) currentSection.replaceWith(nextSection);
+  };
+
+  const markChanged = () => {
+    if (!changeNotice) return;
+    changeNotice.hidden = false;
+    document.querySelectorAll('form button').forEach((button) => {
+      button.disabled = true;
+    });
+  };
+
+  const check = async ({force = false} = {}) => {
+    if (checking || (!force && document.visibilityState !== 'visible')) return;
+    checking = true;
+    if (refreshButton) refreshButton.disabled = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 4000);
+    try {
+      const response = await fetch(
+        `/dashboard/status?path=${encodeURIComponent(location.pathname)}`,
+        {cache: 'no-store', credentials: 'same-origin', signal: controller.signal}
+      );
+      if (!response.ok) throw new Error(`status check failed: ${response.status}`);
+      const status = await response.json();
+      setConnection('connected', 'Connected', status.checked_at);
+      if (force || status.version !== version) {
+        if (mode === 'replace') {
+          await replaceLiveRegions();
+          version = status.version;
+          root.dataset.pageVersion = version;
+        } else if (status.version !== version) {
+          markChanged();
+          version = status.version;
+          root.dataset.pageVersion = version;
+        }
+      }
+    } catch (_error) {
+      setConnection('disconnected', 'Disconnected', 'retrying');
+    } finally {
+      window.clearTimeout(timeout);
+      checking = false;
+      if (refreshButton) refreshButton.disabled = false;
+    }
+  };
+
+  const schedule = () => {
+    window.clearInterval(timer);
+    if (document.visibilityState === 'visible') {
+      check();
+      timer = window.setInterval(check, Number(root.dataset.pollSeconds) * 1000);
+    }
+  };
+
+  refreshButton?.addEventListener('click', () => {
+    if (mode === 'notice' && changeNotice && !changeNotice.hidden) {
+      location.reload();
+      return;
+    }
+    check({force: true});
+  });
+  document.addEventListener('visibilitychange', schedule);
+  schedule();
+})();
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +243,8 @@ class ReviewAdminServer:
             "Connection": "close",
             "Cache-Control": "no-store",
             "Content-Security-Policy": (
-                "default-src 'none'; style-src 'unsafe-inline'; "
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; "
+                "connect-src 'self'; "
                 "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
             ),
             "Referrer-Policy": "no-referrer",
@@ -201,6 +326,29 @@ class ReviewAdminServer:
                 self._cookie_value(cookie, "gatekeeper_session"), self._session_token
             ):
                 return 404, {}, self._page("Dashboard Session Missing")
+        if path == "/dashboard.js":
+            if method != "GET":
+                return 405, {"Allow": "GET"}, b""
+            return (
+                200,
+                {"Content-Type": "text/javascript; charset=utf-8"},
+                DASHBOARD_SCRIPT.encode("utf-8"),
+            )
+        if path == "/dashboard/status":
+            if method != "GET":
+                return 405, {"Allow": "GET"}, b""
+            page_path = parse_qs(parsed.query).get("path", [""])[0]
+            version = self._page_version(page_path)
+            if version is None:
+                return 404, {"Content-Type": "application/json"}, b"{}"
+            payload = json.dumps(
+                {
+                    "version": version,
+                    "checked_at": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return 200, {"Content-Type": "application/json"}, payload
         if path == "/" and method == "GET":
             return 200, {}, await self._dashboard_page()
         if path == "/review" and method == "GET":
@@ -293,6 +441,79 @@ class ReviewAdminServer:
                 return 400, {}, self._page("Unknown Action")
             self._identity_cache.pop(item.sender_key, None)
         return 303, {"Location": "/review"}, b""
+
+    def _page_version(self, path: str) -> str | None:
+        now = int(time.time())
+        payload: object
+        if path == "/":
+            active = self.store.active_restrictions(now=now)
+            reviews = self.store.review_items(now=now)
+            payload = (
+                self.store.get_mode(),
+                sorted(self.store.enforcement_statistics(now=now).items()),
+                [self._active_version(item, now) for item in active],
+                [(item.id, item.updated_at, item.message_count) for item in reviews],
+            )
+        elif path == "/review":
+            payload = [
+                (
+                    item.id,
+                    item.updated_at,
+                    item.message_count,
+                    item.classification,
+                    item.rule_codes,
+                )
+                for item in self.store.review_items(now=now)
+            ]
+        elif path == "/cases":
+            payload = [
+                self._active_version(item, now)
+                for item in self.store.active_restrictions(now=now)
+            ]
+        elif path.startswith("/review/"):
+            try:
+                item = self.store.review_item(int(path.removeprefix("/review/")))
+            except ValueError:
+                return None
+            payload = (
+                None
+                if item is None
+                else (
+                    item.id,
+                    item.status,
+                    item.updated_at,
+                    item.message_count,
+                    item.reference is not None,
+                    item.expires_at > now,
+                )
+            )
+        elif path.startswith("/cases/"):
+            sender_key = path.removeprefix("/cases/")
+            if not sender_key or "/" in sender_key:
+                return None
+            item = self.store.active_restriction(sender_key, now=now)
+            payload = None if item is None else self._active_version(item, now)
+        else:
+            return None
+        serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(serialized.encode("ascii")).hexdigest()[:20]
+
+    @staticmethod
+    def _active_version(
+        item: ActiveRestriction, now: int | None = None
+    ) -> tuple[object, ...]:
+        timestamp = int(time.time()) if now is None else now
+        return (
+            item.sender_key,
+            item.status,
+            item.reason,
+            item.suppressed_until,
+            item.updated_at,
+            item.envelope is not None,
+            item.evidence_expires_at,
+            item.reference is not None,
+            item.suppressed_until is not None and item.suppressed_until <= timestamp,
+        )
 
     def _write_access_token(self) -> None:
         temporary = self.access_token_path.with_suffix(".access-token.tmp")
@@ -507,7 +728,7 @@ class ReviewAdminServer:
         content = (
             self._masthead("Active Cases", f"{len(items)} Restrictions")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
-            + "<main><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
+            + "<main data-live-region='active-cases'><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
             + "<h2>Review Active Restrictions</h2>"
             + "<p>Every restriction remains manageable for its full lifetime. Encrypted evidence is retained separately for short-term review. Telegram block is not used.</p>"
             + "<dl class='metric-grid'>"
@@ -517,7 +738,7 @@ class ReviewAdminServer:
             + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></section>"
             + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Evidence</th><th>Updated</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div></main>"
-            + "<section class='decision-panel'><p class='eyebrow'>Legacy Recovery</p>"
+            + "<section class='decision-panel' data-live-region='legacy-recovery'><p class='eyebrow'>Legacy Recovery</p>"
             + "<h2>Allow an unidentified restricted sender by Telegram User ID</h2>"
             + "<p>Use this only for a legacy restriction created before encrypted control "
             + "identities were retained. This removes the "
@@ -534,7 +755,11 @@ class ReviewAdminServer:
             + "</form></section>"
         )
         return self._page(
-            content, raw=True, page_title="Active Cases"
+            content,
+            raw=True,
+            page_title="Active Cases",
+            live_refresh="replace",
+            page_version=self._page_version("/cases"),
         )
 
     async def _show_enforcement(
@@ -639,6 +864,7 @@ class ReviewAdminServer:
         content = f"""
         {self._masthead("Active Cases", self._human_label(item.status))}
         <p class="back"><a href="/cases">← Active Cases</a></p>
+        {self._change_notice()}
         <main class="review-grid"><section class="message-panel">
           <p class="eyebrow">{evidence_heading}</p>
           <h2>{html.escape(identity)}</h2>
@@ -660,7 +886,11 @@ class ReviewAdminServer:
             {self._action_form(item.sender_key, "keep", keep_label, base="cases")}
           </div></section>"""
         return 200, {}, self._page(
-            content, raw=True, page_title=f"Active Case · {self._human_label(item.status)}"
+            content,
+            raw=True,
+            page_title=f"Active Case · {self._human_label(item.status)}",
+            live_refresh="notice",
+            page_version=self._page_version(f"/cases/{item.sender_key}"),
         )
 
     def _peer_from_item(self, item: ReviewItem) -> types.InputPeerUser:
@@ -777,6 +1007,7 @@ class ReviewAdminServer:
             content = f"""
             {self._masthead("Review Item", f"Review #{item.id}")}
             <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
+            {self._change_notice()}
             <main class="review-grid">
               <section class="message-panel">
                 <p class="eyebrow">Telegram Message Unavailable</p>
@@ -800,12 +1031,17 @@ class ReviewAdminServer:
             </section>
             """
             return 200, {}, self._page(
-                content, raw=True, page_title=f"Review #{item.id}"
+                content,
+                raw=True,
+                page_title=f"Review #{item.id}",
+                live_refresh="notice",
+                page_version=self._page_version(f"/review/{item.id}"),
             )
         text = message.message or f"[Non-text message: {type(message.media).__name__}]"
         content = f"""
         {self._masthead("Review Item", f"Review #{item.id}")}
         <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
+        {self._change_notice()}
         <main class="review-grid">
           <section class="message-panel">
             <p class="eyebrow">Fetched from Telegram · Not Stored Locally</p>
@@ -835,8 +1071,9 @@ class ReviewAdminServer:
         return 200, {}, self._page(
             content,
             raw=True,
-            refresh_seconds=30,
             page_title=f"Review #{item.id}",
+            live_refresh="notice",
+            page_version=self._page_version(f"/review/{item.id}"),
         )
 
     async def _archive_and_mute(
@@ -926,7 +1163,7 @@ class ReviewAdminServer:
         mode = self.store.get_mode()
         content = (
             self._masthead("Operations Dashboard", mode.title())
-            + "<main><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
+            + "<main data-live-region='operations'><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
             "<h2>Operations Dashboard</h2>"
             "<p>Use Active Cases for recovery after a possible false positive. "
             "Pending Reviews cover monitor-mode simulations and protect-mode exceptions.</p>"
@@ -943,8 +1180,9 @@ class ReviewAdminServer:
         return self._page(
             content,
             raw=True,
-            refresh_seconds=10,
             page_title="Operations Dashboard",
+            live_refresh="replace",
+            page_version=self._page_version("/"),
         )
 
     async def _review_queue_page(self) -> bytes:
@@ -964,20 +1202,21 @@ class ReviewAdminServer:
         return self._page(
             self._masthead("Pending Reviews", f"{len(items)} Pending")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
-            + "<main><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
+            + "<main data-live-region='pending-reviews'><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
             "<h2>Review Pending Senders</h2>"
             "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
             "Message content is fetched only when a review item is opened.</p>"
             "<p>Deleting a conversation in Telegram does not remove its local pending review. "
             "Open the row and resolve it when the referenced message is unavailable.</p>"
-            "<p class='refresh-note'>This page checks the connection every 10 seconds and shows "
-            "an error when the SSH tunnel is unavailable.</p></section>"
+            "<p class='refresh-note'>Connection health is checked quietly while this tab is visible. "
+            "The table updates in place only when review state changes.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Review Reason</th>"
             "<th>Matched HR Rules</th><th>Messages</th>"
             f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
             raw=True,
-            refresh_seconds=10,
             page_title="Pending Reviews",
+            live_refresh="replace",
+            page_version=self._page_version("/review"),
         )
 
     async def _live_identities(
@@ -1130,10 +1369,23 @@ class ReviewAdminServer:
         return (
             "<header class='masthead'><div><span class='mark'>TG</span>"
             "<span class='product'>PM Gatekeeper</span></div>"
-            "<div class='connection'><span class='live'><i></i>Connected</span>"
-            f"<small>Updated {checked_at}</small></div>"
-            f"<div class='section'>{html.escape(section)}<span>{html.escape(status)}</span></div>"
+            f"<div class='section' data-section-indicator>{html.escape(section)}"
+            f"<span>{html.escape(status)}</span></div>"
+            "<div class='connection' data-connection data-state='connected'>"
+            "<div><span class='live'><i></i><span data-connection-label>Connected</span></span>"
+            f"<small data-checked-at>Checked {checked_at}</small></div>"
+            "<button class='refresh-control' type='button' data-dashboard-refresh "
+            "aria-label='Check now' title='Check now'>↻</button></div>"
             "</header>"
+        )
+
+    @staticmethod
+    def _change_notice() -> str:
+        return (
+            "<section class='live-change-notice' data-change-notice hidden>"
+            "<strong>This record changed while you were viewing it.</strong> "
+            "Actions are paused to prevent a stale decision. Check now to load the current state."
+            "</section>"
         )
 
     def _action_form(
@@ -1226,8 +1478,9 @@ class ReviewAdminServer:
         content: str,
         *,
         raw: bool = False,
-        refresh_seconds: int | None = None,
         page_title: str | None = None,
+        live_refresh: str | None = None,
+        page_version: str | None = None,
     ) -> bytes:
         if raw:
             body = content
@@ -1265,17 +1518,22 @@ class ReviewAdminServer:
                 + return_action
                 + "</div></section></main>"
             )
-        refresh = (
-            f'<meta http-equiv="refresh" content="{refresh_seconds}">'
-            if refresh_seconds is not None
-            else ""
-        )
         document_title = page_title or (
             "Gatekeeper Dashboard" if raw else f"Gatekeeper · {content}"
         )
+        live_attributes = (
+            f' data-live-refresh="{html.escape(live_refresh)}"'
+            f' data-page-version="{html.escape(page_version)}"'
+            f' data-poll-seconds="{DASHBOARD_POLL_SECONDS}"'
+            if raw and live_refresh and page_version
+            else ""
+        )
+        dashboard_script = (
+            '<script src="/dashboard.js" defer></script>' if live_attributes else ""
+        )
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-{refresh}<title>{html.escape(document_title)}</title><style>
+<title>{html.escape(document_title)}</title><style>
 :root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#d84a28;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}}
 *{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}
@@ -1284,7 +1542,7 @@ body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;b
 .mark{{display:inline-grid;place-items:center;width:2.5rem;height:2.5rem;margin-right:.8rem;color:var(--paper);background:var(--ink);font-weight:800;letter-spacing:-.08em}}
 .product{{font-size:1.15rem;font-weight:750;letter-spacing:-.01em}}.section{{text-transform:uppercase;font:700 .72rem/1.4 var(--font-data);letter-spacing:.08em;text-align:right;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .section span{{display:block;color:var(--signal);font-weight:800;margin-top:.25rem}}main{{padding:3rem 1.25rem 5rem}}
-.connection{{padding:.5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font:400 .65rem/1.4 var(--font-data);letter-spacing:.03em;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}
+.connection{{display:flex;align-items:center;gap:.7rem;padding:.5rem .55rem .5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font:400 .65rem/1.4 var(--font-data);letter-spacing:.03em;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}.connection[data-state="disconnected"] .live{{color:var(--signal)}}.connection[data-state="disconnected"] .live i{{background:var(--signal);box-shadow:0 0 0 4px #f7d8cf;animation:none}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}.refresh-control{{display:none;width:2rem;min-height:2rem;padding:0;border-color:var(--line);box-shadow:none;font:800 1rem/1 var(--font-data)}}body[data-live-refresh] .refresh-control{{display:inline-flex}}.refresh-control:hover{{transform:none;box-shadow:none;border-color:var(--ink)}}.refresh-control:disabled{{opacity:.45}}
 .queue-intro{{max-width:none;margin-bottom:2.5rem}}h1,h2{{font-family:var(--font-ui);line-height:1.12;letter-spacing:-.025em}}.queue-intro h2{{font-size:clamp(1.85rem,3.6vw,3rem);font-weight:720;margin:.55rem 0 1rem}}
 .queue-intro p{{max-width:none;color:var(--muted)}}.refresh-note{{margin-top:1.2rem;padding-left:1rem;border-left:3px solid var(--safe);font-size:.78rem}}.eyebrow{{margin:0;text-transform:uppercase;letter-spacing:.13em;font-size:.7rem;font-weight:800;color:var(--signal)}}
 .metric-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin:2rem 0 0}}.metric-grid>div{{min-width:0;padding:1rem;border:1px solid var(--line);background:rgba(255,253,247,.72)}}.metric-grid dd{{margin:.45rem 0 0}}.data-value{{font:700 1.15rem/1.35 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
@@ -1298,10 +1556,10 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-data);fo
 .telegram-link{{display:inline-block;max-width:100%;font-weight:800;overflow-wrap:anywhere}}dt{{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}dd{{margin:.2rem 0 1.2rem;overflow-wrap:anywhere}}.badge{{display:inline-block;max-width:100%;padding:.2rem .45rem;background:#f8e9d8;border:1px solid var(--signal);color:#9d3118;font-weight:800;overflow-wrap:anywhere}}
 details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:pointer;font-weight:800}}details pre{{font-size:.75rem;color:var(--muted)}}.decision-panel{{position:relative;width:calc(100% - 2.5rem);max-width:1080px;margin:0 auto 4rem;border-top:5px solid var(--ink)}}.decision-panel h2{{font-size:1.7rem;margin-bottom:0}}
 .actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
-.actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}
+.actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}.live-change-notice{{position:relative;max-width:1080px;margin:1.25rem auto 0;padding:1rem 1.25rem;border:1px solid var(--signal);border-left:5px solid var(--signal);background:#f8e9d8;color:var(--ink)}}.live-change-notice[hidden]{{display:none}}
 .actions.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .actions.one{{grid-template-columns:minmax(0,24rem)}}.notice,.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
 .manual-release{{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(16rem,1.4fr);gap:.75rem;align-items:end;margin-top:1.5rem}}.manual-release label{{grid-column:1/-1;font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}.manual-release input{{min-height:3.25rem;width:100%;padding:.8rem 1rem;border:1px solid var(--ink);background:var(--panel);color:var(--ink);font:700 .9rem/1.35 var(--font-data)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{width:100%;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
 @media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid,.manual-release{{grid-template-columns:1fr}}}}
-</style></head><body>{body}</body></html>""".encode("utf-8")
+</style>{dashboard_script}</head><body{live_attributes}>{body}</body></html>""".encode("utf-8")
