@@ -142,7 +142,10 @@ scripts/dashboard-tunnel.sh "$DEPLOY_HOST"
 ```
 
 Keep the terminal open. Press Enter when prompted to open the one-time login link, or pass `-o` to
-open it immediately. `Ctrl+C` closes the tunnel.
+open it immediately. Login redirects to a random capability path and does not set an authentication
+cookie. Treat the entire resulting address as a secret and do not bookmark, share, or paste it into
+an untrusted page. Each successful login rotates the capability and invalidates the previous address.
+`Ctrl+C` closes the tunnel.
 
 ### 3. Send a safe test
 
@@ -175,18 +178,20 @@ Returning to `monitor` keeps message processing active but cancels non-test pend
 ## Dashboard and daily operation
 
 The dashboard has no public TCP listener. The tunnel helper connects local port `8765` to the
-owner-only Unix socket on the server and reads a one-time access token. While the tab is visible, the
-browser performs an authenticated lightweight connection check every 15 seconds; checks pause while
-the tab is hidden. The indicator changes between **Connected** and **Disconnected**, and its
-**Checked** timestamp updates without reloading the page. Use the adjacent refresh control to check
-immediately.
+owner-only Unix socket on the server and reads a one-time access token. Login rotates that token and
+redirects to a process-local 256-bit capability path; the dashboard does not send an authentication
+cookie. While the tab is visible, the browser performs a capability-prefixed lightweight connection
+check every 15 seconds; checks pause while the tab is hidden. The indicator changes between
+**Connected** and **Disconnected**, and its **Checked** timestamp updates without reloading the page.
+Use the adjacent refresh control to check immediately.
 
 Overview and list pages update their marked regions in place only when the service reports a changed
 state fingerprint. Current form input and focus are preserved during those updates. Detail pages do
 not replace evidence or decision controls in the background: if the underlying review or restriction
 changes, the dashboard disables the stale actions and asks the operator to load the current state.
 Losing the SSH tunnel leaves the current page visible while the connection indicator reports the
-failure.
+failure. List pages retain their current page during refresh and show 50 rows per page in stable
+most-recently-updated order.
 
 ### Pending Reviews
 

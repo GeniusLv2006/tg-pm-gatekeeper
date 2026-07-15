@@ -112,11 +112,17 @@ The dashboard is available only through an SSH tunnel; Docker publishes no Gatek
 scripts/dashboard-tunnel.sh root@server.example
 ```
 
+The one-time login redirects to a random, process-local capability path instead of setting an
+authentication cookie. Treat the resulting address as a secret: do not bookmark, share, or paste it
+into an untrusted page. A new login rotates the path and immediately invalidates the previous one.
+
 It has two main areas:
 
 - **Active Cases**: review every current restriction; encrypted control identities remain available
   for the restriction lifetime, while message evidence is retained for up to 30 days;
 - **Pending Reviews**: resolve monitor-mode simulations and protect-mode exceptions.
+
+Both lists are ordered by most recent activity and paginated at 50 rows per page.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
 referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Archive and

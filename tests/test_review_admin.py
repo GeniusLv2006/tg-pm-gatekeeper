@@ -12,9 +12,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
-from telethon import functions
+from telethon import functions, types
 
 from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
+from tg_pm_gatekeeper.message_facts import facts_from_message
 from tg_pm_gatekeeper.review_admin import ReviewAdminServer
 from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
@@ -24,6 +25,7 @@ class FakeTelegramClient:
     def __init__(self) -> None:
         self.requests: list[object] = []
         self.entity_requests = 0
+        self.fail_entity_requests = False
         self.fail_next_mute = False
         self.message = SimpleNamespace(
             message="transient-canary", media=None, reply_to=None
@@ -34,6 +36,8 @@ class FakeTelegramClient:
 
     async def get_entity(self, peer):
         self.entity_requests += 1
+        if self.fail_entity_requests:
+            raise RuntimeError("identity lookup failed")
         sender = SimpleNamespace(
             first_name="Test", last_name="Sender", username="testsender"
         )
@@ -152,16 +156,17 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
-            f"/review/{self.review_id}",
+            f"/{self.server._capability_token}/review/{self.review_id}",
             body,
             request_headers={
                 "host": "127.0.0.1:8765",
                 "origin": "http://127.0.0.1:8765",
-                "cookie": f"gatekeeper_session={self.server._session_token}",
             },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/review")
+        self.assertEqual(
+            headers["Location"], f"/{self.server._capability_token}/review"
+        )
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_accepts_missing_origin(self) -> None:
@@ -171,15 +176,16 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
-            f"/review/{self.review_id}",
+            f"/{self.server._capability_token}/review/{self.review_id}",
             body,
             request_headers={
                 "host": "127.0.0.1:8765",
-                "cookie": f"gatekeeper_session={self.server._session_token}",
             },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/review")
+        self.assertEqual(
+            headers["Location"], f"/{self.server._capability_token}/review"
+        )
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_accepts_noncanonical_origin(self) -> None:
@@ -188,16 +194,17 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
-            f"/review/{self.review_id}",
+            f"/{self.server._capability_token}/review/{self.review_id}",
             body,
             request_headers={
                 "host": "127.0.0.1:8765",
                 "origin": "null",
-                "cookie": f"gatekeeper_session={self.server._session_token}",
             },
         )
         self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/review")
+        self.assertEqual(
+            headers["Location"], f"/{self.server._capability_token}/review"
+        )
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_rejects_invalid_csrf_for_any_origin(self) -> None:
@@ -206,14 +213,11 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(origin=origin):
                 status, _, response = await self.server._dispatch(
                     "POST",
-                    f"/review/{self.review_id}",
+                    f"/{self.server._capability_token}/review/{self.review_id}",
                     body,
                     request_headers={
                         "host": "127.0.0.1:8765",
                         "origin": origin,
-                        "cookie": (
-                            f"gatekeeper_session={self.server._session_token}"
-                        ),
                     },
                 )
                 self.assertEqual(status, 400)
@@ -351,9 +355,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             reader, writer = await asyncio.open_unix_connection(self.server.socket_path)
             writer.write(
                 (
-                    "GET /dashboard.js HTTP/1.1\r\n"
-                    "Host: 127.0.0.1:8765\r\n"
-                    f"Cookie: gatekeeper_session={self.server._session_token}\r\n\r\n"
+                    f"GET /{self.server._capability_token}/dashboard.js HTTP/1.1\r\n"
+                    "Host: 127.0.0.1:8765\r\n\r\n"
                 ).encode("ascii")
             )
             await writer.drain()
@@ -362,15 +365,18 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
             self.assertIn(b"Content-Type: text/javascript; charset=utf-8", response)
             self.assertIn(b"script-src 'self'; connect-src 'self'", response)
+            self.assertIn(b"Cache-Control: no-store", response)
+            self.assertIn(b"Referrer-Policy: no-referrer", response)
+            self.assertNotIn(b"Set-Cookie:", response)
         finally:
             await self.server.stop()
 
-    async def test_production_dispatch_requires_access_cookie(self) -> None:
+    async def test_production_dispatch_requires_capability_path(self) -> None:
         status, _, response = await self.server._dispatch(
             "GET", "/", b"", request_headers={"host": "127.0.0.1:8765"}
         )
         self.assertEqual(status, 404)
-        self.assertIn(b"Dashboard Session Missing", response)
+        self.assertIn(b"Dashboard Access Missing", response)
         self.assertNotIn(b"Return to Dashboard", response)
         for protected_path in (
             "/dashboard.js",
@@ -392,6 +398,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 303)
         self.assertNotEqual(self.server._access_token, login_token)
+        capability = self.server._capability_token
+        self.assertEqual(headers["Location"], f"/{capability}/")
+        self.assertNotIn("Set-Cookie", headers)
         replay_status, _, _ = await self.server._dispatch(
             "GET",
             f"/login?token={login_token}",
@@ -399,28 +408,107 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             request_headers={"host": "127.0.0.1:8765"},
         )
         self.assertEqual(replay_status, 400)
-        cookie = headers["Set-Cookie"].split(";", 1)[0]
-        status, _, _ = await self.server._dispatch(
+        status, _, page = await self.server._dispatch(
             "GET",
-            "/",
+            f"/{capability}/",
             b"",
-            request_headers={"host": "127.0.0.1:8765", "cookie": cookie},
+            request_headers={
+                "host": "127.0.0.1:8765",
+                "cookie": "gatekeeper_session=unrelated-local-service-cookie",
+            },
         )
         self.assertEqual(status, 200)
+        self.assertIn(f"href='/{capability}/review'".encode(), page)
+        self.assertIn(f'src="/{capability}/dashboard.js"'.encode(), page)
+        self.assertNotIn(b"href='/review'", page)
         for protected_path in (
             "/dashboard.js",
             "/dashboard/status?path=%2Freview",
         ):
             protected_status, _, _ = await self.server._dispatch(
                 "GET",
-                protected_path,
+                f"/{capability}{protected_path}",
                 b"",
-                request_headers={
-                    "host": "127.0.0.1:8765",
-                    "cookie": cookie,
-                },
+                request_headers={"host": "127.0.0.1:8765"},
             )
             self.assertEqual(protected_status, 200)
+
+        next_login_token = self.server._access_token
+        status, next_headers, _ = await self.server._dispatch(
+            "GET",
+            f"/login?token={next_login_token}",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(status, 303)
+        self.assertNotEqual(self.server._capability_token, capability)
+        self.assertEqual(
+            next_headers["Location"], f"/{self.server._capability_token}/"
+        )
+        stale_status, _, _ = await self.server._dispatch(
+            "GET",
+            f"/{capability}/",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(stale_status, 404)
+
+    async def test_pending_reviews_are_paginated_with_stable_page_links(self) -> None:
+        now = int(time.time())
+        for index in range(50):
+            self.store.enqueue_review(
+                f"sender-{index:02d}",
+                self.protector.seal_review_reference(
+                    200_000_000 + index, -987654321, 1000 + index
+                ),
+                "would_challenge",
+                "[]",
+                "{}",
+                now + 700,
+                now + index + 1,
+            )
+
+        first = await self.server._review_queue_page(page=1)
+        second = await self.server._review_queue_page(page=2)
+
+        self.assertIn(b"Page 1 of 2", first)
+        self.assertIn(b"href='/review?page=2'", first)
+        self.assertNotIn(b"href='/review?page=0'", first)
+        self.assertIn(b"Page 2 of 2", second)
+        self.assertIn(b"href='/review?page=1'", second)
+        self.assertNotIn(b"href='/review?page=3'", second)
+
+        status, _, _ = await self.server._dispatch("GET", "/review?page=3", b"")
+        self.assertEqual(status, 404)
+        status, _, _ = await self.server._dispatch(
+            "GET", "/dashboard/status?path=%2Freview%3Fpage%3D3", b""
+        )
+        self.assertEqual(status, 404)
+
+    async def test_active_case_identity_lookup_is_batched_and_failure_cached(
+        self,
+    ) -> None:
+        for index in range(3):
+            user_id = 300_000_000 + index
+            self.store.quarantine(
+                f"restricted-{index}",
+                restriction_reference=self.protector.seal_restriction_reference(
+                    user_id, -987654321
+                ),
+            )
+        items = self.store.active_restrictions()
+
+        identities = await self.server._live_enforcement_identities(items)
+        self.assertEqual(len(identities), 3)
+        self.assertEqual(self.client.entity_requests, 1)
+
+        self.server._identity_cache.clear()
+        self.client.fail_entity_requests = True
+        failed = await self.server._live_enforcement_identities(items)
+        repeated = await self.server._live_enforcement_identities(items)
+        self.assertEqual(len(failed), 3)
+        self.assertEqual(len(repeated), 3)
+        self.assertEqual(self.client.entity_requests, 2)
 
     async def test_legacy_enforcement_routes_redirect(self) -> None:
         status, headers, _ = await self.server._dispatch("GET", "/enforcement", b"")
@@ -839,6 +927,14 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_spam_decision_performs_explicit_telegram_actions(self) -> None:
         self.client.message = SimpleNamespace(
             message="transient-canary https://body.invalid/private?token=body-secret",
+            entities=[
+                types.MessageEntityTextUrl(
+                    offset=0,
+                    length=17,
+                    url="https://hidden.invalid/path?token=hidden-secret",
+                ),
+                types.MessageEntityUrl(offset=17, length=56),
+            ],
             media=SimpleNamespace(
                 webpage=SimpleNamespace(
                     url="https://preview.invalid/path?token=preview-secret",
@@ -889,6 +985,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("preview-secret", serialized)
         self.assertIn("body-secret", serialized)
         self.assertIn("quote.invalid", serialized)
+        self.assertIn("hidden-secret", serialized)
+        extracted = facts_from_message(self.client.message)
+        payload_urls = {entry["url"] for entry in payload["urls"]}
+        self.assertEqual(payload_urls, set(extracted.urls))
         self.assertIsNotNone(self.store.dialog_snapshot("sender"))
         self.assertEqual(self.cancelled, ["sender"])
 

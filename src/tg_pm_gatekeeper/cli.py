@@ -30,7 +30,10 @@ def parser() -> argparse.ArgumentParser:
 def run(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     settings = Settings.from_environment(require_telegram=False)
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        pending_review_retention_days=settings.pending_review_retention_days,
+    )
     try:
         if args.command == "healthcheck":
             return 0 if store.healthy() else 1
