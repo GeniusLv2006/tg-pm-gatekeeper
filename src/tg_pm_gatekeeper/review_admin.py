@@ -24,7 +24,6 @@ from .rules import URL_RE, normalized_domain, url_evidence, url_shape
 from .service import GatekeeperService
 from .store import ActiveRestriction, DialogSnapshot, ReviewItem, StateStore
 
-
 LOG = logging.getLogger("gatekeeper.review")
 MAX_HEADER_BYTES = 16 * 1024
 MAX_BODY_BYTES = 4 * 1024
@@ -799,7 +798,10 @@ class ReviewAdminServer:
                     "Open this conversation in Telegram ↗</a>"
                 )
             except Exception:
-                pass
+                LOG.info(
+                    "active_case_identity_lookup_failed",
+                    extra={"sender_key": item.sender_key},
+                )
         rules = ", ".join(
             self._human_label(str(value)) for value in payload.get("rule_codes", [])
         ) or "—"
@@ -1312,6 +1314,10 @@ class ReviewAdminServer:
                     item.sender_key, name, username, IDENTITY_CACHE_SECONDS
                 )
             except Exception:
+                LOG.info(
+                    "active_case_identity_lookup_failed",
+                    extra={"sender_key": item.sender_key},
+                )
                 continue
         return identities
 

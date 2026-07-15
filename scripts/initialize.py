@@ -13,7 +13,6 @@ from pathlib import Path
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
 
-
 TARGETS = (
     Path("telegram.session.secret"),
     Path("hmac.key"),

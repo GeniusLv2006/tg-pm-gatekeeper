@@ -15,12 +15,11 @@ from telethon import functions, types
 
 from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
-from tg_pm_gatekeeper.service import GatekeeperService
-from tg_pm_gatekeeper.service import TextStyleSpan
+from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
-    TelegramAdapter,
     TelegramActions,
+    TelegramAdapter,
     facts_from_message,
     formatting_entities_from_spans,
     input_peer_from_sender,

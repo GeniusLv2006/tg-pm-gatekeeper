@@ -20,7 +20,6 @@ from .policy import DetectionResult, PolicyEngine, Severity
 from .rules import MessageFacts, evaluate_hard_rules, url_evidence, url_shape
 from .store import SenderState, StateStore
 
-
 LOG = logging.getLogger("gatekeeper.service")
 DIGITS_RE = re.compile(r"^[0-9]+$")
 CHALLENGE_PROCESSING_GRACE_SECONDS = 30
@@ -489,7 +488,7 @@ class GatekeeperService:
                     sender_key, "ENFORCEMENT_REVIEW", "action_failed", now
                 )
             except Exception:
-                pass
+                LOG.error("enforcement_review_audit_failed")
 
     def _activate_enforcement_review(
         self,
@@ -514,7 +513,7 @@ class GatekeeperService:
                     sender_key, "ENFORCEMENT_REVIEW", "action_failed", now
                 )
             except Exception:
-                pass
+                LOG.error("enforcement_review_audit_failed")
 
     def _record_decision(
         self,
@@ -1007,7 +1006,7 @@ class GatekeeperService:
                 if await actions.restore_from_pending():
                     return True
             except Exception:
-                pass
+                LOG.warning("restore_retry_failed")
         return False
 
     async def _send_notice(

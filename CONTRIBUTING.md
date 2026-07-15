@@ -22,6 +22,9 @@ Run the tests before and after your change:
 ```shell
 PYTHONPATH=src .venv/bin/python -m unittest discover -v
 PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
+.venv/bin/python -m pip install --require-hashes --no-deps -r requirements-quality.txt
+.venv/bin/ruff check src tests scripts
+shellcheck scripts/*.sh deploy/*.sh
 git diff --check
 ```
 

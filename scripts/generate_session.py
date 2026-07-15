@@ -8,8 +8,8 @@ import getpass
 import os
 from pathlib import Path
 
-from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
+from telethon.sync import TelegramClient
 
 
 def main() -> None:

@@ -4,6 +4,6 @@
 
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 echo "scripts/review-tunnel.sh is deprecated; use scripts/dashboard-tunnel.sh." >&2
 exec "$script_dir/dashboard-tunnel.sh" "$@"

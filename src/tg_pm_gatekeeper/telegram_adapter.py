@@ -14,8 +14,8 @@ from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
 
 from .config import ConfigurationError, Settings, read_private_file
-from .rules import MessageFacts, URL_RE, normalized_domain
 from .review_admin import ReviewAdminServer
+from .rules import URL_RE, MessageFacts, normalized_domain
 from .service import (
     TEST_MESSAGE_DELETE_DELAY_SECONDS,
     TEST_STATE_RESET_DELAY_SECONDS,
@@ -25,10 +25,9 @@ from .service import (
 )
 from .store import DialogSnapshot, StateStore
 
-
 LOG = logging.getLogger("gatekeeper.telegram")
 SERVICE_USER_IDS = {777000, 42777}
-HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")
+HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
 PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
 LINK_BUTTON_TYPES = (
     types.KeyboardButtonUrl,
