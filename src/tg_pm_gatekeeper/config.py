@@ -42,6 +42,19 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return value
 
 
+def _bounded_nonnegative_int(
+    name: str, default: int, minimum: int, maximum: int
+) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 def _optional_positive_int(name: str) -> int | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -93,6 +106,8 @@ class Settings:
     review_socket_path: Path
     mute_days: int
     outbound_limit_per_hour: int
+    outbound_notice_reserve_per_hour: int
+    outbound_notice_limit_per_sender_per_hour: int
     test_sender_id: int | None
     review_key_file: Path
 
@@ -109,6 +124,7 @@ class Settings:
         except ValueError as exc:
             raise ConfigurationError("TG_API_ID must be an integer") from exc
         denylist = os.environ.get("TG_DENYLIST_FILE", "").strip()
+        outbound_limit = _bounded_int("TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100)
         settings = cls(
             api_id=api_id,
             api_hash=api_hash,
@@ -141,8 +157,15 @@ class Settings:
                 )
             ),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
-            outbound_limit_per_hour=_bounded_int(
-                "TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100
+            outbound_limit_per_hour=outbound_limit,
+            outbound_notice_reserve_per_hour=_bounded_nonnegative_int(
+                "TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR",
+                min(3, outbound_limit - 1),
+                0,
+                outbound_limit - 1,
+            ),
+            outbound_notice_limit_per_sender_per_hour=_bounded_int(
+                "TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR", 3, 1, 100
             ),
             test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
             review_key_file=Path(

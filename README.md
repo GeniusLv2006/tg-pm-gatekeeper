@@ -143,8 +143,12 @@ incoming private message
       -> owner replies later: trust the sender
       -> timeout: warn, delete after 10 seconds, suppress for 2 hours
       -> attempts exhausted: warn, delete after 10 seconds, suppress for 24 hours
-      -> outbound limit reached: keep archived and send to manual review
+      -> new-challenge quota reached: keep archived and send to manual review
 ```
+
+The hourly outbound limit remains a hard cap. Part of that capacity is reserved for bounded
+verification hints, corrections, timeout warnings, and results for challenges already in progress,
+so a burst of new senders cannot consume every notification slot.
 
 HR is the deterministic Hard Rule identifier family, while `critical` is a severity. HR matches with
 `critical` severity currently cover multiple interactive link buttons, forwarded interactive link

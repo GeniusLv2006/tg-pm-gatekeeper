@@ -38,6 +38,12 @@ async def async_main() -> None:
             challenge_ttl_seconds=settings.challenge_ttl_seconds,
             challenge_max_attempts=settings.challenge_max_attempts,
             outbound_limit_per_hour=settings.outbound_limit_per_hour,
+            outbound_notice_reserve_per_hour=(
+                settings.outbound_notice_reserve_per_hour
+            ),
+            outbound_notice_limit_per_sender_per_hour=(
+                settings.outbound_notice_limit_per_sender_per_hour
+            ),
             pending_review_retention_days=settings.pending_review_retention_days,
             active_case_retention_days=settings.active_case_retention_days,
             denylist=load_denylist(settings.denylist_file),

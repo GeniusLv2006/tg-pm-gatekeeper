@@ -272,7 +272,10 @@ after successful verification, rollback, or manual allowance.
   incomplete challenge back to `unknown`, and delete a prompt that never became active. If
   restoration itself fails, the recoverable archiving phase is preserved for startup reconciliation
   instead of claiming that the sender is unconfined.
-- Exhausted outbound capacity archives the unknown dialog and creates a manual review item instead
-  of allowing challenge delivery to fail open.
+- The hourly outbound limit is a hard cap. New challenges can use only the non-reserved portion;
+  verification hints, corrections, timeout warnings, and result notices may use the reserved
+  portion, subject to a per-sender hourly notice cap. Exhausted new-challenge capacity archives the
+  unknown dialog and creates a manual review item instead of allowing challenge delivery to fail
+  open. The dedicated test sender bypasses these counters.
 - Pending deletion jobs include an expected state revision. Switching to monitor cancels non-test
   jobs and creates exception reviews; restart recovery cannot execute stale work.
