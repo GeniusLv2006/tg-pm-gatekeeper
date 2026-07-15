@@ -16,11 +16,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from telethon import functions, types
 
-from .rules import URL_RE, normalized_domain, url_evidence, url_shape
+from .message_facts import facts_from_message
+from .rules import url_evidence, url_shape
 from .service import GatekeeperService
 from .store import ActiveRestriction, DialogSnapshot, ReviewItem, StateStore
 
@@ -32,6 +33,7 @@ IDENTITY_FAILURE_CACHE_SECONDS = 30
 IDENTITY_BATCH_SIZE = 100
 IDENTITY_FETCH_TIMEOUT_SECONDS = 5
 DASHBOARD_POLL_SECONDS = 15
+PAGE_SIZE = 50
 
 
 DASHBOARD_SCRIPT = r"""(() => {
@@ -56,7 +58,7 @@ DASHBOARD_SCRIPT = r"""(() => {
   };
 
   const replaceLiveRegions = async () => {
-    const response = await fetch(location.pathname, {
+    const response = await fetch(location.pathname + location.search, {
       cache: 'no-store',
       credentials: 'same-origin',
       headers: {'X-Dashboard-Refresh': '1'},
@@ -108,8 +110,11 @@ DASHBOARD_SCRIPT = r"""(() => {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 4000);
     try {
+      const capabilityRoot = `/${location.pathname.split('/')[1]}`;
+      const logicalPath = location.pathname.slice(capabilityRoot.length) || '/';
+      const logicalTarget = logicalPath + location.search;
       const response = await fetch(
-        `/dashboard/status?path=${encodeURIComponent(location.pathname)}`,
+        `${capabilityRoot}/dashboard/status?path=${encodeURIComponent(logicalTarget)}`,
         {cache: 'no-store', credentials: 'same-origin', signal: controller.signal}
       );
       if (!response.ok) throw new Error(`status check failed: ${response.status}`);
@@ -184,7 +189,7 @@ class ReviewAdminServer:
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
         self._access_token = secrets.token_urlsafe(32)
-        self._session_token = secrets.token_urlsafe(32)
+        self._capability_token = secrets.token_urlsafe(32)
         self.access_token_path = socket_path.with_suffix(".access-token")
         self._identity_cache: dict[str, tuple[float, str | None, str | None]] = {}
 
@@ -298,33 +303,38 @@ class ReviewAdminServer:
         request_headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
         parsed = urlsplit(target)
+        if request_headers is None:
+            return await self._dispatch_routes(method, target, body)
+        host = request_headers.get("host", "")
+        if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
+            return 400, {}, self._page("Invalid Host")
+        if parsed.path == "/login":
+            token = parse_qs(parsed.query).get("token", [""])[0]
+            if not secrets.compare_digest(token, self._access_token):
+                return 400, {}, self._page("Invalid Access Token")
+            self._access_token = secrets.token_urlsafe(32)
+            self._capability_token = secrets.token_urlsafe(32)
+            self._write_access_token()
+            return 303, {"Location": f"/{self._capability_token}/"}, b""
+        logical_path = self._logical_path(parsed.path)
+        if logical_path is None:
+            return 404, {}, self._page("Dashboard Access Missing")
+        logical_target = urlunsplit(parsed._replace(path=logical_path))
+        status, headers, response = await self._dispatch_routes(
+            method, logical_target, body
+        )
+        return status, self._capability_headers(headers), self._capability_html(
+            response, headers
+        )
+
+    async def _dispatch_routes(
+        self,
+        method: str,
+        target: str,
+        body: bytes,
+    ) -> tuple[int, dict[str, str], bytes]:
+        parsed = urlsplit(target)
         path = parsed.path
-        if request_headers is not None:
-            host = request_headers.get("host", "")
-            if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
-                return 400, {}, self._page("Invalid Host")
-            if path == "/login":
-                token = parse_qs(parsed.query).get("token", [""])[0]
-                if not secrets.compare_digest(token, self._access_token):
-                    return 400, {}, self._page("Invalid Access Token")
-                self._access_token = secrets.token_urlsafe(32)
-                self._write_access_token()
-                return (
-                    303,
-                    {
-                        "Location": "/",
-                        "Set-Cookie": (
-                            f"gatekeeper_session={self._session_token}; HttpOnly; "
-                            "SameSite=Strict; Path=/"
-                        ),
-                    },
-                    b"",
-                )
-            cookie = request_headers.get("cookie", "")
-            if not secrets.compare_digest(
-                self._cookie_value(cookie, "gatekeeper_session"), self._session_token
-            ):
-                return 404, {}, self._page("Dashboard Session Missing")
         if path == "/dashboard.js":
             if method != "GET":
                 return 405, {"Allow": "GET"}, b""
@@ -351,14 +361,24 @@ class ReviewAdminServer:
         if path == "/" and method == "GET":
             return 200, {}, await self._dashboard_page()
         if path == "/review" and method == "GET":
-            return 200, {}, await self._review_queue_page()
+            page = self._page_number(parsed.query)
+            if page is None or not self._page_exists(
+                page, self.store.pending_review_count()
+            ):
+                return 404, {}, self._page("Not Found")
+            return 200, {}, await self._review_queue_page(page=page)
         if path == "/enforcement" and method == "GET":
             return 303, {"Location": "/cases"}, b""
         if path.startswith("/enforcement/"):
             suffix = path.removeprefix("/enforcement/")
             return 303, {"Location": f"/cases/{suffix}"}, b""
         if path == "/cases" and method == "GET":
-            return 200, {}, await self._enforcement_index_page()
+            page = self._page_number(parsed.query)
+            if page is None or not self._page_exists(
+                page, self.store.active_restriction_count()
+            ):
+                return 404, {}, self._page("Not Found")
+            return 200, {}, await self._enforcement_index_page(page=page)
         if path == "/cases/release":
             return await self._dispatch_legacy_release(method, body)
         if path.startswith("/cases/"):
@@ -441,19 +461,62 @@ class ReviewAdminServer:
             self._identity_cache.pop(item.sender_key, None)
         return 303, {"Location": "/review"}, b""
 
-    def _page_version(self, path: str) -> str | None:
+    def _logical_path(self, path: str) -> str | None:
+        parts = path.split("/", 2)
+        candidate = parts[1] if len(parts) > 1 else ""
+        if not secrets.compare_digest(candidate, self._capability_token):
+            return None
+        return "/" + parts[2] if len(parts) == 3 else "/"
+
+    def _capability_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        location = headers.get("Location")
+        if location is None or not location.startswith("/"):
+            return headers
+        return {**headers, "Location": f"/{self._capability_token}{location}"}
+
+    def _capability_html(
+        self, response: bytes, headers: dict[str, str]
+    ) -> bytes:
+        content_type = headers.get("Content-Type", "text/html")
+        if not content_type.startswith("text/html"):
+            return response
+        prefix = f"/{self._capability_token}/".encode("ascii")
+        for attribute in (b"href", b"action", b"src"):
+            response = response.replace(attribute + b"='/", attribute + b"='" + prefix)
+            response = response.replace(attribute + b'="/', attribute + b'="' + prefix)
+        return response
+
+    @staticmethod
+    def _page_number(query: str) -> int | None:
+        raw = parse_qs(query).get("page", ["1"])[0]
+        if not raw.isascii() or not raw.isdecimal():
+            return None
+        page = int(raw)
+        return page if 1 <= page <= 100_000 else None
+
+    @staticmethod
+    def _page_exists(page: int, total: int) -> bool:
+        return page == 1 or (page - 1) * PAGE_SIZE < total
+
+    def _page_version(self, target: str) -> str | None:
+        parsed = urlsplit(target)
+        path = parsed.path
+        page = self._page_number(parsed.query)
+        if page is None:
+            return None
+        offset = (page - 1) * PAGE_SIZE
         now = int(time.time())
         payload: object
         if path == "/":
-            active = self.store.active_restrictions(now=now)
-            reviews = self.store.review_items(now=now)
             payload = (
                 self.store.get_mode(),
                 sorted(self.store.enforcement_statistics(now=now).items()),
-                [self._active_version(item, now) for item in active],
-                [(item.id, item.updated_at, item.message_count) for item in reviews],
+                self.store.active_restriction_count(),
+                self.store.pending_review_count(now=now),
             )
         elif path == "/review":
+            if not self._page_exists(page, self.store.pending_review_count(now=now)):
+                return None
             payload = [
                 (
                     item.id,
@@ -462,12 +525,18 @@ class ReviewAdminServer:
                     item.classification,
                     item.rule_codes,
                 )
-                for item in self.store.review_items(now=now)
+                for item in self.store.review_items(
+                    limit=PAGE_SIZE, offset=offset, now=now
+                )
             ]
         elif path == "/cases":
+            if not self._page_exists(page, self.store.active_restriction_count()):
+                return None
             payload = [
                 self._active_version(item, now)
-                for item in self.store.active_restrictions(now=now)
+                for item in self.store.active_restrictions(
+                    limit=PAGE_SIZE, offset=offset, now=now
+                )
             ]
         elif path.startswith("/review/"):
             try:
@@ -531,14 +600,6 @@ class ReviewAdminServer:
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
-
-    @staticmethod
-    def _cookie_value(header: str, name: str) -> str:
-        for item in header.split(";"):
-            key, separator, value = item.strip().partition("=")
-            if separator and key == name:
-                return value
-        return ""
 
     @staticmethod
     def _json_block(value: object) -> str:
@@ -686,8 +747,11 @@ class ReviewAdminServer:
             )
         return 303, {"Location": "/cases"}, b""
 
-    async def _enforcement_index_page(self) -> bytes:
-        items = self.store.active_restrictions()
+    async def _enforcement_index_page(self, *, page: int = 1) -> bytes:
+        total = self.store.active_restriction_count()
+        items = self.store.active_restrictions(
+            limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE
+        )
         identities = await self._live_enforcement_identities(items)
         stats = self.store.enforcement_statistics()
         rows = "".join(
@@ -725,7 +789,7 @@ class ReviewAdminServer:
             else " Every active restriction has a retained encrypted control identity."
         )
         content = (
-            self._masthead("Active Cases", f"{len(items)} Restrictions")
+            self._masthead("Active Cases", f"{total} Restrictions")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
             + "<main data-live-region='active-cases'><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
             + "<h2>Review Active Restrictions</h2>"
@@ -736,7 +800,9 @@ class ReviewAdminServer:
             + f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
             + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></section>"
             + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Evidence</th><th>Updated</th></tr></thead>"
-            + f"<tbody>{rows}</tbody></table></div></main>"
+            + f"<tbody>{rows}</tbody></table></div>"
+            + self._pagination("/cases", page, total)
+            + "</main>"
             + "<section class='decision-panel' data-live-region='legacy-recovery'><p class='eyebrow'>Legacy Recovery</p>"
             + "<h2>Allow an unidentified restricted sender by Telegram User ID</h2>"
             + "<p>Use this only for a legacy restriction created before encrypted control "
@@ -758,7 +824,9 @@ class ReviewAdminServer:
             raw=True,
             page_title="Active Cases",
             live_refresh="replace",
-            page_version=self._page_version("/cases"),
+            page_version=self._page_version(
+                "/cases" if page == 1 else f"/cases?page={page}"
+            ),
         )
 
     async def _show_enforcement(
@@ -911,58 +979,23 @@ class ReviewAdminServer:
             message = await self.telegram_client.get_messages(peer, ids=message_id)
             if message is None:
                 return
-            text = getattr(message, "message", None) or ""
-            reply_header = getattr(message, "reply_to", None)
-            quote_text = getattr(reply_header, "quote_text", None) or ""
-            quote_urls = tuple(sorted(set(URL_RE.findall(quote_text))))
-            urls = set(URL_RE.findall(text))
-            button_texts: set[str] = set()
-            button_urls: set[str] = set()
-            markup = getattr(message, "reply_markup", None)
-            for row in getattr(markup, "rows", ()) or ():
-                for button in getattr(row, "buttons", ()) or ():
-                    text_value = getattr(button, "text", None)
-                    if isinstance(text_value, str) and text_value.strip():
-                        button_texts.add(text_value.strip())
-                    url_value = getattr(button, "url", None)
-                    if isinstance(url_value, str) and url_value.strip():
-                        urls.add(url_value.strip())
-                        button_urls.add(url_value.strip())
-            webpage = getattr(getattr(message, "media", None), "webpage", None)
-            webpage_url = getattr(webpage, "url", None)
-            preview_urls: set[str] = set()
-            if isinstance(webpage_url, str) and webpage_url.strip():
-                urls.add(webpage_url.strip())
-                preview_urls.add(webpage_url.strip())
-            preview_text = "\n".join(
-                value
-                for attribute in ("site_name", "title", "description", "author")
-                if isinstance(value := getattr(webpage, attribute, None), str)
-                and value.strip()
-            )
-            url_values = tuple(sorted(urls))
-            domains = tuple(
-                sorted({domain for url in url_values if (domain := normalized_domain(url))})
-            )
-            quote_domains = tuple(
-                sorted({domain for url in quote_urls if (domain := normalized_domain(url))})
-            )
+            facts = facts_from_message(message)
             payload: dict[str, object] = {
                 "schema_version": 4,
-                "text": text,
-                "quote_text": quote_text,
-                "preview_text": preview_text,
-                "button_texts": list(sorted(button_texts))[:10],
+                "text": facts.text,
+                "quote_text": facts.quote_text,
+                "preview_text": facts.preview_text,
+                "button_texts": list(facts.button_texts[:10]),
                 "urls": url_evidence(
-                    url_values,
-                    button_urls=tuple(sorted(button_urls)),
-                    preview_urls=tuple(sorted(preview_urls)),
+                    facts.urls,
+                    button_urls=facts.button_urls,
+                    preview_urls=facts.preview_urls,
                 ),
-                "quote_urls": url_evidence(quote_urls),
-                "domains": list(domains[:3]),
-                "quote_domains": list(quote_domains[:3]),
-                "url_shape": url_shape(url_values),
-                "quote_url_shape": url_shape(quote_urls),
+                "quote_urls": url_evidence(facts.quote_urls),
+                "domains": list(facts.domains[:3]),
+                "quote_domains": list(facts.quote_domains[:3]),
+                "url_shape": url_shape(facts.urls),
+                "quote_url_shape": url_shape(facts.quote_urls),
                 "severity": "manual",
                 "policy": "manual_review",
                 "rule_codes": json.loads(item.rule_codes),
@@ -1159,7 +1192,7 @@ class ReviewAdminServer:
             return False
 
     async def _dashboard_page(self) -> bytes:
-        review_items = self.store.review_items()
+        pending_reviews = self.store.pending_review_count()
         active_stats = self.store.enforcement_statistics()
         active_restrictions = active_stats["quarantined"] + active_stats["suppressed"]
         mode = self.store.get_mode()
@@ -1172,7 +1205,7 @@ class ReviewAdminServer:
             "<dl class='metric-grid'>"
             f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
             f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
-            f"<div><dt>Pending Reviews</dt><dd class='data-value'>{len(review_items)}</dd></div>"
+            f"<div><dt>Pending Reviews</dt><dd class='data-value'>{pending_reviews}</dd></div>"
             "</dl></section>"
             "<div class='table-shell'><table><thead><tr><th>Area</th><th>Purpose</th><th>Open</th></tr></thead><tbody>"
             "<tr><td>Active Cases</td><td>Review every current restriction; evidence availability is shown separately.</td><td><a href='/cases'>Open</a></td></tr>"
@@ -1187,8 +1220,11 @@ class ReviewAdminServer:
             page_version=self._page_version("/"),
         )
 
-    async def _review_queue_page(self) -> bytes:
-        items = self.store.review_items()
+    async def _review_queue_page(self, *, page: int = 1) -> bytes:
+        total = self.store.pending_review_count()
+        items = self.store.review_items(
+            limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE
+        )
         identities = await self._live_identities(items)
         rows = "".join(
             f"<tr><td><a href='/review/{item.id}'>#{item.id}</a></td>"
@@ -1202,7 +1238,7 @@ class ReviewAdminServer:
         if not rows:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
-            self._masthead("Pending Reviews", f"{len(items)} Pending")
+            self._masthead("Pending Reviews", f"{total} Pending")
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
             + "<main data-live-region='pending-reviews'><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
             "<h2>Review Pending Senders</h2>"
@@ -1214,11 +1250,15 @@ class ReviewAdminServer:
             "The table updates in place only when review state changes.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Review Reason</th>"
             "<th>Matched HR Rules</th><th>Messages</th>"
-            f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div></main>",
+            f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            + self._pagination("/review", page, total)
+            + "</main>",
             raw=True,
             page_title="Pending Reviews",
             live_refresh="replace",
-            page_version=self._page_version("/review"),
+            page_version=self._page_version(
+                "/review" if page == 1 else f"/review?page={page}"
+            ),
         )
 
     async def _live_identities(
@@ -1289,6 +1329,13 @@ class ReviewAdminServer:
         self, items: list[ActiveRestriction]
     ) -> dict[str, LiveIdentity]:
         identities: dict[str, LiveIdentity] = {}
+        uncached: list[tuple[ActiveRestriction, types.InputPeerUser, int]] = []
+        now = time.monotonic()
+        self._identity_cache = {
+            sender_key: cached
+            for sender_key, cached in self._identity_cache.items()
+            if cached[0] > now
+        }
         for item in items:
             if item.reference is None:
                 continue
@@ -1297,28 +1344,58 @@ class ReviewAdminServer:
                     item.reference
                 )
                 cached = self._identity_cache.get(item.sender_key)
-                if cached and cached[0] > time.monotonic():
+                if cached and cached[0] > now:
                     identities[item.sender_key] = LiveIdentity(
                         user_id, cached[1], cached[2]
                     )
                     continue
-                sender = await asyncio.wait_for(
-                    self.telegram_client.get_entity(
-                        types.InputPeerUser(user_id=user_id, access_hash=access_hash)
-                    ),
+                uncached.append(
+                    (
+                        item,
+                        types.InputPeerUser(
+                            user_id=user_id,
+                            access_hash=access_hash,
+                        ),
+                        user_id,
+                    )
+                )
+            except ValueError:
+                LOG.info(
+                    "active_case_identity_reference_invalid",
+                    extra={"sender_key": item.sender_key},
+                )
+
+        for start in range(0, len(uncached), IDENTITY_BATCH_SIZE):
+            batch = uncached[start : start + IDENTITY_BATCH_SIZE]
+            try:
+                senders = await asyncio.wait_for(
+                    self.telegram_client.get_entity([peer for _, peer, _ in batch]),
                     timeout=IDENTITY_FETCH_TIMEOUT_SECONDS,
                 )
+                if isinstance(senders, (list, tuple)):
+                    senders = list(senders)
+                else:
+                    senders = [senders]
+            except Exception:
+                senders = []
+            for (item, _, user_id), sender in zip(batch, senders, strict=False):
                 name, username = self._sender_name(sender)
                 identities[item.sender_key] = LiveIdentity(user_id, name, username)
                 self._cache_identity(
                     item.sender_key, name, username, IDENTITY_CACHE_SECONDS
                 )
-            except Exception:
+            for item, _, user_id in batch[len(senders) :]:
+                identities[item.sender_key] = LiveIdentity(user_id, None, None)
+                self._cache_identity(
+                    item.sender_key,
+                    None,
+                    None,
+                    IDENTITY_FAILURE_CACHE_SECONDS,
+                )
                 LOG.info(
                     "active_case_identity_lookup_failed",
                     extra={"sender_key": item.sender_key},
                 )
-                continue
         return identities
 
     def _cache_identity(
@@ -1367,6 +1444,27 @@ class ReviewAdminServer:
         return (
             f"<span class='identity-name'>{html.escape(label)}</span>"
             f"<span class='identity-id'>ID {identity.user_id}</span>"
+        )
+
+    @staticmethod
+    def _pagination(base: str, page: int, total: int) -> str:
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        if total_pages == 1:
+            return ""
+        previous = (
+            f"<a href='{base}?page={page - 1}'>← Previous</a>" if page > 1 else ""
+        )
+        following = (
+            f"<a href='{base}?page={page + 1}'>Next →</a>"
+            if page < total_pages
+            else ""
+        )
+        return (
+            "<nav class='pagination' aria-label='Pagination'>"
+            + previous
+            + f"<span>Page {page} of {total_pages}</span>"
+            + following
+            + "</nav>"
         )
 
     @staticmethod
@@ -1500,9 +1598,9 @@ class ReviewAdminServer:
                     "The requested page is unavailable. Check the address or return to the "
                     "dashboard."
                 ),
-                "Dashboard Session Missing": (
-                    "This browser does not have a valid dashboard session. Run the tunnel "
-                    "helper again and open its new one-time link."
+                "Dashboard Access Missing": (
+                    "This address does not contain a valid dashboard capability. Run the "
+                    "tunnel helper again and open its new one-time link."
                 ),
                 "Request Failed": (
                     "The request could not be completed. No dashboard action was confirmed."
@@ -1510,7 +1608,7 @@ class ReviewAdminServer:
             }.get(content, "Check the request and return to the dashboard.")
             return_action = (
                 ""
-                if content in {"Invalid Access Token", "Dashboard Session Missing"}
+                if content in {"Invalid Access Token", "Dashboard Access Missing"}
                 else "<a class='button-link' href='/'>Return to Dashboard</a>"
             )
             body = (
@@ -1554,6 +1652,7 @@ body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;b
 .metric-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin:2rem 0 0}}.metric-grid>div{{min-width:0;padding:1rem;border:1px solid var(--line);background:rgba(255,253,247,.72)}}.metric-grid dd{{margin:.45rem 0 0}}.data-value{{font:700 1.15rem/1.35 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .table-shell{{overflow-x:auto;border:1px solid var(--line);background:var(--panel);box-shadow:8px 8px 0 var(--ink)}}table{{border-collapse:collapse;width:100%;min-width:860px}}
 th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}}th{{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}}tbody tr:last-child td{{border-bottom:0}}tbody tr:hover{{background:#f8e9d8}}a{{color:var(--ink);text-underline-offset:.22em}}td:first-child a{{font-weight:900;color:var(--signal)}}
+.pagination{{display:flex;justify-content:center;align-items:center;gap:1.25rem;margin:2rem 0 0;font:700 .75rem/1.4 var(--font-data)}}.pagination a{{font-weight:800}}
 .identity-name,.identity-id{{display:block}}.identity-name{{font-size:1rem;font-weight:700}}.identity-id{{margin-top:.2rem;color:var(--muted);font:400 .7rem/1.4 var(--font-data);letter-spacing:.02em;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .back{{padding:1.25rem 1.25rem 0}}.review-grid{{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.75fr);gap:1.5rem;padding-bottom:2rem}}
 .message-panel,.case-file,.decision-panel{{min-width:0;border:1px solid var(--line);background:var(--panel);padding:clamp(1.25rem,4vw,2.4rem)}}.message-panel h2{{font-size:2rem;margin:.5rem 0 1.8rem;overflow-wrap:anywhere}}

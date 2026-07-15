@@ -132,28 +132,36 @@ containing peer access data and a message ID. It is not a conversation archive. 
 opens an item, the running client decrypts that single reference and fetches the referenced message
 and sender from Telegram. Those values are rendered in the response but are not persisted or logged.
 
-The queue page decrypts the same pending references to display Telegram IDs and resolves names and
-usernames from Telegram in batches. Profile names are cached only in process memory for five minutes;
-failed lookups are retried after 30 seconds. Review decisions evict the matching cached identity.
-Responses use `Cache-Control: no-store`, although rendered identity remains visible in the owner's
-browser memory and screenshots like any other displayed page.
+The Pending Reviews and Active Cases pages decrypt their respective references to display Telegram
+IDs and resolve names and usernames from Telegram in bounded batches. Both lists use stable
+most-recently-updated ordering and 50-row pages. Profile names are cached only in process memory for
+five minutes; failed lookups are retried after 30 seconds. Review decisions evict the matching cached
+identity. Responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, although
+rendered identity and the capability address remain visible in the owner's browser memory and
+screenshots like any other displayed page.
 
-Authenticated dashboard pages load a same-origin script that checks `/dashboard/status` every 15
-seconds while the tab is visible. The status response contains only an opaque fingerprint of the
-current page state and a check time; it contains no message content, Telegram identity, encrypted
-reference, or evidence. When a list or overview fingerprint changes, the browser fetches the current
-page and replaces only its marked live regions while preserving current form input and focus. Detail
-pages instead disable stale decision controls and require an explicit reload after their underlying
-record changes. Hidden tabs stop checking until visible again, and the manual control can request an
-immediate check. The script and status route use the existing dashboard session and remain behind the
-same owner-only Unix socket and SSH tunnel.
+The one-time login rotates both the access token and a random 256-bit capability path. No dashboard
+authentication cookie is set. A new successful login immediately invalidates the previous capability,
+and an absent or incorrect capability receives the same 404 response. Every internal link, form,
+script, page refresh, and status request remains beneath that path.
+
+Authenticated dashboard pages load a same-origin script that checks the capability-prefixed status
+route every 15 seconds while the tab is visible. The status response contains only an opaque
+fingerprint of the current page state and a check time; it contains no message content, Telegram
+identity, encrypted reference, or evidence. When a list or overview fingerprint changes, the browser
+fetches the current page, including its page number, and replaces only its marked live regions while
+preserving current form input and focus. Detail pages instead disable stale decision controls and
+require an explicit reload after their underlying record changes. Hidden tabs stop checking until
+visible again, and the manual control can request an immediate check. The script and status route
+remain behind the same owner-only Unix socket, SSH tunnel, and capability path.
 
 An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
 the local allowlist and are restored first when Gatekeeper previously archived the dialog. Confirmed
 spam is archived and muted unless the sender is already quarantined. Dismiss performs no new action
 through Telegram and therefore leaves a rate-limit fallback quarantine in place, but it cancels any
 pending or failed Gatekeeper deletion jobs for that sender. A decision immediately removes the
-encrypted reference. Pending references expire after no more than seven days, while non-reversible
+encrypted reference. Pending references, including reviews created while changing mode or recording
+an action failure, consistently use the configured one-to-seven-day retention. Non-reversible
 verdicts may remain for the normal audit retention period.
 Deleting a conversation in Telegram does not itself update the local queue. If the referenced
 message is no longer available, the detail page still exposes a resolve-only action that dismisses
@@ -162,7 +170,8 @@ without changing sender state.
 
 Protect-mode terminal states have a separate **Active Cases** surface. It lists every current
 quarantine and suppression, independent of evidence availability. The service captures the
-original triggering text/caption, Telegram-provided quote and preview, button text, full URLs,
+original triggering text/caption, Telegram-provided quote and preview, text-link entities, visible
+URL entities, button text, full URLs,
 normalized domains, URL shape, matched HR identifiers, and severity before a challenge begins,
 encrypts it with the active-case review key, and exposes it only after the sender becomes quarantined
 or suppressed. A correct answer, challenge rollback, or manual allowance erases the evidence.

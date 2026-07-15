@@ -209,6 +209,64 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(action.sender_key, "test-sender")
         self.assertEqual(self.store.statistics()["pending_reviews"], 0)
 
+    def test_configured_retention_applies_to_generated_exception_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(
+                Path(directory) / "state.sqlite3",
+                pending_review_retention_days=1,
+            )
+            try:
+                state = store.suppress(
+                    "sender",
+                    "critical_rule",
+                    until=None,
+                    reference=b"reference",
+                    now=100,
+                )
+                store.schedule_action(
+                    "sender",
+                    reason="critical_rule",
+                    reference=b"reference",
+                    execute_at=200,
+                    expected_revision=state.revision,
+                    now=100,
+                )
+                store.set_mode("protect")
+                before = int(time.time())
+                store.set_mode("monitor")
+                review = store.review_items(now=before)[0]
+                self.assertGreaterEqual(review.expires_at, before + 86400)
+                self.assertLessEqual(review.expires_at, before + 86401)
+
+                other = store.suppress(
+                    "other",
+                    "critical_rule",
+                    until=None,
+                    reference=b"other",
+                    now=300,
+                )
+                other_id = store.schedule_action(
+                    "other",
+                    reason="critical_rule",
+                    reference=b"other",
+                    execute_at=400,
+                    expected_revision=other.revision,
+                    now=300,
+                )
+                action = next(
+                    action
+                    for action in store.pending_actions()
+                    if action.id == other_id
+                )
+                assert action is not None
+                store.enqueue_action_failure(action, now=500)
+                generated = next(
+                    item for item in store.review_items(now=500) if item.sender_key == "other"
+                )
+                self.assertEqual(generated.expires_at, 500 + 86400)
+            finally:
+                store.close()
+
     def test_protect_preflight_rejects_stale_pending_action(self) -> None:
         self.store.heartbeat()
         state = self.store.suppress(

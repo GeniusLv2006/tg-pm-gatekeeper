@@ -233,7 +233,10 @@ class PendingAction:
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, pending_review_retention_days: int = 7) -> None:
+        if not 1 <= pending_review_retention_days <= 7:
+            raise ValueError("pending review retention must be between 1 and 7 days")
+        self.pending_review_retention_days = pending_review_retention_days
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._connection = sqlite3.connect(path, timeout=5)
         os.chmod(path, 0o600)
@@ -472,7 +475,7 @@ class StateStore:
                                 f"cancelled_{item['reason']}",
                                 now,
                                 now,
-                                now + 7 * 86400,
+                                now + self.pending_review_retention_days * 86400,
                             ),
                         )
 
@@ -992,21 +995,35 @@ class StateStore:
         return ActiveRestriction(**dict(row)) if row else None
 
     def active_restrictions(
-        self, *, limit: int | None = None, now: int | None = None
+        self,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        now: int | None = None,
     ) -> list[ActiveRestriction]:
+        if offset < 0 or (limit is not None and limit < 1):
+            raise ValueError("invalid active restriction page bounds")
         timestamp = int(time.time()) if now is None else now
         query = (
             self._active_restriction_select()
             + " WHERE sender.status IN ('quarantined','suppressed') "
-            "ORDER BY sender.updated_at DESC"
+            "ORDER BY sender.updated_at DESC, sender.sender_key ASC"
         )
         parameters: tuple[int, ...] = (timestamp,)
         if limit is not None:
-            query += " LIMIT ?"
-            parameters = (timestamp, limit)
+            query += " LIMIT ? OFFSET ?"
+            parameters = (timestamp, limit, offset)
         with self._lock:
             rows = self._connection.execute(query, parameters).fetchall()
         return [ActiveRestriction(**dict(row)) for row in rows]
+
+    def active_restriction_count(self) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM sender_state "
+                "WHERE status IN ('quarantined','suppressed')"
+            ).fetchone()
+        return int(row[0])
 
     @staticmethod
     def _active_restriction_select() -> str:
@@ -1321,7 +1338,7 @@ class StateStore:
                         f"{action.reason}_action_failed",
                         timestamp,
                         timestamp,
-                        timestamp + 7 * 86400,
+                        timestamp + self.pending_review_retention_days * 86400,
                     ),
                 )
 
@@ -1386,8 +1403,10 @@ class StateStore:
         return int(cursor.lastrowid)
 
     def review_items(
-        self, *, limit: int = 100, now: int | None = None
+        self, *, limit: int = 50, offset: int = 0, now: int | None = None
     ) -> list[ReviewItem]:
+        if limit < 1 or offset < 0:
+            raise ValueError("invalid review page bounds")
         timestamp = int(time.time()) if now is None else now
         with self._lock:
             rows = self._connection.execute(
@@ -1395,10 +1414,20 @@ class StateStore:
                 "features, status, message_count, created_at, updated_at, "
                 "expires_at, reviewed_at "
                 "FROM review_queue WHERE status='pending' AND expires_at>? "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (timestamp, limit),
+                "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                (timestamp, limit, offset),
             ).fetchall()
         return [ReviewItem(**dict(row)) for row in rows]
+
+    def pending_review_count(self, *, now: int | None = None) -> int:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM review_queue "
+                "WHERE status='pending' AND expires_at>?",
+                (timestamp,),
+            ).fetchone()
+        return int(row[0])
 
     def review_item(self, review_id: int) -> ReviewItem | None:
         with self._lock:

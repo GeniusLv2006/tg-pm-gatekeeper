@@ -24,7 +24,10 @@ async def async_main() -> None:
     protector = IdentifierProtector(
         read_private_file(settings.hmac_key_file, minimum_bytes=32)
     )
-    store = StateStore(settings.database_path)
+    store = StateStore(
+        settings.database_path,
+        pending_review_retention_days=settings.pending_review_retention_days,
+    )
     try:
         review_protector = ActiveCaseProtector(
             read_private_file(settings.review_key_file, minimum_bytes=32)
