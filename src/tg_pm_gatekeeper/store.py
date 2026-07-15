@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SCHEMA_VERSION = 4
 SENDER_STATUSES = (
     "unknown",
@@ -240,14 +239,19 @@ class StateStore:
         os.chmod(path, 0o600)
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        with self._connection:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
-            self._connection.execute("PRAGMA foreign_keys=ON")
-            self._initialize_schema()
-            self._connection.execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES ('mode', 'monitor')"
-            )
+        try:
+            with self._connection:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=FULL")
+                self._connection.execute("PRAGMA foreign_keys=ON")
+                self._initialize_schema()
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO settings(key, value) "
+                    "VALUES ('mode', 'monitor')"
+                )
+        except Exception:
+            self._connection.close()
+            raise
 
     def _initialize_schema(self) -> None:
         version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])

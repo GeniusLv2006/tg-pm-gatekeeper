@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-
 Severity = Literal["none", "signal", "high", "critical"]
 PlannedAction = Literal["allow", "challenge", "delete", "exception_review"]
 

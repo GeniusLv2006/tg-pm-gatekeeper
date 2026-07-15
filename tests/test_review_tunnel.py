@@ -11,7 +11,6 @@ import time
 import unittest
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).parents[1] / "scripts" / "dashboard-tunnel.sh"
 LEGACY_SCRIPT = Path(__file__).parents[1] / "scripts" / "review-tunnel.sh"
 

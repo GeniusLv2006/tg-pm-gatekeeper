@@ -128,6 +128,8 @@ dashboard_reachable() {
 }
 
 read_access_token() {
+    # The path is restricted to absolute alphanumeric/underscore/dot/slash/dash values above.
+    # shellcheck disable=SC2029
     if [ -n "$ssh_config" ]; then
         ssh -F "$ssh_config" "$host" "cat $remote_token"
     else
@@ -154,6 +156,8 @@ report_closed() {
     return 1
 }
 
+# Invoked by the signal and exit traps below.
+# shellcheck disable=SC2329
 cleanup() {
     if [ -n "$tunnel_pid" ] && kill -0 "$tunnel_pid" 2>/dev/null; then
         kill "$tunnel_pid" 2>/dev/null || true

@@ -7,8 +7,8 @@ import os
 import stat
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.initialize import render_config, write_private_file
 from tg_pm_gatekeeper.config import ConfigurationError, Settings

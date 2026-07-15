@@ -10,7 +10,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from .policy import DetectionResult, Severity
 
-
 URL_RE = re.compile(r"(?i)(?:https?://|tg://|www\.)[^\s<>()\[\]{}]+")
 TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？'\"”’》】）"
 ASCII_HOSTNAME_RE = re.compile(

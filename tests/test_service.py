@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,9 +16,8 @@ from tg_pm_gatekeeper.service import (
     REPLY_REQUIRED_TEXT,
     TEST_VERIFICATION_FAILED_TEXT,
     TEST_VERIFICATION_TIMEOUT_TEXT,
-    VERIFICATION_FAILED_TEXT,
     VERIFICATION_FAILED_SUPPRESSION_SECONDS,
-    VERIFICATION_TIMEOUT_TEXT,
+    VERIFICATION_FAILED_TEXT,
     VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
     Challenge,
     GatekeeperService,
@@ -31,7 +28,6 @@ from tg_pm_gatekeeper.service import (
     new_challenge,
 )
 from tg_pm_gatekeeper.store import StateStore
-
 
 TEST_SENDER_ID = 900_000_001
 
@@ -259,7 +255,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(expression=expression):
                 sequence = iter(values)
 
-                def deterministic_randbelow(upper: int) -> int:
+                def deterministic_randbelow(
+                    upper: int, sequence=sequence
+                ) -> int:
                     value = next(sequence)
                     self.assertGreaterEqual(value, 0)
                     self.assertLess(value, upper)
