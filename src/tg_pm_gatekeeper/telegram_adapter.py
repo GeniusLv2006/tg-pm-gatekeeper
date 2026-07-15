@@ -280,6 +280,13 @@ class TelegramActions:
             self.peer, sender_key, since, delete_at
         )
 
+    def schedule_verification_message_deletion(
+        self, sender_key: str, message_ids: tuple[int, ...], delete_at: int
+    ) -> None:
+        self.adapter.schedule_verification_message_deletion(
+            self.peer, sender_key, message_ids, delete_at
+        )
+
     def schedule_dialog_deletion(self, action_id: int, delete_at: int) -> None:
         self.adapter.schedule_dialog_deletion(action_id, delete_at)
 
@@ -632,6 +639,40 @@ class TelegramAdapter:
         self._track_maintenance_task(
             self._test_message_deletion_worker(peer, sender_key, since, delete_at)
         )
+
+    def schedule_verification_message_deletion(
+        self,
+        peer,
+        sender_key: str,
+        message_ids: tuple[int, ...],
+        delete_at: int,
+    ) -> None:
+        self._track_maintenance_task(
+            self._verification_message_deletion_worker(
+                peer, sender_key, message_ids, delete_at
+            )
+        )
+
+    async def _verification_message_deletion_worker(
+        self,
+        peer,
+        sender_key: str,
+        message_ids: tuple[int, ...],
+        delete_at: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(max(0, delete_at - int(time.time())))
+            await self.client.delete_messages(peer, list(message_ids), revoke=True)
+            self.store.audit(
+                sender_key, "CHALLENGE_CLEANUP", "messages_deleted", int(time.time())
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            self.store.audit(
+                sender_key, "CHALLENGE_CLEANUP", "action_failed", int(time.time())
+            )
+            LOG.error("verification_message_deletion_failed")
 
     async def _test_message_deletion_worker(
         self, peer, sender_key: str, since: int, delete_at: int

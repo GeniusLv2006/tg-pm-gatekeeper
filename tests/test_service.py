@@ -46,6 +46,7 @@ class FakeActions:
         self.scheduled: list[tuple[str, int, int]] = []
         self.cancelled: list[str] = []
         self.deletions: list[tuple[str, int, int]] = []
+        self.verification_deletions: list[tuple[str, tuple[int, ...], int]] = []
         self.deleted_messages: list[int] = []
         self.deleted_message_batches: list[tuple[int, ...]] = []
         self.deleted_dialogs = 0
@@ -116,6 +117,11 @@ class FakeActions:
         self, sender_key: str, since: int, delete_at: int
     ) -> None:
         self.deletions.append((sender_key, since, delete_at))
+
+    def schedule_verification_message_deletion(
+        self, sender_key: str, message_ids: tuple[int, ...], delete_at: int
+    ) -> None:
+        self.verification_deletions.append((sender_key, message_ids, delete_at))
 
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int
@@ -665,13 +671,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             "challenge_incorrect",
         )
+        actions.next_message_id = 104
         self.assertEqual(
             await self.service.handle(
                 self.message(103, "12", reply_to_message_id=100), actions
             ),
             "provisional",
         )
-        self.assertEqual(actions.deleted_message_batches, [(100, 102, 103)])
+        self.assertEqual(actions.deleted_message_batches, [])
+        self.assertEqual(
+            actions.verification_deletions,
+            [(sender_key, (100, 101, 102, 103, 104), self.now + 10)],
+        )
+        cleanup = self.store._connection.execute(
+            "SELECT outcome FROM audit WHERE sender_key=? "
+            "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1",
+            (sender_key,),
+        ).fetchone()
+        self.assertEqual(cleanup["outcome"], "scheduled")
         self.assertEqual(actions.deleted_dialogs, 0)
 
     async def test_signed_number_is_format_error_without_attempt(self) -> None:

@@ -90,8 +90,10 @@ window starts only after Telegram confirms prompt delivery. The dialog is archiv
 the challenge becomes active. Replies to another message, standalone answers, and non-numeric replies
 do not consume an attempt or extend the deadline. At most one corrective hint is sent per challenge.
 Numeric input is NFKC-normalized before comparison. A correct answer restores the dialog and its
-previous archive, silent, and mute settings while keeping HR screening active, then deletes
-only explicitly indexed challenge, answer, corrective, and success messages in one Telegram request.
+previous archive, silent, and mute settings while keeping HR screening active. The success notice
+remains visible for 10 seconds, then one Telegram request deletes the complete explicitly indexed
+challenge flow, including earlier incorrect answers, corrective notices, the correct answer, and the
+success notice.
 Restoration is retried three times; persistent failure creates an exception review instead of
 silently treating a correct sender as spam. A timeout sends a deletion warning. Two
 incorrect numeric answers send a failure notice with a 10-second countdown, then delete the private

@@ -56,6 +56,7 @@ FAILED_DIALOG_DELETE_DELAY_SECONDS = 10
 VERIFICATION_FAILED_SUPPRESSION_SECONDS = 24 * 3600
 VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS = 2 * 3600
 TEST_MESSAGE_DELETE_DELAY_SECONDS = 10
+VERIFICATION_SUCCESS_DELETE_DELAY_SECONDS = 10
 TEST_STATE_RESET_DELAY_SECONDS = 60
 MAX_REVIEW_BUTTON_TEXTS = 10
 
@@ -79,6 +80,9 @@ class MessageActions(Protocol):
     def cancel_timeout(self, sender_key: str) -> None: ...
     def schedule_test_message_deletion(
         self, sender_key: str, since: int, delete_at: int
+    ) -> None: ...
+    def schedule_verification_message_deletion(
+        self, sender_key: str, message_ids: tuple[int, ...], delete_at: int
     ) -> None: ...
     def schedule_dialog_deletion(self, action_id: int, delete_at: int) -> None: ...
     def schedule_test_state_reset(
@@ -852,7 +856,7 @@ class GatekeeperService:
                 formatting=notice_formatting(VERIFICATION_PASSED_TEXT),
             )
             verification_message_ids = set(
-                self.store.automated_message_ids_between(
+                self.store.message_ids_between(
                     sender_key,
                     state.challenge_message_id or message.message_id,
                     max(message.message_id, passed_message_id or message.message_id),
@@ -863,13 +867,15 @@ class GatekeeperService:
                 verification_message_ids.add(state.challenge_message_id)
             if passed_message_id is not None:
                 verification_message_ids.add(passed_message_id)
-            cleanup_succeeded = await actions.delete_messages(
-                tuple(sorted(verification_message_ids))
+            actions.schedule_verification_message_deletion(
+                sender_key,
+                tuple(sorted(verification_message_ids)),
+                now + VERIFICATION_SUCCESS_DELETE_DELAY_SECONDS,
             )
             self.store.audit(
                 sender_key,
                 "CHALLENGE_CLEANUP",
-                "messages_deleted" if cleanup_succeeded else "action_failed",
+                "scheduled",
                 now,
             )
             if sender_key == self.test_sender_key:

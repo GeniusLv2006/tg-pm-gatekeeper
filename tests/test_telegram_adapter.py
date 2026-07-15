@@ -284,6 +284,57 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
 
         client.delete_messages.assert_awaited_once_with(peer, [10, 11, 12], revoke=True)
 
+    async def test_delayed_verification_cleanup_deletes_full_batch_and_audits(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                client = SimpleNamespace(delete_messages=AsyncMock())
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.client = client
+                adapter.store = store
+                peer = types.InputPeerUser(user_id=123, access_hash=456)
+
+                await adapter._verification_message_deletion_worker(
+                    peer, "sender", (10, 11, 12, 13, 14), 0
+                )
+
+                client.delete_messages.assert_awaited_once_with(
+                    peer, [10, 11, 12, 13, 14], revoke=True
+                )
+                row = store._connection.execute(
+                    "SELECT outcome FROM audit WHERE sender_key='sender' "
+                    "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                self.assertEqual(row["outcome"], "messages_deleted")
+            finally:
+                store.close()
+
+    async def test_delayed_verification_cleanup_records_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                client = SimpleNamespace(
+                    delete_messages=AsyncMock(side_effect=RuntimeError("delete failed"))
+                )
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.client = client
+                adapter.store = store
+                peer = types.InputPeerUser(user_id=123, access_hash=456)
+
+                await adapter._verification_message_deletion_worker(
+                    peer, "sender", (10, 11), 0
+                )
+
+                row = store._connection.execute(
+                    "SELECT outcome FROM audit WHERE sender_key='sender' "
+                    "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                self.assertEqual(row["outcome"], "action_failed")
+            finally:
+                store.close()
+
     async def test_delete_dialog_revokes_history_and_clears_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
