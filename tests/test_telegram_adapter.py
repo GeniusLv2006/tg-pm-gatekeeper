@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from telethon import functions, types
 
@@ -373,6 +374,49 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_lookup_failure_continues_as_untrusted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                protector = IdentifierProtector(b"k" * 32)
+                service = SimpleNamespace(
+                    protector=protector,
+                    handle=AsyncMock(return_value="challenged"),
+                )
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.store = store
+                adapter.service = service
+                adapter.settings = SimpleNamespace(test_sender_id=None)
+                adapter._has_prior_outgoing = AsyncMock(
+                    side_effect=RuntimeError("telegram lookup failed")
+                )
+                sender = SimpleNamespace(
+                    id=123,
+                    access_hash=456,
+                    bot=False,
+                    contact=False,
+                )
+                event = SimpleNamespace(
+                    is_private=True,
+                    message=types.Message(
+                        id=1,
+                        peer_id=types.PeerUser(123),
+                        date=datetime.fromtimestamp(100, timezone.utc),
+                        message="hello",
+                    ),
+                    input_chat=types.InputPeerUser(123, 456),
+                    get_sender=AsyncMock(return_value=sender),
+                )
+
+                await adapter._on_message(event)
+
+                service.handle.assert_awaited_once()
+                incoming = service.handle.await_args.args[0]
+                self.assertFalse(incoming.has_trusted_history)
+                self.assertEqual(store.statistics()["audit_records"], 1)
+            finally:
+                store.close()
+
     async def test_automated_outgoing_message_does_not_create_trust(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
@@ -427,6 +471,58 @@ class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(trusted)
             finally:
                 store.close()
+
+
+class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
+    def make_adapter(self) -> TelegramAdapter:
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = SimpleNamespace(
+            connect=AsyncMock(),
+            is_user_authorized=AsyncMock(return_value=True),
+            get_me=AsyncMock(),
+            add_event_handler=Mock(),
+            run_until_disconnected=AsyncMock(),
+            disconnect=AsyncMock(),
+        )
+        adapter._recover_challenges = AsyncMock()
+        adapter._recover_test_sender_cleanup = AsyncMock()
+        adapter._recover_pending_actions = AsyncMock()
+        adapter._review_admin = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        adapter._timeout_tasks = {}
+        adapter._maintenance_tasks = set()
+        adapter._heartbeat_task = None
+        return adapter
+
+    async def test_heartbeat_failure_terminates_runtime(self) -> None:
+        adapter = self.make_adapter()
+
+        async def wait_for_disconnect() -> None:
+            await asyncio.Event().wait()
+
+        adapter.client.run_until_disconnected.side_effect = wait_for_disconnect
+        adapter._heartbeat_loop = AsyncMock(
+            side_effect=RuntimeError("heartbeat write failed")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "heartbeat write failed"):
+            await adapter.run()
+
+        adapter._review_admin.stop.assert_awaited_once()
+        adapter.client.disconnect.assert_awaited_once()
+
+    async def test_normal_disconnect_cancels_and_awaits_heartbeat(self) -> None:
+        adapter = self.make_adapter()
+
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        adapter._heartbeat_loop = AsyncMock(side_effect=wait_forever)
+
+        await adapter.run()
+
+        self.assertTrue(adapter._heartbeat_task.done())
+        adapter._review_admin.stop.assert_awaited_once()
+        adapter.client.disconnect.assert_awaited_once()
 
 
 if __name__ == "__main__":

@@ -122,7 +122,7 @@ Continue when:
 
 - the `gatekeeper` container shows `healthy`;
 - the status output includes `"mode":"monitor"`;
-- `heartbeat` is a recent Unix timestamp; and
+- `heartbeat` is a recent Unix timestamp and is not more than five seconds in the future; and
 - `action_failures` is `0`.
 
 If the container is not healthy, run:
@@ -360,7 +360,11 @@ quota, and can lose its entire test dialog after exhausted attempts. Remove the 
 | --- | --- |
 | `docker compose` is not found | Install Docker Engine and the Compose plugin; the legacy `docker-compose` command is not used. |
 | Container stays unhealthy | Run `docker compose logs --tail=100 gatekeeper`; check for a missing private file, broad permissions, or an unauthorized Telegram session. |
-| `startup_failed` | Confirm the five private files exist, the session and keys are mode `0600`, and `config.env` contains real API values. |
+| `startup_configuration_failed` | Check required `config.env` values and documented numeric bounds. |
+| `startup_private_file_failed` | Confirm the five private files exist, are regular files, and have the documented ownership and permissions. |
+| `startup_database_migration_failed` | Keep the database and any pre-migration backup intact; verify the current schema and follow the schema-update procedure. |
+| `startup_telegram_session_failed` | Confirm the Telegram session is still authorized from an official client and reprovision it if revoked. |
+| `startup_runtime_failed` | Inspect the immediately preceding privacy-safe events and container state; a supervised heartbeat or pruning failure intentionally exits for restart. |
 | Dashboard token or socket is missing | Confirm the container is healthy, then inspect `/var/lib/tg-pm-gatekeeper/review.sock` and `review.access-token`. |
 | Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
 | Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Resolve and Cancel Pending Jobs** if the sender decision no longer needs the message. |

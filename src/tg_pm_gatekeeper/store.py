@@ -410,13 +410,22 @@ class StateStore:
                 (str(timestamp),),
             )
 
-    def healthy(self, *, max_age: int = 120, now: int | None = None) -> bool:
+    def healthy(
+        self,
+        *,
+        max_age: int = 120,
+        max_future_skew: int = 5,
+        now: int | None = None,
+    ) -> bool:
         timestamp = now or int(time.time())
         with self._lock:
             row = self._connection.execute(
                 "SELECT value FROM settings WHERE key='heartbeat'"
             ).fetchone()
-        return bool(row and timestamp - int(row["value"]) <= max_age)
+        if not row:
+            return False
+        age = timestamp - int(row["value"])
+        return -max_future_skew <= age <= max_age
 
     def get_mode(self) -> str:
         with self._lock:
