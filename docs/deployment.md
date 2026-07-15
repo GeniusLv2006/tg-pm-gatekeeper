@@ -328,6 +328,52 @@ PYTHON
 After rebuilding, verify the schema version, state counts, and logs. Delete the temporary backup only
 after every check passes. Preserve the failed database for diagnosis if migration fails.
 
+```shell
+ssh "$DEPLOY_HOST" '
+cd /opt/tg-pm-gatekeeper
+docker compose exec -T gatekeeper python -c "import sqlite3; connection=sqlite3.connect(\"/var/lib/tg-pm-gatekeeper/state.sqlite3\"); print(connection.execute(\"PRAGMA user_version\").fetchone()[0])"
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+docker compose logs --tail=100 gatekeeper
+'
+```
+
+For this migration, the first command must print `5`.
+
+Schema 5 replaces the schema 4 `outbound_events` rows with categorized events. Existing rows become
+`legacy`, retain no sender identity, and continue to count toward the hard total until their one-hour
+window expires. New rows contain only the existing HMAC-derived sender key, never a raw Telegram ID.
+
+Schema 5 is not writable by pre-schema-5 code. A code rollback to an earlier commit therefore also
+requires the pre-migration database. Record the earlier commit before updating. If startup or live
+validation fails, keep the schema 5 database for diagnosis and restore both code and data together:
+
+```shell
+ssh "$DEPLOY_HOST" '
+set -eu
+cd /opt/tg-pm-gatekeeper
+previous_commit=REPLACE_WITH_RECORDED_COMMIT
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+docker compose down
+mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v5.$stamp.sqlite3"
+for suffix in -wal -shm; do
+    path="/var/lib/tg-pm-gatekeeper/state.sqlite3$suffix"
+    if [ -e "$path" ]; then
+        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v5.$stamp.sqlite3$suffix"
+    fi
+done
+cp --preserve=mode,ownership,timestamps /var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3 /var/lib/tg-pm-gatekeeper/state.sqlite3
+chmod 0600 /var/lib/tg-pm-gatekeeper/state.sqlite3
+git switch --detach "$previous_commit"
+docker compose up -d --build
+docker compose ps
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+'
+```
+
+Do not substitute the schema 5 database into an older image or delete the failed database before
+diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt;
+do not merge the incompatible database files.
+
 ## Configuration
 
 `scripts/initialize.py` writes the production defaults. [.env.example](../.env.example) lists every
@@ -338,6 +384,8 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 | `TG_CHALLENGE_TTL_SECONDS` | `60` | Time allowed for a direct reply; 30–600 seconds |
 | `TG_CHALLENGE_MAX_ATTEMPTS` | `2` | Numeric attempts; 1–5 |
 | `TG_OUTBOUND_LIMIT_PER_HOUR` | `10` | Gatekeeper messages per hour; 1–100 |
+| `TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR` | `min(3, limit-1)` | Capacity unavailable to new challenges but usable by notices; 0–`limit-1` |
+| `TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR` | `3` | Notice messages one sender may consume per hour; 1–100 |
 | `TG_AUDIT_RETENTION_DAYS` | `30` | Local audit-event retention |
 | `TG_PENDING_REVIEW_RETENTION_DAYS` | `7` | Pending Review retention; 1–7 days |
 | `TG_ACTIVE_CASE_RETENTION_DAYS` | `30` | Active Case snapshot retention; 1–30 days |
@@ -347,6 +395,12 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 | `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only dashboard Unix socket |
 
 Invalid bounded values stop startup instead of silently changing behavior.
+
+The total limit is always the hard upper bound. New challenges stop at
+`limit - notice reserve`; verification hints, corrections, timeout warnings, and result notices can
+use the remaining capacity but cannot exceed either the total limit or the per-sender notice limit.
+The `status` command reports `outbound_total_1h`, `outbound_challenge_1h`,
+`outbound_notice_1h`, and `outbound_quota_rejected_1h` without raw sender identifiers.
 
 ### Dedicated test sender
 

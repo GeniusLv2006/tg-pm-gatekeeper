@@ -170,6 +170,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self,
         *,
         outbound_limit: int = 10,
+        outbound_notice_reserve: int | None = None,
+        outbound_notice_sender_limit: int = 3,
         test_sender_id: int | None = None,
     ) -> GatekeeperService:
         return GatekeeperService(
@@ -178,6 +180,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             challenge_ttl_seconds=60,
             challenge_max_attempts=2,
             outbound_limit_per_hour=outbound_limit,
+            outbound_notice_reserve_per_hour=outbound_notice_reserve,
+            outbound_notice_limit_per_sender_per_hour=outbound_notice_sender_limit,
             test_sender_id=test_sender_id,
             active_case_protector=self.review_protector,
             challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
@@ -590,11 +594,21 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dedicated_test_sender_bypasses_outbound_limit(self) -> None:
         service = self.make_service(outbound_limit=1, test_sender_id=TEST_SENDER_ID)
-        self.store.claim_outbound_slot(1, self.now)
+        self.store.claim_outbound_slot(
+            limit=1,
+            notice_reserve=0,
+            notice_sender_limit=3,
+            sender_key="other-sender",
+            category="challenge",
+            now=self.now,
+        )
         outcome = await service.handle(
             self.message(1, sender_id=TEST_SENDER_ID), FakeActions()
         )
         self.assertEqual(outcome, "challenged")
+        self.assertEqual(
+            self.store.outbound_statistics(now=self.now)["outbound_total_1h"], 1
+        )
 
     async def test_standalone_answer_does_not_consume_attempt_and_guides_once(
         self,
@@ -781,7 +795,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limit_fallback_archives_and_enqueues_review(self) -> None:
         self.store.set_mode("protect")
         service = self.make_service(outbound_limit=1)
-        self.store.claim_outbound_slot(1, self.now)
+        self.store.claim_outbound_slot(
+            limit=1,
+            notice_reserve=0,
+            notice_sender_limit=3,
+            sender_key="other-sender",
+            category="challenge",
+            now=self.now,
+        )
         reference = self.protector.seal_review_reference(123456789, 456, 1)
         actions = FakeActions()
         outcome = await service.handle(
@@ -795,12 +816,60 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "challenge_unavailable",
         )
 
+    async def test_reserved_capacity_keeps_existing_challenge_notice_available(
+        self,
+    ) -> None:
+        service = self.make_service(outbound_limit=4, outbound_notice_reserve=2)
+        for index in range(2):
+            self.assertTrue(
+                self.store.claim_outbound_slot(
+                    limit=4,
+                    notice_reserve=2,
+                    notice_sender_limit=3,
+                    sender_key=f"other-{index}",
+                    category="challenge",
+                    now=self.now,
+                )
+            )
+        self.store.set_mode("protect")
+        fallback = await service.handle(self.message(1), FakeActions())
+        self.assertEqual(fallback, "quarantined_rate_limited")
+
+        sender_key = self.set_active_challenge(sender_id=234567890)
+        actions = FakeActions()
+        outcome = await service.handle(
+            self.message(
+                2,
+                "11",
+                sender_id=234567890,
+                reply_to_message_id=100,
+            ),
+            actions,
+        )
+        self.assertEqual(outcome, "challenge_incorrect")
+        self.assertEqual(len(actions.sent), 1)
+        self.assertEqual(
+            self.store.sender(sender_key).status,
+            "challenged",
+        )
+        metrics = self.store.outbound_statistics(now=self.now)
+        self.assertEqual(metrics["outbound_challenge_1h"], 2)
+        self.assertEqual(metrics["outbound_notice_1h"], 1)
+        self.assertEqual(metrics["outbound_quota_rejected_1h"], 1)
+
     async def test_rate_limit_archive_failure_stays_unknown_and_enqueues_review(
         self,
     ) -> None:
         self.store.set_mode("protect")
         service = self.make_service(outbound_limit=1)
-        self.store.claim_outbound_slot(1, self.now)
+        self.store.claim_outbound_slot(
+            limit=1,
+            notice_reserve=0,
+            notice_sender_limit=3,
+            sender_key="other-sender",
+            category="challenge",
+            now=self.now,
+        )
         reference = self.protector.seal_review_reference(123456789, 456, 1)
         outcome = await service.handle(
             self.message(1, review_reference=reference),

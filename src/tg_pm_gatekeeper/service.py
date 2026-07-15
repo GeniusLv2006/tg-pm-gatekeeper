@@ -222,6 +222,8 @@ class GatekeeperService:
         challenge_ttl_seconds: int = 60,
         challenge_max_attempts: int = 2,
         outbound_limit_per_hour: int = 10,
+        outbound_notice_reserve_per_hour: int | None = None,
+        outbound_notice_limit_per_sender_per_hour: int = 3,
         pending_review_retention_days: int = 7,
         active_case_retention_days: int = 30,
         denylist: frozenset[str] = frozenset(),
@@ -235,6 +237,18 @@ class GatekeeperService:
         self.challenge_ttl_seconds = challenge_ttl_seconds
         self.challenge_max_attempts = challenge_max_attempts
         self.outbound_limit_per_hour = outbound_limit_per_hour
+        self.outbound_notice_reserve_per_hour = (
+            min(3, outbound_limit_per_hour - 1)
+            if outbound_notice_reserve_per_hour is None
+            else outbound_notice_reserve_per_hour
+        )
+        self.outbound_notice_limit_per_sender_per_hour = (
+            outbound_notice_limit_per_sender_per_hour
+        )
+        if not 0 <= self.outbound_notice_reserve_per_hour < outbound_limit_per_hour:
+            raise ValueError("invalid outbound notice reserve")
+        if self.outbound_notice_limit_per_sender_per_hour < 1:
+            raise ValueError("invalid per-sender outbound notice limit")
         self.pending_review_retention_days = min(pending_review_retention_days, 7)
         self.active_case_retention_days = min(active_case_retention_days, 30)
         self.denylist = denylist
@@ -621,7 +635,7 @@ class GatekeeperService:
             severity=severity,
             now=now,
         )
-        if not self._claim_outbound_slot(sender_key, now):
+        if not self._claim_outbound_slot(sender_key, "challenge", now):
             return await self._rate_limit_fallback(sender_key, message, actions, now)
 
         challenge = self.challenge_factory()
@@ -1019,7 +1033,7 @@ class GatekeeperService:
         reply_to_message_id: int | None = None,
         formatting: tuple[TextStyleSpan, ...] = (),
     ) -> int | None:
-        if not self._claim_outbound_slot(sender_key, now):
+        if not self._claim_outbound_slot(sender_key, "notice", now):
             self.store.audit(sender_key, "OUTBOUND_RATE_LIMIT", "suppressed", now)
             return None
         try:
@@ -1034,9 +1048,16 @@ class GatekeeperService:
             self.store.audit(sender_key, "OUTBOUND_NOTICE", "action_failed", now)
             return None
 
-    def _claim_outbound_slot(self, sender_key: str, now: int) -> bool:
+    def _claim_outbound_slot(
+        self, sender_key: str, category: str, now: int
+    ) -> bool:
         return sender_key == self.test_sender_key or self.store.claim_outbound_slot(
-            self.outbound_limit_per_hour, now
+            limit=self.outbound_limit_per_hour,
+            notice_reserve=self.outbound_notice_reserve_per_hour,
+            notice_sender_limit=self.outbound_notice_limit_per_sender_per_hour,
+            sender_key=sender_key,
+            category=category,
+            now=now,
         )
 
     async def _finalize_timeout_failure(

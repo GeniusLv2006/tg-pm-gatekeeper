@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore, StoreMigrationError
@@ -25,6 +27,88 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_mode(), "monitor")
         self.store.set_mode("protect")
         self.assertEqual(self.store.get_mode(), "protect")
+
+    def test_outbound_reserve_sender_limit_and_status_metrics(self) -> None:
+        common = {
+            "limit": 5,
+            "notice_reserve": 2,
+            "notice_sender_limit": 2,
+            "now": 1000,
+        }
+        for index in range(3):
+            self.assertTrue(
+                self.store.claim_outbound_slot(
+                    **common,
+                    sender_key=f"challenge-{index}",
+                    category="challenge",
+                )
+            )
+        self.assertFalse(
+            self.store.claim_outbound_slot(
+                **common, sender_key="challenge-blocked", category="challenge"
+            )
+        )
+        for _ in range(2):
+            self.assertTrue(
+                self.store.claim_outbound_slot(
+                    **common, sender_key="notice-sender", category="notice"
+                )
+            )
+        self.assertFalse(
+            self.store.claim_outbound_slot(
+                **common, sender_key="notice-sender", category="notice"
+            )
+        )
+        self.assertFalse(
+            self.store.claim_outbound_slot(
+                **common, sender_key="other-notice-sender", category="notice"
+            )
+        )
+        self.assertEqual(
+            self.store.outbound_statistics(now=1000),
+            {
+                "outbound_total_1h": 5,
+                "outbound_challenge_1h": 3,
+                "outbound_notice_1h": 2,
+                "outbound_quota_rejected_1h": 3,
+            },
+        )
+        self.assertEqual(self.store.statistics(now=1000)["outbound_total_1h"], 5)
+
+    def test_outbound_claim_is_atomic_across_connections(self) -> None:
+        path = Path(self.temp.name) / "concurrent.sqlite3"
+        seed = StateStore(path)
+        seed.close()
+        barrier = threading.Barrier(10)
+
+        def claim(index: int) -> bool:
+            store = StateStore(path)
+            try:
+                barrier.wait()
+                return store.claim_outbound_slot(
+                    limit=4,
+                    notice_reserve=0,
+                    notice_sender_limit=3,
+                    sender_key=f"sender-{index}",
+                    category="challenge",
+                    now=1000,
+                )
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            outcomes = list(executor.map(claim, range(10)))
+
+        self.assertEqual(sum(outcomes), 4)
+        verify = StateStore(path)
+        try:
+            self.assertEqual(verify.outbound_statistics(now=1000)["outbound_total_1h"], 4)
+            self.assertEqual(
+                verify.outbound_statistics(now=1000)["outbound_quota_rejected_1h"],
+                6,
+            )
+        finally:
+            verify.close()
 
     def test_message_claim_is_idempotent(self) -> None:
         self.assertTrue(self.store.claim_message("sender", 1, 100))
@@ -387,7 +471,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -425,7 +509,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                4,
+                5,
             )
         finally:
             reopened.close()
@@ -459,7 +543,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.sender("sender").revision, 0)
             self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 4
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 5
             )
         finally:
             store.close()
@@ -479,7 +563,7 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 4
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 5
             )
         finally:
             reopened.close()
@@ -503,7 +587,41 @@ class StoreMigrationTests(unittest.TestCase):
             }
             self.assertIn("restriction_reference", columns)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 4
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 5
+            )
+        finally:
+            reopened.close()
+
+    def test_v4_outbound_events_migrate_as_legacy_without_sender_ids(self) -> None:
+        store = StateStore(self.path)
+        store._connection.executescript(
+            """
+            DROP INDEX outbound_events_sender_category_time_idx;
+            DROP INDEX outbound_events_time_idx;
+            ALTER TABLE outbound_events RENAME TO outbound_events_v5;
+            CREATE TABLE outbound_events (created_at INTEGER NOT NULL);
+            INSERT INTO outbound_events VALUES (1000), (1001);
+            DROP TABLE outbound_events_v5;
+            PRAGMA user_version=4;
+            """
+        )
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            rows = reopened._connection.execute(
+                "SELECT sender_key,category,created_at FROM outbound_events "
+                "ORDER BY created_at"
+            ).fetchall()
+            self.assertEqual(
+                [(row["sender_key"], row["category"], row["created_at"]) for row in rows],
+                [(None, "legacy", 1000), (None, "legacy", 1001)],
+            )
+            self.assertEqual(
+                reopened.outbound_statistics(now=1001)["outbound_total_1h"], 2
+            )
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 5
             )
         finally:
             reopened.close()

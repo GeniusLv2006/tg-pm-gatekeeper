@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -68,8 +68,18 @@ CREATE TABLE IF NOT EXISTS link_events (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS link_events_sender_time_idx ON link_events(sender_key, created_at);
-CREATE TABLE IF NOT EXISTS outbound_events (created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS outbound_events (
+    sender_key TEXT,
+    category TEXT NOT NULL CHECK (category IN (
+        'legacy', 'challenge', 'notice', 'challenge_rejected', 'notice_rejected'
+    )),
+    created_at INTEGER NOT NULL,
+    CHECK ((category='legacy' AND sender_key IS NULL) OR
+           (category!='legacy' AND sender_key IS NOT NULL))
+);
 CREATE INDEX IF NOT EXISTS outbound_events_time_idx ON outbound_events(created_at);
+CREATE INDEX IF NOT EXISTS outbound_events_sender_category_time_idx
+    ON outbound_events(sender_key, category, created_at);
 CREATE TABLE IF NOT EXISTS automated_messages (
     sender_key TEXT NOT NULL,
     message_id INTEGER NOT NULL,
@@ -267,10 +277,10 @@ class StateStore:
             return
         if version == 0:
             self._migrate_v0_to_v1()
-            version = SCHEMA_VERSION
+            version = 4
         elif version == 1:
             self._migrate_v1_to_v2()
-            version = SCHEMA_VERSION
+            version = 4
         else:
             if version == 2:
                 self._migrate_v2_to_v3()
@@ -278,6 +288,9 @@ class StateStore:
             if version == 3:
                 self._migrate_v3_to_v4()
                 version = 4
+        if version == 4:
+            self._migrate_v4_to_v5()
+            version = 5
         if version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
@@ -319,7 +332,7 @@ class StateStore:
                 "WHEN 'observe' THEN 'monitor' WHEN 'enforce' THEN 'protect' "
                 "ELSE value END WHERE key='mode'"
             )
-            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version=4")
         except Exception:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -338,7 +351,52 @@ class StateStore:
                 self._connection.execute(
                     "ALTER TABLE sender_state ADD COLUMN restriction_reference BLOB"
                 )
-            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version=4")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _migrate_v4_to_v5(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            table = self._connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='outbound_events'"
+            ).fetchone()
+            self._connection.execute("DROP INDEX IF EXISTS outbound_events_time_idx")
+            self._connection.execute(
+                "DROP INDEX IF EXISTS outbound_events_sender_category_time_idx"
+            )
+            if table is not None:
+                self._connection.execute(
+                    "ALTER TABLE outbound_events RENAME TO outbound_events_v4"
+                )
+            self._connection.execute(
+                "CREATE TABLE outbound_events ("
+                "sender_key TEXT,category TEXT NOT NULL CHECK (category IN ("
+                "'legacy','challenge','notice','challenge_rejected',"
+                "'notice_rejected')),created_at INTEGER NOT NULL,"
+                "CHECK ((category='legacy' AND sender_key IS NULL) OR "
+                "(category!='legacy' AND sender_key IS NOT NULL)))"
+            )
+            if table is not None:
+                self._connection.execute(
+                    "INSERT INTO outbound_events(sender_key,category,created_at) "
+                    "SELECT NULL,'legacy',created_at FROM outbound_events_v4"
+                )
+                self._connection.execute("DROP TABLE outbound_events_v4")
+            self._connection.execute(
+                "CREATE INDEX outbound_events_time_idx "
+                "ON outbound_events(created_at)"
+            )
+            self._connection.execute(
+                "CREATE INDEX outbound_events_sender_category_time_idx "
+                "ON outbound_events(sender_key,category,created_at)"
+            )
+            self._connection.execute("PRAGMA user_version=5")
         except Exception:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -375,7 +433,7 @@ class StateStore:
                 "WHEN 'observe' THEN 'monitor' WHEN 'enforce' THEN 'protect' "
                 "ELSE value END WHERE key='mode'"
             )
-            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            self._connection.execute("PRAGMA user_version=4")
         except Exception:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -1492,21 +1550,91 @@ class StateStore:
                 (sender_key, timestamp),
             )
 
-    def claim_outbound_slot(self, limit: int, now: int | None = None) -> bool:
-        timestamp = now or int(time.time())
-        with self._lock, self._connection:
-            self._connection.execute(
-                "DELETE FROM outbound_events WHERE created_at < ?", (timestamp - 3600,)
-            )
-            count = self._connection.execute(
-                "SELECT COUNT(*) FROM outbound_events"
-            ).fetchone()[0]
-            if count >= limit:
-                return False
-            self._connection.execute(
-                "INSERT INTO outbound_events(created_at) VALUES (?)", (timestamp,)
-            )
-            return True
+    def claim_outbound_slot(
+        self,
+        *,
+        limit: int,
+        notice_reserve: int,
+        notice_sender_limit: int,
+        sender_key: str,
+        category: str,
+        now: int | None = None,
+    ) -> bool:
+        if limit < 1:
+            raise ValueError("outbound limit must be positive")
+        if not 0 <= notice_reserve < limit:
+            raise ValueError("notice reserve must be between zero and limit minus one")
+        if notice_sender_limit < 1:
+            raise ValueError("sender notice limit must be positive")
+        if not sender_key:
+            raise ValueError("sender key is required")
+        if category not in {"challenge", "notice"}:
+            raise ValueError("invalid outbound category")
+        timestamp = int(time.time()) if now is None else now
+        rejected_category = f"{category}_rejected"
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                cutoff = timestamp - 3600
+                self._connection.execute(
+                    "DELETE FROM outbound_events WHERE created_at < ?", (cutoff,)
+                )
+                total = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM outbound_events WHERE created_at>=? "
+                        "AND category IN ('legacy','challenge','notice')",
+                        (cutoff,),
+                    ).fetchone()[0]
+                )
+                allowed = total < limit
+                if category == "challenge":
+                    allowed = allowed and total < limit - notice_reserve
+                else:
+                    sender_notices = int(
+                        self._connection.execute(
+                            "SELECT COUNT(*) FROM outbound_events "
+                            "WHERE created_at>=? AND sender_key=? AND category='notice'",
+                            (cutoff, sender_key),
+                        ).fetchone()[0]
+                    )
+                    allowed = allowed and sender_notices < notice_sender_limit
+                self._connection.execute(
+                    "INSERT INTO outbound_events(sender_key,category,created_at) "
+                    "VALUES (?,?,?)",
+                    (
+                        sender_key,
+                        category if allowed else rejected_category,
+                        timestamp,
+                    ),
+                )
+            except Exception:
+                self._connection.execute("ROLLBACK")
+                raise
+            else:
+                self._connection.execute("COMMIT")
+        return allowed
+
+    def outbound_statistics(self, *, now: int | None = None) -> dict[str, int]:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT category,COUNT(*) AS count FROM outbound_events "
+                "WHERE created_at>=? GROUP BY category",
+                (timestamp - 3600,),
+            ).fetchall()
+        counts = {str(row["category"]): int(row["count"]) for row in rows}
+        return {
+            "outbound_total_1h": sum(
+                counts.get(category, 0)
+                for category in ("legacy", "challenge", "notice")
+            ),
+            "outbound_challenge_1h": counts.get("challenge", 0),
+            "outbound_notice_1h": counts.get("notice", 0),
+            "outbound_quota_rejected_1h": (
+                counts.get("challenge_rejected", 0)
+                + counts.get("notice_rejected", 0)
+            ),
+        }
 
     def record_automated_message(
         self, sender_key: str, message_id: int, now: int | None = None
@@ -1673,7 +1801,7 @@ class StateStore:
                     "SELECT COUNT(*) FROM pending_actions WHERE status='failed'"
                 ).fetchone()[0]
             )
-        return {
+        result: dict[str, int | str | None] = {
             "mode": self.get_mode(),
             "allowed": states.get("allowed", 0),
             "challenged": states.get("challenged", 0),
@@ -1701,3 +1829,5 @@ class StateStore:
                 "CHALLENGE_RESTORE", 0
             ),
         }
+        result.update(self.outbound_statistics(now=timestamp))
+        return result

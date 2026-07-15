@@ -29,6 +29,8 @@ class InitializeTests(unittest.TestCase):
         self.assertIn("TG_REVIEW_KEY_FILE=/run/secrets/review_key", config)
         self.assertIn("TG_PENDING_REVIEW_RETENTION_DAYS=7", config)
         self.assertIn("TG_ACTIVE_CASE_RETENTION_DAYS=30", config)
+        self.assertIn("TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR=3", config)
+        self.assertIn("TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR=3", config)
         self.assertIn("TG_TEST_SENDER_ID=\n", config)
         self.assertNotIn("REPLACE_WITH_", config)
 
@@ -71,6 +73,45 @@ class InitializeTests(unittest.TestCase):
         ):
             with self.subTest(name=name), patch.dict(
                 os.environ, {name: value}, clear=True
+            ):
+                with self.assertRaisesRegex(ConfigurationError, expected):
+                    Settings.from_environment(require_telegram=False)
+
+    def test_outbound_reserve_configuration_uses_limit_aware_bounds(self) -> None:
+        with patch.dict(
+            os.environ, {"TG_OUTBOUND_LIMIT_PER_HOUR": "2"}, clear=True
+        ):
+            settings = Settings.from_environment(require_telegram=False)
+            self.assertEqual(settings.outbound_notice_reserve_per_hour, 1)
+            self.assertEqual(
+                settings.outbound_notice_limit_per_sender_per_hour, 3
+            )
+        with patch.dict(
+            os.environ,
+            {
+                "TG_OUTBOUND_LIMIT_PER_HOUR": "1",
+                "TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR": "0",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_environment(require_telegram=False)
+            self.assertEqual(settings.outbound_notice_reserve_per_hour, 0)
+        for values, expected in (
+            (
+                {
+                    "TG_OUTBOUND_LIMIT_PER_HOUR": "4",
+                    "TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR": "4",
+                },
+                "between 0 and 3",
+            ),
+            ({"TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR": "-1"}, "between 0 and 9"),
+            (
+                {"TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR": "0"},
+                "must be positive",
+            ),
+        ):
+            with self.subTest(values=values), patch.dict(
+                os.environ, values, clear=True
             ):
                 with self.assertRaisesRegex(ConfigurationError, expected):
                     Settings.from_environment(require_telegram=False)
