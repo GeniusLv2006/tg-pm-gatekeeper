@@ -88,6 +88,8 @@ class StoreTests(unittest.TestCase):
 
     def test_heartbeat_health(self) -> None:
         self.store.heartbeat(100)
+        self.assertTrue(self.store.healthy(now=95))
+        self.assertFalse(self.store.healthy(now=94))
         self.assertTrue(self.store.healthy(now=150))
         self.assertFalse(self.store.healthy(now=221))
 

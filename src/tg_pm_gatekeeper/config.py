@@ -13,6 +13,10 @@ class ConfigurationError(RuntimeError):
     """Raised when runtime configuration violates the security boundary."""
 
 
+class PrivateFileError(ConfigurationError):
+    """Raised when a required private file cannot be read safely."""
+
+
 def _required(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value or value.startswith("REPLACE_WITH_"):
@@ -56,17 +60,20 @@ def read_private_file(
 ) -> bytes:
     try:
         info = path.lstat()
-    except FileNotFoundError as exc:
-        raise ConfigurationError(f"required private file is missing: {path}") from exc
+    except OSError as exc:
+        raise PrivateFileError(f"required private file is unavailable: {path}") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise ConfigurationError(f"private file must be a regular non-symlink: {path}")
+        raise PrivateFileError(f"private file must be a regular non-symlink: {path}")
     if info.st_mode & 0o077:
-        raise ConfigurationError(f"private file permissions are too broad: {path}")
-    value = path.read_bytes()
+        raise PrivateFileError(f"private file permissions are too broad: {path}")
+    try:
+        value = path.read_bytes()
+    except OSError as exc:
+        raise PrivateFileError(f"required private file is unreadable: {path}") from exc
     if strip:
         value = value.strip()
     if len(value) < minimum_bytes:
-        raise ConfigurationError(f"private file is empty or too short: {path}")
+        raise PrivateFileError(f"private file is empty or too short: {path}")
     return value
 
 

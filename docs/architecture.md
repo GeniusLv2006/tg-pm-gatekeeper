@@ -249,6 +249,11 @@ after successful verification, rollback, or manual allowance.
 ## Failure behavior
 
 - Incoming messages, timeouts, recovery, and review decisions are serialized per derived sender key.
+- If Telegram history lookup fails, the sender is treated as having no trusted history and still
+  enters normal screening; a privacy-safe audit event records the degraded lookup.
+- The heartbeat and pruning loop is supervised with the Telegram connection. An unexpected failure
+  terminates the process so the container restart policy can recover it instead of leaving a
+  connected but unsupervised client running.
 - Challenge delivery is persisted in issuing and archiving phases. Startup reconciles a sent prompt,
   retries the reversible archive action, and resets incomplete work when it cannot recover safely.
 - Activated challenges are already archived, so timeout and restart recovery require only an atomic

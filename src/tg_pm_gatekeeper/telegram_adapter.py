@@ -58,6 +58,10 @@ GATEKEEPER_MESSAGE_PREFIXES = (
 )
 
 
+class TelegramAuthorizationError(RuntimeError):
+    """Raised when the configured Telegram session cannot operate the client."""
+
+
 def formatting_entities_from_spans(
     text: str, spans: tuple[TextStyleSpan, ...]
 ) -> list[types.TypeMessageEntity]:
@@ -410,7 +414,7 @@ class TelegramAdapter:
     async def run(self) -> None:
         await self.client.connect()
         if not await self.client.is_user_authorized():
-            raise RuntimeError("telegram session is not authorized")
+            raise TelegramAuthorizationError("telegram session is not authorized")
         await self.client.get_me()
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
@@ -419,17 +423,36 @@ class TelegramAdapter:
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
         )
+        disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         LOG.info("service_started")
         try:
-            await self.client.run_until_disconnected()
+            disconnect_task = asyncio.create_task(self.client.run_until_disconnected())
+            done, _ = await asyncio.wait(
+                (disconnect_task, self._heartbeat_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if self._heartbeat_task in done:
+                failure = self._heartbeat_task.exception()
+                if failure is not None:
+                    raise failure
+                raise RuntimeError("heartbeat task stopped unexpectedly")
+            await disconnect_task
         finally:
-            if self._heartbeat_task:
-                self._heartbeat_task.cancel()
-            for task in self._timeout_tasks.values():
+            tasks = [
+                task
+                for task in (
+                    disconnect_task,
+                    self._heartbeat_task,
+                    *self._timeout_tasks.values(),
+                    *self._maintenance_tasks,
+                )
+                if task is not None
+            ]
+            for task in tasks:
                 task.cancel()
-            for task in self._maintenance_tasks:
-                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             await self._review_admin.stop()
             await self.client.disconnect()
 
@@ -462,11 +485,22 @@ class TelegramAdapter:
                 and not getattr(sender, "contact", False)
                 and sender_id not in SERVICE_USER_IDS
             ):
-                trusted_history = await self._has_prior_outgoing(
-                    event,
-                    sender_key,
-                    since=state.updated_at if state.status == "provisional" else None,
-                )
+                try:
+                    trusted_history = await self._has_prior_outgoing(
+                        event,
+                        sender_key,
+                        since=(
+                            state.updated_at if state.status == "provisional" else None
+                        ),
+                    )
+                except Exception:
+                    self.store.audit(
+                        sender_key,
+                        "TRUSTED_HISTORY_LOOKUP",
+                        "action_failed",
+                        int(time.time()),
+                    )
+                    LOG.warning("trusted_history_lookup_failed")
             sent_at = message_timestamp(event.message, fallback=int(time.time()))
             incoming = IncomingMessage(
                 sender_id=sender_id,
