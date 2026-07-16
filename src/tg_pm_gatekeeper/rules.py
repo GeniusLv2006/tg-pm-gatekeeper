@@ -8,7 +8,7 @@ import unicodedata
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
-from .policy import DetectionResult, Severity
+from .policy import EvidenceSignal, SignalSource
 
 URL_RE = re.compile(r"(?i)(?:https?://|tg://|www\.)[^\s<>()\[\]{}]+")
 TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？'\"”’》】）"
@@ -18,6 +18,16 @@ ASCII_HOSTNAME_RE = re.compile(
 )
 
 PROMOTION_TERMS: dict[str, tuple[str, ...]] = {
+    "general": (
+        "推广",
+        "联盟",
+        "引流",
+        "代发",
+        "代理",
+        "加盟",
+        "promotion",
+        "affiliate",
+    ),
     "gambling": (
         "博彩",
         "下注",
@@ -63,6 +73,9 @@ CRYPTO_SERVICE_TERMS = ("转账", "能量", "带宽", "代付", "gas fee")
 COMMERCIAL_TERMS = ("下单", "购买", "出售", "兑换", "客服", "活动", "联系")
 CRYPTO_ASSET_RE = re.compile(r"(?<![a-z])(?:trx|usdt|usdc|ton)(?![a-z])")
 USERNAME_RE = re.compile(r"(?<![a-z0-9_@])@[a-z0-9_]{5,32}(?![a-z0-9_])", re.IGNORECASE)
+LOW_INFORMATION_OPENERS = frozenset(
+    {"在吗", "滴滴", "你好", "您好", "hi", "hello", "hey"}
+)
 
 
 def normalize_text(text: str) -> str:
@@ -226,35 +239,37 @@ class MessageFacts:
         return bool(self.urls or self.has_link_button)
 
 
-@dataclass(frozen=True, slots=True)
-class RuleDecision:
-    rule_codes: tuple[str, ...]
-    severity: Severity
-
-    @property
-    def hard_spam(self) -> bool:
-        return self.severity in {"high", "critical"}
-
-    def detection_result(self) -> DetectionResult:
-        return DetectionResult(
-            detector="hard_rules",
-            signals=self.rule_codes,
-            severity=self.severity,
-        )
+def _signal(
+    code: str,
+    source: SignalSource,
+    weight: int,
+    explanation: str,
+) -> EvidenceSignal:
+    return EvidenceSignal(code, source, weight, explanation)
 
 
-def evaluate_hard_rules(
+def detect_evidence_signals(
     facts: MessageFacts,
     *,
     previous_link_messages: int = 0,
     denylist: frozenset[str] = frozenset(),
-) -> RuleDecision:
-    rules: list[str] = []
+) -> tuple[EvidenceSignal, ...]:
+    signals: list[EvidenceSignal] = []
     normalized = normalize_text(facts.text)
     normalized_preview = normalize_text(facts.preview_text)
     normalized_quote = normalize_text(facts.quote_text)
-    promotion = any(
-        term in normalized or term in normalized_preview
+    authored_promotion = any(
+        term in normalized
+        for terms in PROMOTION_TERMS.values()
+        for term in terms
+    )
+    preview_promotion = any(
+        term in normalized_preview
+        for terms in PROMOTION_TERMS.values()
+        for term in terms
+    )
+    quoted_promotion = any(
+        term in normalized_quote
         for terms in PROMOTION_TERMS.values()
         for term in terms
     )
@@ -265,40 +280,232 @@ def evaluate_hard_rules(
     quoted_commercial_signal = any(
         term in normalized_quote for term in COMMERCIAL_TERMS
     ) or bool(USERNAME_RE.search(normalized_quote))
+    quoted_promotion = quoted_promotion or (
+        quoted_crypto_asset
+        and quoted_service_signals >= 2
+        and quoted_commercial_signal
+    )
 
     link_button_count = max(facts.link_button_count, int(facts.has_link_button))
-    normalized_urls = {
+    authored_url_keys = {
         key for url in facts.urls if (key := normalized_url_key(url)) is not None
     }
-    multiple_links = len(normalized_urls) >= 2 or len(set(facts.domains)) >= 2
+    quote_url_keys = {
+        key
+        for url in facts.quote_urls
+        if (key := normalized_url_key(url)) is not None
+    }
+    all_urls = tuple(facts.urls) + tuple(facts.quote_urls)
+    link_kinds = {telegram_link_kind(url) for url in all_urls}
 
-    if link_button_count >= 2:
-        rules.append("HR-01_MULTIPLE_LINK_BUTTONS")
-    if facts.is_forwarded and facts.has_link_button:
-        rules.append("HR-02_FORWARDED_LINK_BUTTON")
-    if promotion and facts.has_link:
-        rules.append("HR-03_PROMOTION_WITH_LINK")
-    if multiple_links and (facts.is_forwarded or promotion):
-        rules.append("HR-04_MULTIPLE_LINKS")
-    if previous_link_messages >= 1 and facts.has_link:
-        rules.append("HR-05_LINK_BURST")
-    if denylist and any(domain_is_denied(domain, denylist) for domain in facts.domains):
-        rules.append("HR-06_DENIED_DOMAIN")
-    if quoted_crypto_asset and quoted_service_signals >= 2 and quoted_commercial_signal:
-        rules.append("HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION")
-    critical = {
-        "HR-01_MULTIPLE_LINK_BUTTONS",
-        "HR-02_FORWARDED_LINK_BUTTON",
-        "HR-06_DENIED_DOMAIN",
-    }
-    high = {
-        "HR-03_PROMOTION_WITH_LINK",
-        "HR-04_MULTIPLE_LINKS",
-        "HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION",
-    }
-    severity = (
-        "critical"
-        if critical.intersection(rules)
-        else ("high" if high.intersection(rules) else ("signal" if rules else "none"))
+    if normalized in LOW_INFORMATION_OPENERS:
+        signals.append(
+            _signal(
+                "LOW_INFORMATION_OPENER",
+                "authored",
+                5,
+                "The authored message is a low-information opener.",
+            )
+        )
+    if any(kind == "invite" for kind in link_kinds):
+        source: SignalSource = (
+            "quoted"
+            if not any(telegram_link_kind(url) == "invite" for url in facts.urls)
+            else "authored"
+        )
+        signals.append(
+            _signal(
+                "TELEGRAM_INVITE",
+                source,
+                10,
+                "A Telegram invitation link is present.",
+            )
+        )
+    invite_button = any(
+        telegram_link_kind(url) == "invite" for url in facts.button_urls
     )
-    return RuleDecision(rule_codes=tuple(rules), severity=severity)
+    if link_button_count == 1 and not invite_button:
+        signals.append(
+            _signal(
+                "LINK_BUTTON",
+                "button",
+                10,
+                "The message contains one interactive link button.",
+            )
+        )
+    if facts.is_forwarded:
+        signals.append(
+            _signal(
+                "FORWARDED_PAYLOAD",
+                "behavior",
+                10,
+                "Telegram marks the message as forwarded.",
+            )
+        )
+    if previous_link_messages >= 1 and facts.has_link:
+        signals.append(
+            _signal(
+                "LINK_BURST",
+                "behavior",
+                10,
+                "The sender recently sent another link-bearing message.",
+            )
+        )
+    if len(authored_url_keys) >= 2 or len(set(facts.domains)) >= 2:
+        signals.append(
+            _signal(
+                "MULTIPLE_LINKS",
+                "authored",
+                15,
+                "The authored message contains multiple distinct links.",
+            )
+        )
+    if len(quote_url_keys) >= 2 or len(set(facts.quote_domains)) >= 2:
+        signals.append(
+            _signal(
+                "QUOTED_MULTIPLE_LINKS",
+                "quoted",
+                15,
+                "The quoted context contains multiple distinct links.",
+            )
+        )
+    if quoted_promotion:
+        signals.append(
+            _signal(
+                "QUOTED_PROMOTIONAL_LANGUAGE",
+                "quoted",
+                15,
+                "The quoted context contains promotional language.",
+            )
+        )
+    if "external_web" in link_kinds and "invite" in link_kinds:
+        signals.append(
+            _signal(
+                "EXTERNAL_AND_TELEGRAM_LINKS",
+                "behavior",
+                15,
+                "External web and Telegram invitation links appear together.",
+            )
+        )
+    if authored_promotion:
+        signals.append(
+            _signal(
+                "PROMOTIONAL_LANGUAGE",
+                "authored",
+                20,
+                "The authored message contains promotional language.",
+            )
+        )
+    elif preview_promotion:
+        signals.append(
+            _signal(
+                "PROMOTIONAL_LANGUAGE",
+                "preview",
+                20,
+                "Telegram webpage preview metadata contains promotional language.",
+            )
+        )
+    if facts.is_forwarded and facts.has_link_button:
+        signals.append(
+            _signal(
+                "FORWARDED_LINK_BUTTON",
+                "button",
+                25,
+                "A forwarded message contains an interactive link button.",
+            )
+        )
+    elif link_button_count >= 2:
+        signals.append(
+            _signal(
+                "MULTIPLE_LINK_BUTTONS",
+                "button",
+                25,
+                "The message contains multiple interactive link buttons.",
+            )
+        )
+    authored_denied_code: str | None = None
+    if denylist and any(
+        domain_is_denied(domain, denylist) for domain in facts.domains
+    ):
+        button_domains = {
+            domain
+            for url in facts.button_urls
+            if (domain := normalized_domain(url)) is not None
+        }
+        preview_domains = {
+            domain
+            for url in facts.preview_urls
+            if (domain := normalized_domain(url)) is not None
+        }
+        authored_denied_code = (
+            "BUTTON_DENIED_DOMAIN"
+            if any(domain_is_denied(domain, denylist) for domain in button_domains)
+            else (
+                "PREVIEW_DENIED_DOMAIN"
+                if any(
+                    domain_is_denied(domain, denylist)
+                    for domain in preview_domains
+                )
+                else "AUTHORED_DENIED_DOMAIN"
+            )
+        )
+    if authored_denied_code is not None:
+        signals.append(
+            _signal(
+                authored_denied_code,
+                "owner_policy",
+                100,
+                "A non-quoted link matches the owner's local domain denylist.",
+            )
+        )
+    elif denylist and any(
+        domain_is_denied(domain, denylist) for domain in facts.quote_domains
+    ):
+        signals.append(
+            _signal(
+                "QUOTED_DENIED_DOMAIN",
+                "owner_policy",
+                30,
+                "A quoted-context link matches the owner's local domain denylist.",
+            )
+        )
+
+    return tuple(signals)
+
+
+def campaign_candidate(
+    facts: MessageFacts, signals: tuple[EvidenceSignal, ...]
+) -> str | None:
+    codes = {signal.code for signal in signals}
+    if "QUOTED_PROMOTIONAL_LANGUAGE" in codes and facts.quote_urls:
+        text = normalize_text(facts.quote_text)
+        urls = sorted(
+            key
+            for url in facts.quote_urls
+            if (key := normalized_url_key(url)) is not None
+        )
+        source = "quoted"
+    elif "PROMOTIONAL_LANGUAGE" in codes and facts.urls:
+        text = normalize_text(
+            "\n".join((facts.text, facts.preview_text, *facts.button_texts))
+        )
+        urls = sorted(
+            key
+            for url in facts.urls
+            if (key := normalized_url_key(url)) is not None
+        )
+        source = "authored"
+    else:
+        return None
+    if not text or not urls:
+        return None
+    return f"adaptive-v1:{source}:{text}:{'|'.join(urls)}"
+
+
+def repeated_campaign_signal() -> EvidenceSignal:
+    return _signal(
+        "REPEATED_CAMPAIGN",
+        "behavior",
+        40,
+        "The same promotional payload appeared from another sender within 24 hours.",
+    )

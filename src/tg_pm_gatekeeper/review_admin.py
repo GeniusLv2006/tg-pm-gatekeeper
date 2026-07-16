@@ -179,6 +179,9 @@ class ReviewAdminServer:
         *,
         mute_days: int,
         cancel_timeout: Callable[[str], None] = lambda _sender_key: None,
+        schedule_dialog_deletion: Callable[[int, int], None] = (
+            lambda _action_id, _delete_at: None
+        ),
         restriction_actions: RestrictionActions | None = None,
     ) -> None:
         self.socket_path = socket_path
@@ -188,6 +191,7 @@ class ReviewAdminServer:
         self.telegram_client = telegram_client
         self.mute_days = mute_days
         self.cancel_timeout = cancel_timeout
+        self.schedule_dialog_deletion = schedule_dialog_deletion
         self.restriction_actions = restriction_actions or RestrictionActions(
             store,
             service,
@@ -440,28 +444,34 @@ class ReviewAdminServer:
                             {},
                             self._page("Telegram Action Failed; Item Was Not Changed"),
                         )
-                    self.store.quarantine(
-                        item.sender_key,
-                        restriction_reference=self.service.restriction_reference(
-                            item.reference
-                        ),
-                    )
-                elif state.status == "challenged":
-                    self.store.quarantine(
-                        item.sender_key,
-                        restriction_reference=self.service.restriction_reference(
-                            item.reference
-                        ),
-                    )
-                if self.store.sender(item.sender_key).status == "quarantined":
-                    self.store.activate_enforcement_review(
-                        item.sender_key,
-                        "manual_spam",
-                        int(time.time())
-                        + self.service.active_case_retention_days * 86400,
-                    )
-                self.cancel_timeout(item.sender_key)
                 self.store.decide_sender_reviews(item.sender_key, "spam")
+                suppressed = self.store.suppress(
+                    item.sender_key,
+                    "manual_permanent_suppression",
+                    until=None,
+                    reference=item.reference,
+                    restriction_reference=self.service.restriction_reference(
+                        item.reference
+                    ),
+                )
+                self.store.activate_enforcement_review(
+                    item.sender_key,
+                    "manual_permanent_suppression",
+                    int(time.time())
+                    + self.service.active_case_retention_days * 86400,
+                )
+                now = int(time.time())
+                action_id = self.store.schedule_action(
+                    item.sender_key,
+                    reason="manual_permanent_suppression",
+                    reference=item.reference,
+                    execute_at=now,
+                    expected_revision=suppressed.revision,
+                    mode_independent=True,
+                    now=now,
+                )
+                self.schedule_dialog_deletion(action_id, now)
+                self.cancel_timeout(item.sender_key)
             elif action == "dismiss":
                 self.store.decide_sender_reviews(item.sender_key, "dismissed")
             else:
@@ -531,7 +541,7 @@ class ReviewAdminServer:
                     item.updated_at,
                     item.message_count,
                     item.classification,
-                    item.rule_codes,
+                    item.signals,
                 )
                 for item in self.store.review_items(
                     limit=PAGE_SIZE, offset=offset, now=now
@@ -629,6 +639,39 @@ class ReviewAdminServer:
             return "—"
         return ", ".join(str(item) for item in value)
 
+    @classmethod
+    def _signal_labels(cls, value: object) -> str:
+        if not isinstance(value, list) or not value:
+            return "—"
+        labels: list[str] = []
+        for item in value:
+            code = item.get("code") if isinstance(item, dict) else item
+            if code:
+                label = cls._human_label(str(code))
+                if isinstance(item, dict):
+                    source = item.get("source")
+                    weight = item.get("weight")
+                    explanation = item.get("explanation")
+                    details = []
+                    if source:
+                        details.append(cls._human_label(str(source)))
+                    if isinstance(weight, (int, float)):
+                        details.append(f"+{weight:g}")
+                    if details:
+                        label += " · " + " · ".join(details)
+                    if explanation:
+                        label += " — " + str(explanation)
+                labels.append(label)
+        return ", ".join(labels) or "—"
+
+    @staticmethod
+    def _is_legacy_payload(payload: dict[str, object]) -> bool:
+        try:
+            schema_version = int(payload.get("schema_version", 0))
+        except (TypeError, ValueError):
+            schema_version = 0
+        return schema_version < 5 or payload.get("policy_version") == "rules-v2"
+
     def _review_sections(self, payload: dict[str, object]) -> str:
         text = str(payload.get("text", ""))
         quote_text = str(payload.get("quote_text", ""))
@@ -653,7 +696,7 @@ class ReviewAdminServer:
             sections += (
                 "<div class='notice'><strong>Limited Textual Evidence.</strong> "
                 "No message text, quoted text, or webpage-preview text was retained. "
-                "Review any available URLs, button text, matched HR rules, and structural "
+                "Review any available URLs, button text, evidence signals, and structural "
                 "metadata before deciding whether to allow the sender or leave the "
                 "restriction unchanged.</div>"
             )
@@ -670,7 +713,7 @@ class ReviewAdminServer:
         )
 
     @staticmethod
-    def _severity_label(payload: dict[str, object], reason: str) -> str:
+    def _legacy_severity_label(payload: dict[str, object], reason: str) -> str:
         severity = str(payload.get("severity") or "").strip().casefold()
         if severity in {"none", "signal", "high", "critical"}:
             return severity.title()
@@ -870,9 +913,25 @@ class ReviewAdminServer:
                     "active_case_identity_lookup_failed",
                     extra={"sender_key": item.sender_key},
                 )
-        rules = ", ".join(
-            self._human_label(str(value)) for value in payload.get("rule_codes", [])
-        ) or "—"
+        legacy_payload = self._is_legacy_payload(payload)
+        if legacy_payload:
+            signal_labels = self._signal_labels(payload.get("rule_codes", []))
+            risk_label = self._legacy_severity_label(payload, item.reason)
+            policy_decision = "Legacy decision retained"
+            decision_basis = "Recorded under rules-v2; not recalculated."
+            legacy_notice = (
+                "<div class='notice'><strong>Legacy HR Decision.</strong> "
+                "Recorded under rules-v2; not recalculated and no new action was added.</div>"
+            )
+        else:
+            signal_labels = self._signal_labels(payload.get("signals", []))
+            risk_label = str(payload.get("risk_score", "Not recorded"))
+            planned_action = str(payload.get("planned_action", "not_recorded"))
+            policy_decision = self._human_label(planned_action)
+            decision_basis = self._human_label(
+                str(payload.get("decision_basis", "not_recorded"))
+            )
+            legacy_notice = ""
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
         observed_at = item.evidence_created_at or item.updated_at
         observed = datetime.fromtimestamp(observed_at, timezone.utc).strftime(
@@ -939,13 +998,16 @@ class ReviewAdminServer:
           <p class="eyebrow">{evidence_heading}</p>
           <h2>{html.escape(identity)}</h2>
           <p class="refresh-note">{evidence_note}</p>
+          {legacy_notice}
           {evidence_content}
           {telegram_link}
         </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
           <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
           <dt>Restriction Cause</dt><dd>{html.escape(self._human_label(item.reason))}</dd>
-          <dt>Severity</dt><dd>{html.escape(self._severity_label(payload, item.reason))}</dd>
-          <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
+          <dt>Risk Score</dt><dd>{html.escape(risk_label)}</dd>
+          <dt>Policy Decision</dt><dd>{html.escape(policy_decision)}</dd>
+          <dt>Decision Basis</dt><dd>{html.escape(decision_basis)}</dd>
+          <dt>Evidence Signals</dt><dd>{html.escape(signal_labels)}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
           <dt>Evidence Expires</dt><dd>{evidence_expiry}</dd></dl>
           <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
@@ -981,7 +1043,7 @@ class ReviewAdminServer:
                 return
             facts = facts_from_message(message)
             payload: dict[str, object] = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "text": facts.text,
                 "quote_text": facts.quote_text,
                 "preview_text": facts.preview_text,
@@ -996,9 +1058,12 @@ class ReviewAdminServer:
                 "quote_domains": list(facts.quote_domains[:3]),
                 "url_shape": url_shape(facts.urls),
                 "quote_url_shape": url_shape(facts.quote_urls),
-                "severity": "manual",
-                "policy": "manual_review",
-                "rule_codes": json.loads(item.rule_codes),
+                "signals": json.loads(item.signals),
+                "risk_score": "Manual decision",
+                "challenge_profile": None,
+                "planned_action": "manual_permanent_suppression",
+                "decision_basis": "manual_operator_decision",
+                "policy_version": "manual-review-v1",
                 "features": json.loads(item.features),
             }
             now = int(time.time())
@@ -1030,9 +1095,7 @@ class ReviewAdminServer:
             IDENTITY_CACHE_SECONDS,
         )
         identity = name + (f" (@{username})" if username else "")
-        rules = ", ".join(
-            self._human_label(value) for value in json.loads(item.rule_codes)
-        ) or "Ordinary Unknown Sender"
+        signals = self._signal_labels(json.loads(item.signals))
         review_reason = self._human_label(item.classification)
         features = json.dumps(json.loads(item.features), indent=2, sort_keys=True)
         observed_at = datetime.fromtimestamp(item.updated_at, timezone.utc).strftime(
@@ -1053,7 +1116,7 @@ class ReviewAdminServer:
               </section>
               <aside class="case-file"><p class="eyebrow">Review Details</p>
                 <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-                <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
+                <dt>Evidence Signals</dt><dd>{html.escape(signals)}</dd>
                 <dt>Messages Observed</dt><dd>{item.message_count}</dd>
                 <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
               </aside>
@@ -1087,7 +1150,7 @@ class ReviewAdminServer:
           <aside class="case-file">
             <p class="eyebrow">Review Details</p>
             <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-            <dt>Matched HR Rules</dt><dd>{html.escape(rules)}</dd>
+            <dt>Evidence Signals</dt><dd>{html.escape(signals)}</dd>
             <dt>Telegram ID</dt><dd>{user_id}</dd>
             <dt>Messages Observed</dt><dd>{item.message_count}</dd>
             <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
@@ -1098,7 +1161,7 @@ class ReviewAdminServer:
           <h2>This decision applies to all pending entries for this sender.</h2>
           <div class="actions">
             {self._action_form(item.id, "legitimate", "Legitimate · Allow Sender")}
-            {self._action_form(item.id, "spam", "Spam · Archive and Mute", danger=True)}
+            {self._action_form(item.id, "spam", "Spam · Permanently Suppress and Delete", danger=True)}
             {self._action_form(item.id, "dismiss", "Dismiss and Cancel Pending Jobs")}
           </div>
         </section>
@@ -1158,7 +1221,7 @@ class ReviewAdminServer:
         except Exception:
             if archive_applied:
                 await self._restore(peer, sender_key)
-            LOG.error("review_quarantine_failed")
+            LOG.error("review_archive_failed")
             return False
 
     async def _restore(self, peer: types.InputPeerUser, sender_key: str) -> bool:
@@ -1203,7 +1266,7 @@ class ReviewAdminServer:
             f"<tr><td><a href='/review/{item.id}'>#{item.id}</a></td>"
             f"<td>{self._identity_cell(identities.get(item.id))}</td>"
             f"<td>{html.escape(self._human_label(item.classification))}</td>"
-            f"<td>{html.escape(', '.join(self._human_label(value) for value in json.loads(item.rule_codes)) or '—')}</td>"
+            f"<td>{html.escape(self._signal_labels(json.loads(item.signals)))}</td>"
             f"<td>{item.message_count}</td>"
             f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
             for item in items
@@ -1222,7 +1285,7 @@ class ReviewAdminServer:
             "<p class='refresh-note'>Connection health is checked quietly while this tab is visible. "
             "The table updates in place only when review state changes.</p></section>"
             "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Review Reason</th>"
-            "<th>Matched HR Rules</th><th>Messages</th>"
+            "<th>Evidence Signals</th><th>Messages</th>"
             f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div>"
             + self._pagination("/review", page, total)
             + "</main>",
@@ -1522,6 +1585,15 @@ class ReviewAdminServer:
             "warning_failed": "Failure Warning Not Delivered · Protect",
             "timeout_notice_failed": "Timeout Warning Not Delivered · Protect",
             "critical_rule": "Critical HR Match",
+            "permanent_suppression": "Permanent Suppression",
+            "standard_challenge": "Standard Challenge",
+            "strict_challenge": "Strict Challenge",
+            "owner_denied_domain": "Owner Denied Domain",
+            "corroborated_repeated_campaign": "Corroborated Repeated Campaign",
+            "risk_score_requires_strict_challenge": "Risk Score Requires Strict Challenge",
+            "risk_score_below_strict_threshold": "Risk Score Below Strict Threshold",
+            "manual_operator_decision": "Manual Operator Decision",
+            "manual_permanent_suppression": "Manual Permanent Suppression",
             "manual_spam": "Manual Spam Review",
             "attempts_exhausted": "Attempts Exhausted",
             "challenge_timeout": "Challenge Timeout",

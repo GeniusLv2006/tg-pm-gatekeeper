@@ -30,6 +30,9 @@ class IdentifierProtector:
     def answer_digest(self, sender_key: str, challenge_id: str, answer: str) -> str:
         return self._digest("answer", f"{sender_key}:{challenge_id}:{answer}")
 
+    def campaign_fingerprint(self, canonical_payload: str) -> str:
+        return self._digest("campaign", canonical_payload)
+
     def seal_review_reference(
         self, telegram_user_id: int, access_hash: int, message_id: int
     ) -> bytes:

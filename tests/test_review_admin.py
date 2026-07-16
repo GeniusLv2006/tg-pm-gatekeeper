@@ -74,6 +74,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.client = FakeTelegramClient()
         self.cancelled: list[str] = []
+        self.scheduled_deletions: list[tuple[int, int]] = []
         self.server = ReviewAdminServer(
             Path(self.temp.name) / "review.sock",
             self.store,
@@ -81,6 +82,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.client,
             mute_days=30,
             cancel_timeout=self.cancelled.append,
+            schedule_dialog_deletion=lambda action_id, delete_at: (
+                self.scheduled_deletions.append((action_id, delete_at))
+            ),
         )
         reference = self.protector.seal_review_reference(123456789, -987654321, 42)
         self.review_id = self.store.enqueue_review(
@@ -565,9 +569,64 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"deciding whether to allow the sender", detail)
         self.assertIn(b"Decrypted Local Evidence", detail)
         self.assertIn(b"Critical HR Match", detail)
-        self.assertIn(b"<dt>Severity</dt><dd>Critical</dd>", detail)
-        self.assertIn(b"Matched HR Rules", detail)
+        self.assertIn(b"Legacy HR Decision", detail)
+        self.assertIn(b"<dt>Risk Score</dt><dd>Critical</dd>", detail)
+        self.assertIn(b"Evidence Signals", detail)
         self.assertIn(b"HR-01 \xc2\xb7 Multiple Link Buttons", detail)
+
+    async def test_active_case_shows_adaptive_signal_breakdown(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        reference = self.protector.seal_review_reference(
+            123456789, -987654321, 42
+        )
+        explanation = "Telegram webpage preview metadata contains promotional language."
+        envelope = self.review_protector.seal(
+            {
+                "schema_version": 5,
+                "text": "synthetic",
+                "signals": [
+                    {
+                        "code": "PROMOTIONAL_LANGUAGE",
+                        "source": "preview",
+                        "weight": 20,
+                        "explanation": explanation,
+                    }
+                ],
+                "risk_score": 30,
+                "challenge_profile": "strict",
+                "planned_action": "strict_challenge",
+                "decision_basis": "risk_score_requires_strict_challenge",
+                "policy_version": "adaptive-v1",
+                "features": {},
+            }
+        )
+        self.store.save_enforcement_review(
+            sender_key,
+            reference=reference,
+            envelope=envelope,
+            reason="challenge_timeout",
+            expires_at=int(time.time()) + 700,
+        )
+        self.store.suppress(
+            sender_key,
+            "challenge_timeout",
+            until=int(time.time()) + 700,
+            reference=reference,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+
+        status, _, detail = await self.server._show_enforcement(
+            self.store.active_restriction(sender_key)
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"<dt>Risk Score</dt><dd>30</dd>", detail)
+        self.assertIn(b"<dt>Policy Decision</dt><dd>Strict Challenge</dd>", detail)
+        self.assertIn(b"Promotional Language \xc2\xb7 Preview \xc2\xb7 +20", detail)
+        self.assertIn(explanation.encode(), detail)
+        self.assertNotIn(b"Legacy HR Decision", detail)
 
     async def test_dashboard_contains_only_actionable_review_areas(self) -> None:
         page = await self.server._dashboard_page()
@@ -969,14 +1028,20 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(
             self.client.requests[1], functions.folders.EditPeerFoldersRequest
         )
-        self.assertEqual(self.store.sender("sender").status, "quarantined")
+        self.assertEqual(self.store.sender("sender").status, "suppressed")
+        self.assertEqual(
+            self.store.sender("sender").suppression_reason,
+            "manual_permanent_suppression",
+        )
         self.assertIsNotNone(self.store.sender("sender").restriction_reference)
         item = self.store.enforcement_review("sender")
         self.assertIsNotNone(item)
-        self.assertEqual(item.reason, "manual_spam")
+        self.assertEqual(item.reason, "manual_permanent_suppression")
         self.assertGreaterEqual(item.expires_at, int(time.time()) + 30 * 86400 - 2)
         payload = self.review_protector.open(item.envelope)
-        self.assertEqual(payload["schema_version"], 4)
+        self.assertEqual(payload["schema_version"], 5)
+        self.assertEqual(payload["policy_version"], "manual-review-v1")
+        self.assertEqual(payload["planned_action"], "manual_permanent_suppression")
         self.assertIn("transient-canary", payload["text"])
         self.assertIn("Preview Title", payload["preview_text"])
         self.assertEqual(payload["button_texts"], ["Open private offer"])
@@ -991,8 +1056,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload_urls, set(extracted.urls))
         self.assertIsNotNone(self.store.dialog_snapshot("sender"))
         self.assertEqual(self.cancelled, ["sender"])
+        self.assertEqual(len(self.scheduled_deletions), 1)
+        self.assertTrue(self.store.pending_actions()[0].mode_independent)
 
-    async def test_spam_decision_does_not_repeat_existing_quarantine(self) -> None:
+    async def test_spam_decision_converts_existing_quarantine_to_suppression(self) -> None:
         self.store.quarantine("sender", 150)
         body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
         status, _, _ = await self.server._dispatch(
@@ -1000,7 +1067,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 303)
         self.assertEqual(self.client.requests, [])
-        self.assertEqual(self.store.sender("sender").status, "quarantined")
+        self.assertEqual(self.store.sender("sender").status, "suppressed")
+        self.assertEqual(len(self.scheduled_deletions), 1)
         self.assertEqual(self.cancelled, ["sender"])
 
     async def test_spam_partial_archive_failure_is_compensated(self) -> None:

@@ -16,8 +16,15 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from .crypto import ActiveCaseProtector, IdentifierProtector
-from .policy import DetectionResult, PolicyEngine, Severity
-from .rules import MessageFacts, evaluate_hard_rules, url_evidence, url_shape
+from .policy import EvidenceSignal, PolicyEngine, ScreeningDecision
+from .rules import (
+    MessageFacts,
+    campaign_candidate,
+    detect_evidence_signals,
+    repeated_campaign_signal,
+    url_evidence,
+    url_shape,
+)
 from .store import SenderState, StateStore
 
 LOG = logging.getLogger("gatekeeper.service")
@@ -40,6 +47,10 @@ VERIFICATION_FAILED_TEXT = (
 VERIFICATION_TIMEOUT_TEXT = (
     "⛔ Verification Failed\n\nThe verification window expired.\n\n"
     "This conversation will be deleted in 10 seconds. Try again in 2 hours."
+)
+STRICT_VERIFICATION_TIMEOUT_TEXT = (
+    "⛔ Verification Failed\n\nThe strict verification window expired.\n\n"
+    "This conversation will be deleted in 10 seconds. Try again in 24 hours."
 )
 TEST_VERIFICATION_FAILED_TEXT = (
     "⛔ Verification Failed\n\nThis test conversation remains archived and muted.\n\n"
@@ -354,42 +365,49 @@ class GatekeeperService:
                 return outcome
 
             recent_links = self.store.recent_link_messages(sender_key, now=now)
-            decision = evaluate_hard_rules(
+            signals = detect_evidence_signals(
                 message.facts,
                 previous_link_messages=recent_links,
                 denylist=self.denylist,
             )
-            if message.facts.has_link:
+            if message.facts.has_link and not is_test_sender:
                 self.store.record_link_message(sender_key, now)
+            if not is_test_sender:
+                candidate = campaign_candidate(message.facts, signals)
+                if candidate is not None:
+                    fingerprint = self.protector.campaign_fingerprint(candidate)
+                    if self.store.observe_campaign(
+                        fingerprint, sender_key, now=now
+                    ) >= 2:
+                        signals += (repeated_campaign_signal(),)
 
-            detection = decision.detection_result()
-            policy = self.policy.decide(detection)
-            if decision.severity == "critical" and not is_test_sender:
-                for rule in decision.rule_codes:
-                    self.store.audit(sender_key, rule, "matched", now)
+            decision = self.policy.decide(() if is_test_sender else signals)
+            if (
+                decision.planned_action == "permanent_suppression"
+                and not is_test_sender
+            ):
+                for signal in decision.signals:
+                    self.store.audit(sender_key, signal.code, "matched", now)
                 if self.store.get_mode() == "monitor":
                     outcome = "would_delete"
                     self._enqueue_review(
-                        sender_key, message, outcome, decision.rule_codes, now
+                        sender_key, message, outcome, decision.signals, now
                     )
                 else:
                     self._capture_enforcement_review(
                         sender_key,
                         message,
-                        reason="critical_rule",
-                        rule_codes=decision.rule_codes,
-                        severity=decision.severity,
+                        reason="permanent_suppression",
+                        decision=decision,
                         now=now,
                     )
-                    outcome = self._schedule_critical_delete(
+                    outcome = self._schedule_permanent_suppression(
                         sender_key, message, actions, now
                     )
-                self._record_decision(
-                    sender_key, detection, policy.planned_action, outcome, now
-                )
+                self._record_decision(sender_key, decision, outcome, now)
                 return outcome
 
-            if state.status == "provisional":
+            if state.status == "provisional" and not signals:
                 outcome = "provisional"
                 return outcome
             if state.status == "challenged":
@@ -401,10 +419,10 @@ class GatekeeperService:
             if self.store.get_mode() == "monitor" and not is_test_sender:
                 self.store.audit(sender_key, "CHALLENGE_REQUIRED", "observed", now)
                 outcome = "would_challenge"
-                self._enqueue_review(sender_key, message, outcome, (), now)
-                self._record_decision(
-                    sender_key, detection, policy.planned_action, outcome, now
+                self._enqueue_review(
+                    sender_key, message, outcome, decision.signals, now
                 )
+                self._record_decision(sender_key, decision, outcome, now)
                 return outcome
 
             outcome = await self._issue_challenge(
@@ -412,12 +430,10 @@ class GatekeeperService:
                 message,
                 actions,
                 now,
-                rule_codes=decision.rule_codes,
-                severity=decision.severity,
+                decision=decision,
             )
-            self._record_decision(
-                sender_key, detection, policy.planned_action, outcome, now
-            )
+            if not is_test_sender:
+                self._record_decision(sender_key, decision, outcome, now)
             return outcome
         except Exception:
             LOG.error("message_processing_failed")
@@ -430,12 +446,11 @@ class GatekeeperService:
         self,
         message: IncomingMessage,
         *,
-        rule_codes: tuple[str, ...] = (),
-        severity: Severity = "none",
+        decision: ScreeningDecision,
     ) -> dict[str, object]:
         facts = message.facts
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "text": message.text,
             "quote_text": facts.quote_text,
             "preview_text": facts.preview_text,
@@ -464,9 +479,20 @@ class GatekeeperService:
                 "url_count": min(len(set(facts.urls)), 2),
                 "via_bot": facts.via_bot,
             },
-            "rule_codes": list(rule_codes),
-            "severity": severity,
-            "policy_version": "rules-v2",
+            "signals": [
+                {
+                    "code": signal.code,
+                    "source": signal.source,
+                    "weight": signal.weight,
+                    "explanation": signal.explanation,
+                }
+                for signal in decision.signals
+            ],
+            "risk_score": decision.risk_score,
+            "challenge_profile": decision.challenge_profile,
+            "planned_action": decision.planned_action,
+            "decision_basis": decision.decision_basis,
+            "policy_version": decision.policy_version,
         }
 
     def _capture_enforcement_review(
@@ -475,8 +501,7 @@ class GatekeeperService:
         message: IncomingMessage,
         *,
         reason: str,
-        rule_codes: tuple[str, ...] = (),
-        severity: Severity = "none",
+        decision: ScreeningDecision,
         now: int,
     ) -> None:
         if (
@@ -486,8 +511,7 @@ class GatekeeperService:
             return
         payload = self._active_case_payload(
             message,
-            rule_codes=rule_codes,
-            severity=severity,
+            decision=decision,
         )
         try:
             envelope = self.active_case_protector.seal(payload)
@@ -536,25 +560,35 @@ class GatekeeperService:
     def _record_decision(
         self,
         sender_key: str,
-        detection: DetectionResult,
-        planned_action: str,
+        decision: ScreeningDecision,
         actual_action: str,
         now: int,
     ) -> None:
         self.store.record_decision(
             sender_key,
-            detector=detection.detector,
-            signals=json.dumps(detection.signals, separators=(",", ":")),
-            severity=detection.severity,
-            score=detection.score,
-            model_version=detection.model_version,
-            planned_action=planned_action,
+            detector="adaptive_signals",
+            signals=json.dumps(
+                [
+                    {
+                        "code": signal.code,
+                        "source": signal.source,
+                        "weight": signal.weight,
+                    }
+                    for signal in decision.signals
+                ],
+                separators=(",", ":"),
+            ),
+            assessment=decision.challenge_profile or "permanent_suppression",
+            risk_score=decision.risk_score,
+            model_version=None,
+            decision_basis=decision.decision_basis,
+            planned_action=decision.planned_action,
             actual_action=actual_action,
-            policy_version="rules-v2",
+            policy_version=decision.policy_version,
             now=now,
         )
 
-    def _schedule_critical_delete(
+    def _schedule_permanent_suppression(
         self,
         sender_key: str,
         message: IncomingMessage,
@@ -564,12 +598,15 @@ class GatekeeperService:
         if message.review_reference is None:
             self.store.delete_enforcement_review(sender_key)
             self.store.audit(
-                sender_key, "CRITICAL_DELETE", "reference_unavailable", now
+                sender_key,
+                "PERMANENT_SUPPRESSION",
+                "reference_unavailable",
+                now,
             )
             return "fail_safe"
         state = self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             reference=message.review_reference,
             restriction_reference=self.restriction_reference(
@@ -579,13 +616,13 @@ class GatekeeperService:
         )
         self._activate_enforcement_review(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             now,
             reference=message.review_reference,
         )
         action_id = self.store.schedule_action(
             sender_key,
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=message.review_reference,
             execute_at=now,
             expected_revision=state.revision,
@@ -593,7 +630,7 @@ class GatekeeperService:
         )
         actions.cancel_timeout(sender_key)
         actions.schedule_dialog_deletion(action_id, now)
-        self.store.audit(sender_key, "CRITICAL_DELETE", "scheduled", now)
+        self.store.audit(sender_key, "PERMANENT_SUPPRESSION", "scheduled", now)
         return "suppressed"
 
     def _schedule_suppressed_delete(
@@ -628,23 +665,25 @@ class GatekeeperService:
         actions: MessageActions,
         now: int,
         *,
-        rule_codes: tuple[str, ...] = (),
-        severity: Severity = "none",
+        decision: ScreeningDecision,
     ) -> str:
         self._capture_enforcement_review(
             sender_key,
             message,
             reason="challenge_pending",
-            rule_codes=rule_codes,
-            severity=severity,
+            decision=decision,
             now=now,
         )
         if not self._claim_outbound_slot(sender_key, "challenge", now):
             return await self._rate_limit_fallback(sender_key, message, actions, now)
 
         challenge = self.challenge_factory()
+        challenge_profile = decision.challenge_profile or "standard"
+        max_attempts = (
+            1 if challenge_profile == "strict" else self.challenge_max_attempts
+        )
         prompt = challenge_prompt(
-            challenge, self.challenge_ttl_seconds, self.challenge_max_attempts
+            challenge, self.challenge_ttl_seconds, max_attempts
         )
         expires_at = now + self.challenge_ttl_seconds
         digest = self.protector.answer_digest(
@@ -658,6 +697,7 @@ class GatekeeperService:
             prompt,
             message.review_reference,
             now,
+            challenge_profile=challenge_profile,
         )
         archive_confirmed = False
         challenge_message_id: int | None = None
@@ -760,7 +800,7 @@ class GatekeeperService:
         sender_key: str,
         message: IncomingMessage,
         classification: str,
-        rule_codes: tuple[str, ...],
+        signals: tuple[EvidenceSignal, ...],
         now: int,
     ) -> None:
         if message.review_reference is None:
@@ -783,7 +823,17 @@ class GatekeeperService:
             sender_key,
             message.review_reference,
             classification,
-            json.dumps(rule_codes, separators=(",", ":")),
+            json.dumps(
+                [
+                    {
+                        "code": signal.code,
+                        "source": signal.source,
+                        "weight": signal.weight,
+                    }
+                    for signal in signals
+                ],
+                separators=(",", ":"),
+            ),
             json.dumps(features, sort_keys=True, separators=(",", ":")),
             now + self.pending_review_retention_days * 86400,
             now,
@@ -799,7 +849,19 @@ class GatekeeperService:
     ) -> str:
         expires_at = state.challenge_expires_at
         if not expires_at or message.sent_at > expires_at:
-            self.store.expire_challenge(sender_key, expires_at or 0, now)
+            self.store.expire_challenge(
+                sender_key,
+                expires_at or 0,
+                now,
+                suppression_seconds=(
+                    VERIFICATION_FAILED_SUPPRESSION_SECONDS
+                    if state.challenge_profile == "strict"
+                    else VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS
+                ),
+                restriction_reference=self.restriction_reference(
+                    state.challenge_action_reference
+                ),
+            )
             self.store.audit(sender_key, "challenge_expired", "already_archived", now)
             actions.cancel_timeout(sender_key)
             await self._finalize_timeout_failure(
@@ -886,7 +948,10 @@ class GatekeeperService:
 
         attempts = self.store.increment_attempts(sender_key, now)
         self.store.audit(sender_key, "CHALLENGE_INCORRECT", "rejected", now)
-        if attempts >= self.challenge_max_attempts:
+        max_attempts = (
+            1 if state.challenge_profile == "strict" else self.challenge_max_attempts
+        )
+        if attempts >= max_attempts:
             actions.cancel_timeout(sender_key)
             failed_text = (
                 TEST_VERIFICATION_FAILED_TEXT
@@ -975,7 +1040,7 @@ class GatekeeperService:
                 now,
             )
             return "suppressed" if sender_key != self.test_sender_key else "quarantined"
-        remaining = self.challenge_max_attempts - attempts
+        remaining = max_attempts - attempts
         noun = "attempt" if remaining == 1 else "attempts"
         incorrect_text = (
             "❌ Incorrect Answer\n\nReply to the same verification message with "
@@ -1078,7 +1143,11 @@ class GatekeeperService:
         timeout_text = (
             TEST_VERIFICATION_TIMEOUT_TEXT
             if sender_key == self.test_sender_key
-            else VERIFICATION_TIMEOUT_TEXT
+            else (
+                STRICT_VERIFICATION_TIMEOUT_TEXT
+                if challenge_state.challenge_profile == "strict"
+                else VERIFICATION_TIMEOUT_TEXT
+            )
         )
         notice_id = await self._send_notice(
             sender_key,
@@ -1159,11 +1228,16 @@ class GatekeeperService:
         async with self.sender_lock(sender_key):
             timestamp = self.clock() if now is None else now
             state = self.store.sender(sender_key)
+            suppression_seconds = (
+                VERIFICATION_FAILED_SUPPRESSION_SECONDS
+                if state.challenge_profile == "strict"
+                else VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS
+            )
             expired = self.store.expire_challenge(
                 sender_key,
                 expires_at,
                 timestamp,
-                suppression_seconds=VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS,
+                suppression_seconds=suppression_seconds,
                 restriction_reference=self.restriction_reference(
                     state.challenge_action_reference
                 ),

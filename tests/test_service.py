@@ -178,6 +178,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         outbound_limit: int = 10,
         outbound_notice_reserve: int | None = None,
         outbound_notice_sender_limit: int = 3,
+        denylist: frozenset[str] = frozenset(),
         test_sender_id: int | None = None,
     ) -> GatekeeperService:
         return GatekeeperService(
@@ -188,6 +189,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             outbound_limit_per_hour=outbound_limit,
             outbound_notice_reserve_per_hour=outbound_notice_reserve,
             outbound_notice_limit_per_sender_per_hour=outbound_notice_sender_limit,
+            denylist=denylist,
             test_sender_id=test_sender_id,
             active_case_protector=self.review_protector,
             challenge_factory=lambda: Challenge("challenge", "12", "7 + 5 = ?"),
@@ -295,12 +297,38 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ),
             actions,
         )
-        self.assertEqual(outcome, "would_delete")
+        self.assertEqual(outcome, "would_challenge")
         self.assertEqual(actions.sent, [])
         self.assertEqual(actions.quarantines, 0)
         review = self.store.review_items(now=self.now)[0]
         self.assertEqual(review.expires_at, self.now + 7 * 86400)
         self.assertNotIn(b"private-message-canary", self.database_path.read_bytes())
+
+    async def test_monitor_records_permanent_suppression_without_telegram_action(
+        self,
+    ) -> None:
+        self.service = self.make_service(
+            denylist=frozenset({"blocked.invalid"})
+        )
+        actions = FakeActions()
+        facts = MessageFacts(
+            text="https://blocked.invalid/offer",
+            urls=("https://blocked.invalid/offer",),
+            domains=("blocked.invalid",),
+        )
+        outcome = await self.service.handle(
+            self.message(1, facts.text, facts), actions
+        )
+        sender_key = self.protector.sender_key(123456789)
+        self.assertEqual(outcome, "would_delete")
+        self.assertEqual(self.store.sender(sender_key).status, "unknown")
+        self.assertEqual(actions.sent, [])
+        self.assertEqual(actions.quarantines, 0)
+        self.assertEqual(actions.dialog_deletions, [])
+        self.assertEqual(
+            self.store.review_items(now=self.now)[0].classification,
+            "would_delete",
+        )
 
     async def test_suppressed_sender_retains_encrypted_original_review_snapshot(
         self,
@@ -419,23 +447,39 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             (sender_key,),
         ).fetchone()
         payload = self.review_protector.open(row["envelope"])
-        self.assertEqual(payload["severity"], "high")
-        self.assertEqual(payload["rule_codes"], ["HR-03_PROMOTION_WITH_LINK"])
+        self.assertEqual(payload["schema_version"], 5)
+        self.assertEqual(payload["policy_version"], "adaptive-v1")
+        self.assertEqual(payload["risk_score"], 30)
+        self.assertEqual(payload["challenge_profile"], "strict")
+        self.assertEqual(payload["planned_action"], "strict_challenge")
+        self.assertEqual(
+            {signal["code"] for signal in payload["signals"]},
+            {"TELEGRAM_INVITE", "PROMOTIONAL_LANGUAGE"},
+        )
 
-    async def test_critical_rule_schedules_silent_persistent_delete(self) -> None:
+    async def test_denied_domain_schedules_silent_permanent_suppression(self) -> None:
         self.store.set_mode("protect")
+        self.service = self.make_service(
+            denylist=frozenset({"blocked.invalid"})
+        )
         actions = FakeActions()
         outcome = await self.service.handle(
             self.message(
                 1,
-                facts=MessageFacts(has_link_button=True, link_button_count=2),
+                text="推广 https://blocked.invalid/offer",
+                facts=MessageFacts(
+                    text="推广 https://blocked.invalid/offer",
+                    urls=("https://blocked.invalid/offer",),
+                    domains=("blocked.invalid",),
+                ),
             ),
             actions,
         )
         sender_key = self.protector.sender_key(123456789)
         self.assertEqual(outcome, "suppressed")
         self.assertEqual(
-            self.store.sender(sender_key).suppression_reason, "critical_rule"
+            self.store.sender(sender_key).suppression_reason,
+            "permanent_suppression",
         )
         self.assertEqual(
             self.protector.open_restriction_reference(
@@ -449,8 +493,14 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         item = self.store.enforcement_review(sender_key, now=self.now)
         self.assertEqual(item.expires_at, self.now + 30 * 86400)
         payload = self.review_protector.open(item.envelope)
-        self.assertEqual(payload["severity"], "critical")
-        self.assertEqual(payload["rule_codes"], ["HR-01_MULTIPLE_LINK_BUTTONS"])
+        self.assertEqual(payload["schema_version"], 5)
+        self.assertEqual(payload["risk_score"], 120)
+        self.assertEqual(payload["planned_action"], "permanent_suppression")
+        self.assertEqual(payload["decision_basis"], "owner_denied_domain")
+        self.assertIn(
+            "AUTHORED_DENIED_DOMAIN",
+            {signal["code"] for signal in payload["signals"]},
+        )
 
     async def test_expired_suppression_returns_sender_to_challenge(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -499,6 +549,217 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "provisional")
         self.assertEqual(actions.restores, 1)
         self.assertIn("conversation has been restored", actions.sent[-1][0])
+
+    async def test_strict_challenge_allows_one_attempt_and_suppresses_for_24h(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
+        facts = MessageFacts(
+            text="推广 https://t.me/+syntheticInvite",
+            urls=("https://t.me/+syntheticInvite",),
+            domains=("t.me",),
+        )
+        actions = FakeActions()
+        self.assertEqual(
+            await self.service.handle(
+                self.message(1, text=facts.text, facts=facts), actions
+            ),
+            "challenged",
+        )
+        sender_key = self.protector.sender_key(123456789)
+        self.assertEqual(self.store.sender(sender_key).challenge_profile, "strict")
+        self.assertIn("Attempts allowed: 1", actions.sent[0][0])
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, "11", reply_to_message_id=100), actions
+            ),
+            "suppressed",
+        )
+        state = self.store.sender(sender_key)
+        self.assertEqual(state.suppressed_until, self.now + 24 * 3600)
+
+    async def test_strict_challenge_timeout_suppresses_for_24h(self) -> None:
+        self.store.set_mode("protect")
+        facts = MessageFacts(
+            text="推广 https://t.me/+syntheticInvite",
+            urls=("https://t.me/+syntheticInvite",),
+            domains=("t.me",),
+        )
+        actions = FakeActions()
+        await self.service.handle(self.message(1, text=facts.text, facts=facts), actions)
+        sender_key = self.protector.sender_key(123456789)
+        self.assertTrue(
+            await self.service.expire_challenge(
+                sender_key,
+                self.now + 60,
+                now=self.now + 65,
+                actions=actions,
+            )
+        )
+        self.assertEqual(
+            self.store.sender(sender_key).suppressed_until,
+            self.now + 65 + 24 * 3600,
+        )
+        self.assertIn("24 hours", actions.sent[-1][0])
+
+    async def test_strict_challenge_correct_answer_enters_provisional(self) -> None:
+        self.store.set_mode("protect")
+        facts = MessageFacts(
+            text="推广 https://t.me/+syntheticInvite",
+            urls=("https://t.me/+syntheticInvite",),
+            domains=("t.me",),
+        )
+        actions = FakeActions()
+        await self.service.handle(self.message(1, facts.text, facts), actions)
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, "12", reply_to_message_id=100), actions
+            ),
+            "provisional",
+        )
+        sender_key = self.protector.sender_key(123456789)
+        self.assertEqual(self.store.sender(sender_key).status, "provisional")
+
+    async def test_repeated_cross_sender_campaign_crosses_destructive_gate(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
+
+        def campaign(opener: str) -> MessageFacts:
+            return MessageFacts(
+                text=opener,
+                quote_text=(
+                    "联盟推广 https://landing.invalid/offer "
+                    "https://t.me/+syntheticInvite"
+                ),
+                quote_urls=(
+                    "https://landing.invalid/offer",
+                    "https://t.me/+syntheticInvite",
+                ),
+                quote_domains=("landing.invalid", "t.me"),
+                is_forwarded=True,
+            )
+
+        first = campaign("在吗")
+        self.assertEqual(
+            await self.service.handle(
+                self.message(1, first.text, first, sender_id=111_111_111),
+                FakeActions(),
+            ),
+            "challenged",
+        )
+        second_actions = FakeActions()
+        second = campaign("滴滴")
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, second.text, second, sender_id=222_222_222),
+                second_actions,
+            ),
+            "suppressed",
+        )
+        second_key = self.protector.sender_key(222_222_222)
+        payload = self.review_protector.open(
+            self.store.enforcement_review(second_key, now=self.now).envelope
+        )
+        self.assertEqual(
+            payload["decision_basis"], "corroborated_repeated_campaign"
+        )
+        self.assertIn(
+            "REPEATED_CAMPAIGN",
+            {signal["code"] for signal in payload["signals"]},
+        )
+        database = self.database_path.read_bytes()
+        self.assertNotIn("联盟推广".encode(), database)
+        self.assertNotIn(b"https://landing.invalid/offer", database)
+
+    async def test_test_sender_does_not_seed_campaign_detection(self) -> None:
+        self.store.set_mode("protect")
+        service = self.make_service(test_sender_id=TEST_SENDER_ID)
+        facts = MessageFacts(
+            text="滴滴",
+            quote_text=(
+                "联盟推广 https://landing.invalid/offer "
+                "https://t.me/+syntheticInvite"
+            ),
+            quote_urls=(
+                "https://landing.invalid/offer",
+                "https://t.me/+syntheticInvite",
+            ),
+            quote_domains=("landing.invalid", "t.me"),
+            is_forwarded=True,
+        )
+        await service.handle(
+            self.message(1, facts.text, facts, sender_id=TEST_SENDER_ID),
+            FakeActions(),
+        )
+        self.assertEqual(
+            await service.handle(
+                self.message(2, facts.text, facts, sender_id=333_333_333),
+                FakeActions(),
+            ),
+            "challenged",
+        )
+        count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM campaign_events"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+        test_key = self.protector.sender_key(TEST_SENDER_ID)
+        test_decisions = self.store._connection.execute(
+            "SELECT COUNT(*) FROM decision_events WHERE sender_key=?",
+            (test_key,),
+        ).fetchone()[0]
+        test_links = self.store._connection.execute(
+            "SELECT COUNT(*) FROM link_events WHERE sender_key=?",
+            (test_key,),
+        ).fetchone()[0]
+        self.assertEqual((test_decisions, test_links), (0, 0))
+
+    async def test_different_campaign_payloads_do_not_cross_sender_gate(self) -> None:
+        self.store.set_mode("protect")
+
+        def campaign(path: str) -> MessageFacts:
+            landing = f"https://landing.invalid/{path}"
+            return MessageFacts(
+                text="滴滴",
+                quote_text=(
+                    f"联盟推广 {landing} https://t.me/+syntheticInvite"
+                ),
+                quote_urls=(landing, "https://t.me/+syntheticInvite"),
+                quote_domains=("landing.invalid", "t.me"),
+                is_forwarded=True,
+            )
+
+        first = campaign("offer-a")
+        second = campaign("offer-b")
+        first_outcome = await self.service.handle(
+            self.message(1, first.text, first, sender_id=444_444_444),
+            FakeActions(),
+        )
+        second_outcome = await self.service.handle(
+            self.message(2, second.text, second, sender_id=555_555_555),
+            FakeActions(),
+        )
+        self.assertEqual((first_outcome, second_outcome), ("challenged", "challenged"))
+        rows = self.store._connection.execute(
+            "SELECT fingerprint,COUNT(*) AS count FROM campaign_events "
+            "GROUP BY fingerprint"
+        ).fetchall()
+        self.assertEqual([row["count"] for row in rows], [1, 1])
+
+    async def test_nonpromotional_links_do_not_create_campaign_events(self) -> None:
+        facts = MessageFacts(
+            text="请查看项目文档 https://docs.invalid/guide",
+            urls=("https://docs.invalid/guide",),
+            domains=("docs.invalid",),
+        )
+        await self.service.handle(
+            self.message(1, facts.text, facts, sender_id=666_666_666),
+            FakeActions(),
+        )
+        count = self.store._connection.execute(
+            "SELECT COUNT(*) FROM campaign_events"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
 
     async def test_challenge_ttl_starts_after_prompt_delivery(self) -> None:
         self.store.set_mode("protect")
@@ -904,14 +1165,51 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.protector.sender_key(123456789)
         self.store.mark_provisional(sender_key, self.now)
         self.store.set_mode("protect")
+        self.service = self.make_service(
+            denylist=frozenset({"blocked.invalid"})
+        )
         outcome = await self.service.handle(
             self.message(
                 1,
-                facts=MessageFacts(has_link_button=True, link_button_count=2),
+                text="https://blocked.invalid/offer",
+                facts=MessageFacts(
+                    text="https://blocked.invalid/offer",
+                    urls=("https://blocked.invalid/offer",),
+                    domains=("blocked.invalid",),
+                ),
             ),
             FakeActions(),
         )
         self.assertEqual(outcome, "suppressed")
+
+    async def test_provisional_sender_with_new_risk_is_challenged_again(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.mark_provisional(sender_key, self.now)
+        self.store.set_mode("protect")
+        facts = MessageFacts(
+            text="推广 https://t.me/+syntheticInvite",
+            urls=("https://t.me/+syntheticInvite",),
+            domains=("t.me",),
+        )
+        outcome = await self.service.handle(
+            self.message(1, facts.text, facts), FakeActions()
+        )
+        self.assertEqual(outcome, "challenged")
+        state = self.store.sender(sender_key)
+        self.assertEqual(state.status, "challenged")
+        self.assertEqual(state.challenge_profile, "strict")
+
+    async def test_provisional_sender_without_new_evidence_remains_provisional(
+        self,
+    ) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.mark_provisional(sender_key, self.now)
+        self.store.set_mode("protect")
+        outcome = await self.service.handle(
+            self.message(1, "项目进度已更新"), FakeActions()
+        )
+        self.assertEqual(outcome, "provisional")
+        self.assertEqual(self.store.sender(sender_key).status, "provisional")
 
     async def test_owner_reply_promotes_provisional_sender(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -1012,6 +1310,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "Verification required",
             reference,
             self.now,
+            challenge_profile="strict",
         )
         actions = FakeActions()
         recovered = await self.service.recover_incomplete_challenge(
@@ -1019,6 +1318,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(recovered)
         self.assertEqual(self.store.sender(sender_key).status, "challenged")
+        self.assertEqual(self.store.sender(sender_key).challenge_profile, "strict")
         self.assertEqual(actions.scheduled[0][2], 30)
 
     async def test_recovery_archive_failure_resets_unknown(self) -> None:

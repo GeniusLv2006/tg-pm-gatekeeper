@@ -400,6 +400,48 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.statistics(now=199)["pending_reviews"], 1)
         self.assertEqual(self.store.statistics(now=200)["pending_reviews"], 0)
 
+    def test_statistics_report_recent_adaptive_decisions_without_payloads(self) -> None:
+        self.store.record_decision(
+            "sender-a",
+            detector="deterministic",
+            signals='[{"code":"LOW_INFORMATION_OPENER"}]',
+            assessment="standard",
+            risk_score=5,
+            model_version=None,
+            decision_basis="risk_below_strict_threshold",
+            planned_action="standard_challenge",
+            actual_action="challenged",
+            policy_version="adaptive-v1",
+            now=100,
+        )
+        self.store.record_decision(
+            "sender-b",
+            detector="deterministic",
+            signals='[{"code":"REPEATED_CAMPAIGN"}]',
+            assessment="permanent_suppression",
+            risk_score=110,
+            model_version=None,
+            decision_basis="repeated_campaign_destructive_gate",
+            planned_action="permanent_suppression",
+            actual_action="suppressed",
+            policy_version="adaptive-v1",
+            now=200,
+        )
+        stats = self.store.statistics(now=300)
+        self.assertEqual(stats["standard_challenge_7d"], 1)
+        self.assertEqual(stats["strict_challenge_7d"], 0)
+        self.assertEqual(stats["permanent_suppression_7d"], 1)
+        self.assertEqual(stats["repeated_campaign_7d"], 1)
+
+    def test_campaign_observation_counts_distinct_recent_senders(self) -> None:
+        self.assertEqual(self.store.observe_campaign("digest", "sender-a", now=100), 1)
+        self.assertEqual(self.store.observe_campaign("digest", "sender-a", now=200), 1)
+        self.assertEqual(self.store.observe_campaign("digest", "sender-b", now=300), 2)
+        self.assertEqual(
+            self.store.observe_campaign("digest", "sender-c", now=300 + 86401),
+            1,
+        )
+
     def test_review_reference_expires_at_its_own_deadline(self) -> None:
         self.store.enqueue_review(
             "sender", b"sealed-reference", "would_challenge", "[]", "{}", 200, 100
@@ -471,7 +513,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 5)
+            self.assertEqual(version, 6)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -509,7 +551,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                5,
+                6,
             )
         finally:
             reopened.close()
@@ -543,7 +585,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.sender("sender").revision, 0)
             self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 5
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 6
             )
         finally:
             store.close()
@@ -563,7 +605,7 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 5
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
             )
         finally:
             reopened.close()
@@ -587,7 +629,7 @@ class StoreMigrationTests(unittest.TestCase):
             }
             self.assertIn("restriction_reference", columns)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 5
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
             )
         finally:
             reopened.close()
@@ -621,10 +663,85 @@ class StoreMigrationTests(unittest.TestCase):
                 reopened.outbound_statistics(now=1001)["outbound_total_1h"], 2
             )
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 5
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
             )
         finally:
             reopened.close()
+
+    def test_v5_database_migrates_active_challenge_and_legacy_decision(self) -> None:
+        store = StateStore(self.path)
+        store.suppress(
+            "legacy-case",
+            "critical_rule",
+            until=None,
+            reference=b"legacy-reference",
+            now=90,
+        )
+        store._connection.executescript(
+            """
+            INSERT INTO sender_state(
+                sender_key,status,challenge_id,answer_digest,challenge_expires_at,
+                challenge_message_id,updated_at
+            ) VALUES ('sender','challenged','id','digest',700,12,100);
+            INSERT INTO decision_events(
+                sender_key,detector,signals,assessment,risk_score,model_version,
+                decision_basis,planned_action,actual_action,policy_version,created_at
+            ) VALUES (
+                'sender','hard_rules','[\"HR-01\"]','critical',100,NULL,
+                'legacy_rules_v2','suppress','suppressed','rules-v2',100
+            );
+            ALTER TABLE sender_state DROP COLUMN challenge_profile;
+            ALTER TABLE review_queue RENAME COLUMN signals TO rule_codes;
+            ALTER TABLE decision_events RENAME COLUMN assessment TO severity;
+            ALTER TABLE decision_events RENAME COLUMN risk_score TO score;
+            ALTER TABLE decision_events DROP COLUMN decision_basis;
+            DROP TABLE campaign_events;
+            PRAGMA user_version=5;
+            """
+        )
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            self.assertEqual(reopened.sender("sender").challenge_profile, "standard")
+            row = reopened._connection.execute(
+                "SELECT signals,assessment,risk_score,decision_basis,policy_version "
+                "FROM decision_events WHERE sender_key='sender'"
+            ).fetchone()
+            self.assertEqual(row["signals"], '["HR-01"]')
+            self.assertEqual(row["assessment"], "critical")
+            self.assertEqual(row["risk_score"], 100)
+            self.assertEqual(row["decision_basis"], "legacy_rules_v2")
+            self.assertEqual(row["policy_version"], "rules-v2")
+            legacy_state = reopened.sender("legacy-case")
+            self.assertEqual(legacy_state.status, "suppressed")
+            self.assertEqual(legacy_state.suppression_reason, "critical_rule")
+            self.assertEqual(reopened.pending_actions(), [])
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
+            )
+        finally:
+            reopened.close()
+
+    def test_newer_schema_is_refused_without_mutation(self) -> None:
+        store = StateStore(self.path)
+        store.close()
+        connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA user_version=7")
+        connection.close()
+
+        with self.assertRaisesRegex(
+            StoreMigrationError, "unsupported database schema version: 7"
+        ):
+            StateStore(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0], 7
+            )
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

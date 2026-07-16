@@ -1,7 +1,7 @@
 # tg-pm-gatekeeper
 
-A self-hosted Telegram userbot that screens unsolicited private messages with local rules, an
-owner-only review dashboard, and optional arithmetic challenges.
+A self-hosted Telegram userbot that screens unsolicited private messages with local deterministic
+evidence signals, an owner-only review dashboard, and optional arithmetic challenges.
 
 > [!IMPORTANT]
 > Gatekeeper controls a Telegram user session. Anyone who steals that session can access the account.
@@ -31,26 +31,27 @@ public administration port.
 | Mode | What happens to unknown senders | Telegram changes |
 | --- | --- | --- |
 | `monitor` (default) | Records what Gatekeeper would have done for your review | None |
-| `protect` | Archives and mutes the dialog, then sends an arithmetic challenge | Yes |
+| `protect` | Applies the adaptive-v1 policy: standard challenge, strict challenge, or permanent suppression | Yes |
 
-HR matches with `critical` severity can delete a private dialog in `protect` mode. Gatekeeper warns
-before deleting a dialog after failed or expired verification. The arithmetic check adds interaction
-friction; it is not a CAPTCHA or proof that a sender is human.
+Permanent suppression requires either a non-quoted owner-denied domain or a corroborated repeated
+campaign across different senders. Strict challenges allow one numeric attempt; a wrong answer or
+timeout warns before deleting the dialog and suppresses the sender for 24 hours. The arithmetic check
+adds interaction friction; it is not a CAPTCHA or proof that a sender is human.
 
 ## Project direction
 
 Gatekeeper is pre-release. The following describes the current development direction, not a feature
 commitment or compatibility promise; priorities and interfaces may change before a stable release.
 
-- The shipped product remains local and deterministic: local rules identify risk, the owner reviews
-  exceptions, and arithmetic challenges add friction for otherwise unknown senders.
+- The shipped product remains local and deterministic: versioned evidence weights identify risk,
+  arithmetic challenges add adaptive friction, and operator review is reserved for runtime
+  exceptions and recovery.
 - The dashboard is intentionally limited to **Pending Reviews** and **Active Cases**. The standalone
   labeling workflow was removed after the local model-training direction was abandoned because the
   available sample volume was not sufficient.
-- An opt-in external model for unknown senders without an HR match of `critical` severity is a
-  possible future direction, but no provider, API contract, or delivery schedule has been selected.
-  Any such integration would require an explicit privacy boundary and a safe fallback to the existing
-  local flow.
+- The `adaptive-v1` weights, thresholds, and destructive gates are code-versioned. They cannot be
+  changed through environment variables; changing an automatic-deletion boundary requires tests and
+  normal code review.
 
 The current release does not send message content to an AI provider. Features documented elsewhere
 in this repository describe shipped behavior unless they are explicitly marked as a possible
@@ -134,9 +135,10 @@ does not deliver another device's outgoing-message update in real time. Gatekeep
 deletes processed commands and all replies or case cards they create after 15 minutes.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
-referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Archive and
-Mute** archives and mutes the dialog, and **Dismiss and Cancel Pending Jobs** closes the review and
-cancels pending Gatekeeper deletion jobs without changing the current trust decision.
+referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Permanently
+Suppress and Delete** records an explicit owner decision and schedules deletion, and **Dismiss and
+Cancel Pending Jobs** closes the review and cancels pending Gatekeeper deletion jobs without changing
+the current trust decision.
 
 See [Dashboard and daily operation](docs/deployment.md#dashboard-and-daily-operation) for the detailed
 behavior and tunnel options.
@@ -146,12 +148,14 @@ behavior and tunnel options.
 ```text
 incoming private message
   -> already trusted? allow
-  -> HR match with critical severity? delete the dialog and suppress the sender
-  -> otherwise archive and mute, then send an arithmetic challenge
+  -> score >= 70 and destructive evidence gate met? delete and permanently suppress
+  -> score >= 30? archive/mute and send a strict arithmetic challenge (1 attempt)
+  -> otherwise archive/mute and send the standard arithmetic challenge
       -> correct direct Reply: restore the dialog
       -> owner replies later: trust the sender
-      -> timeout: warn, delete after 10 seconds, suppress for 2 hours
-      -> attempts exhausted: warn, delete after 10 seconds, suppress for 24 hours
+      -> standard timeout: warn, delete after 10 seconds, suppress for 2 hours
+      -> standard attempts exhausted: warn, delete after 10 seconds, suppress for 24 hours
+      -> strict timeout or wrong answer: warn, delete after 10 seconds, suppress for 24 hours
       -> new-challenge quota reached: keep archived and send to manual review
 ```
 
@@ -159,10 +163,9 @@ The hourly outbound limit remains a hard cap. Part of that capacity is reserved 
 verification hints, corrections, timeout warnings, and results for challenges already in progress,
 so a burst of new senders cannot consume every notification slot.
 
-HR is the deterministic Hard Rule identifier family, while `critical` is a severity. HR matches with
-`critical` severity currently cover multiple interactive link buttons, forwarded interactive link
-buttons, and optional locally denied domains. Promotional and multi-link HR matches with `high`
-severity follow the normal challenge path. The full rule and state behavior is documented in
+Risk is a fixed sum of structured evidence signals. A score alone cannot authorize permanent
+suppression: weak signals and quoted denylist matches remain on the strict-challenge path even above
+70. The full signal map, thresholds, destructive gates, and state behavior are documented in
 [Architecture](docs/architecture.md).
 
 ## Common operator commands
@@ -177,7 +180,8 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli allow USER_ID
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 ```
 
-Returning to `monitor` cancels non-test pending destructive jobs. The CLI refuses `allow` for active
+Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual
+spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active
 challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use
 **Legitimate · Allow Sender** or **Allow Now** in the dashboard instead. If Active Case evidence has
 expired, the restriction remains listed and **Allow Now** continues to work through a separate
