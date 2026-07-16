@@ -171,6 +171,8 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.adapter._self_user_id = 1000
         self.adapter._operator_case_controls = {}
         self.adapter._operator_command_lock = asyncio.Lock()
+        self.adapter._operator_sync_cursor = 0
+        self.adapter._operator_handled_message_ids = {}
         self.adapter._restriction_actions = SimpleNamespace(allow=AsyncMock())
         self.adapter.client = SimpleNamespace(
             get_entity=AsyncMock(
@@ -233,6 +235,14 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
 
         event.respond.assert_not_awaited()
 
+    async def test_forwarded_command_is_ignored(self) -> None:
+        event = self.event("/gatekeeper ping")
+        event.message.fwd_from = SimpleNamespace(from_id=1000)
+
+        await self.adapter._on_operator_message(event)
+
+        event.respond.assert_not_awaited()
+
     async def test_cases_create_reply_bound_controls_without_evidence(self) -> None:
         sender_key = self.protector.sender_key(123456789)
         reference = self.protector.seal_restriction_reference(123456789, -987654321)
@@ -289,6 +299,34 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.adapter._restriction_actions.allow.assert_not_awaited()
         self.assertIn("current case", event.respond.await_args.args[0])
+
+    async def test_sync_processes_cross_client_command_once(self) -> None:
+        command = self.event("/gatekeeper ping")
+        command.id = 12
+        self.adapter.client.get_messages = AsyncMock(return_value=[command])
+
+        await self.adapter._sync_operator_messages()
+        await self.adapter._on_operator_message(command)
+
+        self.assertEqual(self.adapter._operator_sync_cursor, 12)
+        command.respond.assert_awaited_once()
+        self.adapter.client.get_messages.assert_awaited_once_with(
+            "me",
+            limit=100,
+            min_id=0,
+            reverse=True,
+            search="/gatekeeper",
+        )
+
+    async def test_sync_initialization_does_not_replay_existing_commands(self) -> None:
+        existing = self.event("/gatekeeper ping")
+        existing.id = 20
+        self.adapter.client.get_messages = AsyncMock(return_value=[existing])
+
+        await self.adapter._initialize_operator_sync_cursor()
+
+        self.assertEqual(self.adapter._operator_sync_cursor, 20)
+        existing.respond.assert_not_awaited()
 
 
 class FakeHistoryClient:
@@ -668,6 +706,7 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
             connect=AsyncMock(),
             is_user_authorized=AsyncMock(return_value=True),
             get_me=AsyncMock(return_value=SimpleNamespace(id=1000)),
+            get_messages=AsyncMock(return_value=[]),
             add_event_handler=Mock(),
             run_until_disconnected=AsyncMock(),
             disconnect=AsyncMock(),
@@ -679,6 +718,8 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         adapter._timeout_tasks = {}
         adapter._maintenance_tasks = set()
         adapter._heartbeat_task = None
+        adapter._operator_sync_cursor = None
+        adapter._operator_handled_message_ids = {}
         adapter.settings = SimpleNamespace(
             telegram_operator_controls_enabled=operator_controls
         )

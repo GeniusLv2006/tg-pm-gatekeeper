@@ -221,7 +221,11 @@ and kept only in process memory; a restart, a newer `cases` command, or expiry i
 Commands are ignored outside Saved Messages, including messages sent to private users or groups.
 Case cards contain the resolved name or username, restriction state, reason, and age. They do not
 copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved
-Messages. The cards themselves remain in Telegram until the owner deletes them.
+Messages. The cards themselves remain in Telegram until the owner deletes them. Telegram may omit
+real-time outgoing updates created by another client, so Gatekeeper also checks only Saved Messages
+newer than its startup cursor every three seconds. Commands are deduplicated across both paths and
+are never replayed from before the current service start. The fallback history query searches only
+for `/gatekeeper` matches and does not retrieve unrelated Saved Messages.
 
 Legacy restrictions without an encrypted control identity cannot be released this way. Use the
 dashboard's **Legacy Recovery** path for those cases. Pending Review decisions and detailed evidence

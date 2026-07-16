@@ -36,6 +36,8 @@ PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
 OPERATOR_CASE_LIMIT = 5
 OPERATOR_CONTROL_TTL_SECONDS = 15 * 60
 OPERATOR_IDENTITY_TIMEOUT_SECONDS = 5
+OPERATOR_SYNC_INTERVAL_SECONDS = 3
+OPERATOR_SYNC_BATCH_LIMIT = 100
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
     "⚠️ Verification Required",
@@ -337,6 +339,8 @@ class TelegramAdapter:
         self._self_user_id: int | None = None
         self._operator_case_controls: dict[int, OperatorCaseControl] = {}
         self._operator_command_lock = asyncio.Lock()
+        self._operator_sync_cursor: int | None = None
+        self._operator_handled_message_ids: dict[int, float] = {}
         self._restriction_actions = RestrictionActions(
             store,
             service,
@@ -359,6 +363,8 @@ class TelegramAdapter:
             raise TelegramAuthorizationError("telegram session is not authorized")
         me = await self.client.get_me()
         self._self_user_id = int(me.id)
+        if self.settings.telegram_operator_controls_enabled:
+            await self._initialize_operator_sync_cursor()
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
         await self._recover_pending_actions()
@@ -370,6 +376,7 @@ class TelegramAdapter:
             self.client.add_event_handler(
                 self._on_operator_message, events.NewMessage(outgoing=True)
             )
+            self._track_maintenance_task(self._operator_sync_loop())
         disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         LOG.info("service_started")
@@ -478,6 +485,7 @@ class TelegramAdapter:
             or not event.is_private
             or not event.outgoing
             or event.chat_id != self._self_user_id
+            or getattr(event.message, "fwd_from", None) is not None
         ):
             return
         text = (event.raw_text or "").strip()
@@ -485,26 +493,48 @@ class TelegramAdapter:
             return
         try:
             async with self._operator_command_lock:
+                message_id = getattr(event, "id", None)
+                now = time.monotonic()
+                self._operator_handled_message_ids = {
+                    handled_id: expires_at
+                    for handled_id, expires_at in self._operator_handled_message_ids.items()
+                    if expires_at > now
+                }
+                if (
+                    isinstance(message_id, int)
+                    and message_id in self._operator_handled_message_ids
+                ):
+                    return
+                if isinstance(message_id, int):
+                    self._operator_handled_message_ids[message_id] = (
+                        now + OPERATOR_CONTROL_TTL_SECONDS
+                    )
                 if text in {"/gatekeeper", "/gatekeeper help"}:
+                    command_name = "help"
                     await event.respond(
                         self._operator_help(), link_preview=False, parse_mode=None
                     )
                 elif text == "/gatekeeper ping":
+                    command_name = "ping"
                     await event.respond(
                         "✅ Gatekeeper operator controls are online.",
                         link_preview=False,
                         parse_mode=None,
                     )
                 elif text == "/gatekeeper cases":
+                    command_name = "cases"
                     await self._send_operator_cases(event)
                 elif text == "/gatekeeper allow":
+                    command_name = "allow"
                     await self._allow_operator_case(event)
                 else:
+                    command_name = "unknown"
                     await event.respond(
                         "Unknown Gatekeeper command. Send /gatekeeper help.",
                         link_preview=False,
                         parse_mode=None,
                     )
+                LOG.info(f"operator_command_handled:{command_name}")
         except Exception:
             LOG.error("operator_command_failed")
             try:
@@ -515,6 +545,51 @@ class TelegramAdapter:
                 )
             except Exception:
                 LOG.error("operator_response_failed")
+
+    async def _initialize_operator_sync_cursor(self) -> None:
+        try:
+            messages = await self.client.get_messages("me", limit=1)
+        except Exception:
+            self._operator_sync_cursor = None
+            LOG.warning("operator_sync_initialization_failed")
+            return
+        self._operator_sync_cursor = max(
+            (int(message.id) for message in messages),
+            default=0,
+        )
+
+    async def _operator_sync_loop(self) -> None:
+        while True:
+            await asyncio.sleep(OPERATOR_SYNC_INTERVAL_SECONDS)
+            try:
+                await self._sync_operator_messages()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning("operator_sync_failed")
+
+    async def _sync_operator_messages(self) -> None:
+        if self._operator_sync_cursor is None:
+            await self._initialize_operator_sync_cursor()
+            return
+        while True:
+            messages = await self.client.get_messages(
+                "me",
+                limit=OPERATOR_SYNC_BATCH_LIMIT,
+                min_id=self._operator_sync_cursor,
+                reverse=True,
+                search="/gatekeeper",
+            )
+            if not messages:
+                return
+            for message in messages:
+                message_id = int(message.id)
+                if message_id <= self._operator_sync_cursor:
+                    continue
+                self._operator_sync_cursor = message_id
+                await self._on_operator_message(message)
+            if len(messages) < OPERATOR_SYNC_BATCH_LIMIT:
+                return
 
     async def _send_operator_cases(self, event) -> None:
         self._operator_case_controls.clear()
