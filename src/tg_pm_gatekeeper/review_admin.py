@@ -664,6 +664,52 @@ class ReviewAdminServer:
                 labels.append(label)
         return ", ".join(labels) or "—"
 
+    @classmethod
+    def _signal_breakdown(cls, value: object) -> str:
+        if not isinstance(value, list) or not value:
+            return "<span class='empty-value'>—</span>"
+        items: list[str] = []
+        for item in value:
+            code = item.get("code") if isinstance(item, dict) else item
+            if not code:
+                continue
+            title = html.escape(cls._human_label(str(code)))
+            source = item.get("source") if isinstance(item, dict) else None
+            weight = item.get("weight") if isinstance(item, dict) else None
+            explanation = item.get("explanation") if isinstance(item, dict) else None
+            source_badge = (
+                "<span class='signal-source'>"
+                f"{html.escape(cls._human_label(str(source)))}"
+                "</span>"
+                if source
+                else ""
+            )
+            score_badge = (
+                f"<span class='signal-score'>+{weight:g}</span>"
+                if isinstance(weight, (int, float))
+                else ""
+            )
+            explanation_copy = (
+                f"<p class='signal-explanation'>{html.escape(str(explanation))}</p>"
+                if explanation
+                else ""
+            )
+            items.append(
+                "<li class='signal-item'>"
+                "<span class='signal-index' aria-hidden='true'></span>"
+                "<div class='signal-copy'>"
+                f"<div class='signal-heading'><strong>{title}</strong>{score_badge}</div>"
+                f"{source_badge}{explanation_copy}"
+                "</div></li>"
+            )
+        if not items:
+            return "<span class='empty-value'>—</span>"
+        return (
+            "<ol class='signal-list' aria-label='Evidence signals'>"
+            + "".join(items)
+            + "</ol>"
+        )
+
     @staticmethod
     def _is_legacy_payload(payload: dict[str, object]) -> bool:
         try:
@@ -915,7 +961,7 @@ class ReviewAdminServer:
                 )
         legacy_payload = self._is_legacy_payload(payload)
         if legacy_payload:
-            signal_labels = self._signal_labels(payload.get("rule_codes", []))
+            signal_breakdown = self._signal_breakdown(payload.get("rule_codes", []))
             risk_label = self._legacy_severity_label(payload, item.reason)
             policy_decision = "Legacy decision retained"
             decision_basis = "Recorded under rules-v2; not recalculated."
@@ -924,7 +970,7 @@ class ReviewAdminServer:
                 "Recorded under rules-v2; not recalculated and no new action was added.</div>"
             )
         else:
-            signal_labels = self._signal_labels(payload.get("signals", []))
+            signal_breakdown = self._signal_breakdown(payload.get("signals", []))
             risk_label = str(payload.get("risk_score", "Not recorded"))
             planned_action = str(payload.get("planned_action", "not_recorded"))
             policy_decision = self._human_label(planned_action)
@@ -1007,7 +1053,7 @@ class ReviewAdminServer:
           <dt>Risk Score</dt><dd>{html.escape(risk_label)}</dd>
           <dt>Policy Decision</dt><dd>{html.escape(policy_decision)}</dd>
           <dt>Decision Basis</dt><dd>{html.escape(decision_basis)}</dd>
-          <dt>Evidence Signals</dt><dd>{html.escape(signal_labels)}</dd>
+          <dt>Evidence Signals</dt><dd class="signal-breakdown">{signal_breakdown}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
           <dt>Evidence Expires</dt><dd>{evidence_expiry}</dd></dl>
           <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
@@ -1095,7 +1141,7 @@ class ReviewAdminServer:
             IDENTITY_CACHE_SECONDS,
         )
         identity = name + (f" (@{username})" if username else "")
-        signals = self._signal_labels(json.loads(item.signals))
+        signals = self._signal_breakdown(json.loads(item.signals))
         review_reason = self._human_label(item.classification)
         features = json.dumps(json.loads(item.features), indent=2, sort_keys=True)
         observed_at = datetime.fromtimestamp(item.updated_at, timezone.utc).strftime(
@@ -1116,7 +1162,7 @@ class ReviewAdminServer:
               </section>
               <aside class="case-file"><p class="eyebrow">Review Details</p>
                 <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-                <dt>Evidence Signals</dt><dd>{html.escape(signals)}</dd>
+                <dt>Evidence Signals</dt><dd class="signal-breakdown">{signals}</dd>
                 <dt>Messages Observed</dt><dd>{item.message_count}</dd>
                 <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
               </aside>
@@ -1150,7 +1196,7 @@ class ReviewAdminServer:
           <aside class="case-file">
             <p class="eyebrow">Review Details</p>
             <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-            <dt>Evidence Signals</dt><dd>{html.escape(signals)}</dd>
+            <dt>Evidence Signals</dt><dd class="signal-breakdown">{signals}</dd>
             <dt>Telegram ID</dt><dd>{user_id}</dd>
             <dt>Messages Observed</dt><dd>{item.message_count}</dd>
             <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
@@ -1704,6 +1750,7 @@ th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical
 pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}pre.message{{min-height:180px;margin:0 0 1.5rem;padding:1.4rem;background:var(--ink);color:#f7f1df;font:1rem/1.65 var(--font-ui);border-left:5px solid var(--signal)}}
 .content-label{{margin:1.5rem 0 .55rem;color:var(--muted);font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}}pre.message.quote{{min-height:96px;background:#27332e;border-left-color:#b88836}}
 .telegram-link{{display:inline-block;max-width:100%;font-weight:800;overflow-wrap:anywhere}}dt{{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}dd{{margin:.2rem 0 1.2rem;overflow-wrap:anywhere}}.badge{{display:inline-block;max-width:100%;padding:.2rem .45rem;background:#f8e9d8;border:1px solid var(--signal);color:#9d3118;font-weight:800;overflow-wrap:anywhere}}
+.signal-breakdown{{margin-top:.55rem}}.signal-list{{display:grid;gap:.65rem;margin:0 0 1.35rem;padding:0;list-style:none;counter-reset:evidence-signal}}.signal-item{{counter-increment:evidence-signal;display:grid;grid-template-columns:1.75rem minmax(0,1fr);gap:.65rem;padding:.75rem;background:#f7f2e7;border:1px solid var(--line);border-left:3px solid #b88836}}.signal-index{{display:grid;place-items:center;align-self:start;width:1.75rem;height:1.75rem;background:var(--ink);color:var(--panel);font:700 .64rem/1 var(--font-data)}}.signal-index:before{{content:counter(evidence-signal,decimal-leading-zero)}}.signal-copy{{min-width:0}}.signal-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:.55rem}}.signal-heading strong{{font-size:.82rem;line-height:1.35}}.signal-score{{flex:0 0 auto;padding:.18rem .38rem;background:#ead9ba;color:#724d0b;font:800 .68rem/1.2 var(--font-data);font-variant-numeric:tabular-nums}}.signal-source{{display:inline-block;margin-top:.35rem;padding:.12rem .3rem;border:1px solid var(--line);background:var(--panel);color:var(--muted);font:700 .64rem/1.3 var(--font-data);text-transform:uppercase;letter-spacing:.08em}}.signal-explanation{{margin:.5rem 0 0;color:#4f5953;font-size:.76rem;line-height:1.5}}.empty-value{{color:var(--muted)}}
 details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:pointer;font-weight:800}}details pre{{font-size:.75rem;color:var(--muted)}}.decision-panel{{position:relative;width:calc(100% - 2.5rem);max-width:1080px;margin:0 auto 4rem;border-top:5px solid var(--ink)}}.decision-panel h2{{font-size:1.7rem;margin-bottom:0}}
 .actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
 .actions>button{{width:100%}}button:disabled{{cursor:not-allowed;color:var(--muted);border-color:var(--line);box-shadow:none}}.live-change-notice{{position:relative;max-width:1080px;margin:1.25rem auto 0;padding:1rem 1.25rem;border:1px solid var(--signal);border-left:5px solid var(--signal);background:#f8e9d8;color:var(--ink)}}.live-change-notice[hidden]{{display:none}}
