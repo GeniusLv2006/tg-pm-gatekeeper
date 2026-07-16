@@ -227,6 +227,10 @@ newer than its startup cursor every three seconds. Commands are deduplicated acr
 are never replayed from before the current service start. The fallback history query searches only
 for `/gatekeeper` matches and does not retrieve unrelated Saved Messages.
 
+Processed command messages and all responses or case cards generated for them are automatically
+deleted after 15 minutes, matching the reply-control lifetime. Cleanup jobs are held only in process
+memory; if the service restarts during that window, delete any remaining artifacts manually.
+
 Legacy restrictions without an encrypted control identity cannot be released this way. Use the
 dashboard's **Legacy Recovery** path for those cases. Pending Review decisions and detailed evidence
 inspection also remain dashboard-only.

@@ -10,7 +10,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from telethon import functions, types
 
@@ -173,6 +173,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.adapter._operator_command_lock = asyncio.Lock()
         self.adapter._operator_sync_cursor = 0
         self.adapter._operator_handled_message_ids = {}
+        self.adapter.schedule_operator_artifact_deletion = Mock()
         self.adapter._restriction_actions = SimpleNamespace(allow=AsyncMock())
         self.adapter.client = SimpleNamespace(
             get_entity=AsyncMock(
@@ -207,10 +208,14 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         return SimpleNamespace(
             is_private=True,
-            outgoing=outgoing,
             chat_id=chat_id,
             raw_text=text,
-            message=SimpleNamespace(reply_to=reply_header),
+            id=8000,
+            message=SimpleNamespace(
+                out=outgoing,
+                fwd_from=None,
+                reply_to=reply_header,
+            ),
             respond=respond,
         )
 
@@ -218,6 +223,9 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         saved = self.event("/gatekeeper ping")
         await self.adapter._on_operator_message(saved)
         self.assertIn("online", saved.respond.await_args.args[0])
+        self.adapter.schedule_operator_artifact_deletion.assert_called_with(
+            [8000, 9000]
+        )
 
         another_chat = self.event("/gatekeeper ping", chat_id=2000)
         await self.adapter._on_operator_message(another_chat)
@@ -242,6 +250,16 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.adapter._on_operator_message(event)
 
         event.respond.assert_not_awaited()
+
+    async def test_operator_artifacts_are_deleted_after_control_ttl(self) -> None:
+        self.adapter.client.delete_messages = AsyncMock()
+        with patch("tg_pm_gatekeeper.telegram_adapter.asyncio.sleep") as sleep:
+            await self.adapter._operator_artifact_deletion_worker((10, 11, 12))
+
+        sleep.assert_awaited_once_with(15 * 60)
+        self.adapter.client.delete_messages.assert_awaited_once_with(
+            "me", [10, 11, 12], revoke=True
+        )
 
     async def test_cases_create_reply_bound_controls_without_evidence(self) -> None:
         sender_key = self.protector.sender_key(123456789)

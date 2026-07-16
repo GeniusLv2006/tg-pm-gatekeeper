@@ -483,7 +483,7 @@ class TelegramAdapter:
             not self.settings.telegram_operator_controls_enabled
             or self._self_user_id is None
             or not event.is_private
-            or not event.outgoing
+            or not bool(getattr(event.message, "out", False))
             or event.chat_id != self._self_user_id
             or getattr(event.message, "fwd_from", None) is not None
         ):
@@ -491,6 +491,7 @@ class TelegramAdapter:
         text = (event.raw_text or "").strip()
         if text != "/gatekeeper" and not text.startswith("/gatekeeper "):
             return
+        artifact_ids: list[int] = []
         try:
             async with self._operator_command_lock:
                 message_id = getattr(event, "id", None)
@@ -509,42 +510,56 @@ class TelegramAdapter:
                     self._operator_handled_message_ids[message_id] = (
                         now + OPERATOR_CONTROL_TTL_SECONDS
                     )
+                    artifact_ids.append(message_id)
                 if text in {"/gatekeeper", "/gatekeeper help"}:
                     command_name = "help"
-                    await event.respond(
-                        self._operator_help(), link_preview=False, parse_mode=None
+                    await self._operator_respond(
+                        event,
+                        self._operator_help(),
+                        artifact_ids,
                     )
                 elif text == "/gatekeeper ping":
                     command_name = "ping"
-                    await event.respond(
+                    await self._operator_respond(
+                        event,
                         "✅ Gatekeeper operator controls are online.",
-                        link_preview=False,
-                        parse_mode=None,
+                        artifact_ids,
                     )
                 elif text == "/gatekeeper cases":
                     command_name = "cases"
-                    await self._send_operator_cases(event)
+                    await self._send_operator_cases(event, artifact_ids)
                 elif text == "/gatekeeper allow":
                     command_name = "allow"
-                    await self._allow_operator_case(event)
+                    await self._allow_operator_case(event, artifact_ids)
                 else:
                     command_name = "unknown"
-                    await event.respond(
+                    await self._operator_respond(
+                        event,
                         "Unknown Gatekeeper command. Send /gatekeeper help.",
-                        link_preview=False,
-                        parse_mode=None,
+                        artifact_ids,
                     )
                 LOG.info(f"operator_command_handled:{command_name}")
         except Exception:
             LOG.error("operator_command_failed")
             try:
-                await event.respond(
+                await self._operator_respond(
+                    event,
                     "❌ Gatekeeper could not process that operator command.",
-                    link_preview=False,
-                    parse_mode=None,
+                    artifact_ids,
                 )
             except Exception:
                 LOG.error("operator_response_failed")
+        finally:
+            if artifact_ids:
+                self.schedule_operator_artifact_deletion(artifact_ids)
+
+    @staticmethod
+    async def _operator_respond(event, text: str, artifact_ids: list[int]):
+        message = await event.respond(text, link_preview=False, parse_mode=None)
+        message_id = getattr(message, "id", None)
+        if isinstance(message_id, int):
+            artifact_ids.append(message_id)
+        return message
 
     async def _initialize_operator_sync_cursor(self) -> None:
         try:
@@ -591,21 +606,21 @@ class TelegramAdapter:
             if len(messages) < OPERATOR_SYNC_BATCH_LIMIT:
                 return
 
-    async def _send_operator_cases(self, event) -> None:
+    async def _send_operator_cases(self, event, artifact_ids: list[int]) -> None:
         self._operator_case_controls.clear()
         total = self.store.active_restriction_count()
         items = self.store.active_restrictions(limit=OPERATOR_CASE_LIMIT)
         if not items:
-            await event.respond(
+            await self._operator_respond(
+                event,
                 "✅ Gatekeeper has no active restrictions.",
-                link_preview=False,
-                parse_mode=None,
+                artifact_ids,
             )
             return
-        await event.respond(
+        await self._operator_respond(
+            event,
             f"Gatekeeper Active Cases · showing {len(items)} of {total}",
-            link_preview=False,
-            parse_mode=None,
+            artifact_ids,
         )
         expires_at = time.monotonic() + OPERATOR_CONTROL_TTL_SECONDS
         for item in items:
@@ -617,15 +632,15 @@ class TelegramAdapter:
                 if actionable
                 else "Telegram identity is unavailable. Use Dashboard legacy recovery."
             )
-            message = await event.respond(
+            message = await self._operator_respond(
+                event,
                 "Gatekeeper Active Case\n\n"
                 f"Sender: {identity}\n"
                 f"State: {item.status.title()}\n"
                 f"Reason: {self._operator_reason(item.reason)}\n"
                 f"Updated: {self._operator_age(item.updated_at)}\n\n"
                 f"{instruction}",
-                link_preview=False,
-                parse_mode=None,
+                artifact_ids,
             )
             if actionable:
                 self._operator_case_controls[int(message.id)] = OperatorCaseControl(
@@ -633,7 +648,7 @@ class TelegramAdapter:
                     expires_at,
                 )
 
-    async def _allow_operator_case(self, event) -> None:
+    async def _allow_operator_case(self, event, artifact_ids: list[int]) -> None:
         reply_id = reply_to_message_id(event.message)
         now = time.monotonic()
         self._operator_case_controls = {
@@ -647,11 +662,11 @@ class TelegramAdapter:
             else None
         )
         if control is None:
-            await event.respond(
+            await self._operator_respond(
+                event,
                 "Reply to a current case from /gatekeeper cases. "
                 "Case controls expire after 15 minutes.",
-                link_preview=False,
-                parse_mode=None,
+                artifact_ids,
             )
             return
         result = await self._restriction_actions.allow(control.sender_key)
@@ -670,7 +685,7 @@ class TelegramAdapter:
                 "❌ Telegram restore failed. The restriction was left unchanged."
             ),
         }[result]
-        await event.respond(response, link_preview=False, parse_mode=None)
+        await self._operator_respond(event, response, artifact_ids)
 
     async def _operator_identity(self, reference: bytes | None) -> str:
         if reference is None:
@@ -922,6 +937,24 @@ class TelegramAdapter:
         task = asyncio.create_task(coroutine)
         self._maintenance_tasks.add(task)
         task.add_done_callback(self._maintenance_tasks.discard)
+
+    def schedule_operator_artifact_deletion(self, message_ids: list[int]) -> None:
+        unique_ids = tuple(dict.fromkeys(message_ids))
+        self._track_maintenance_task(
+            self._operator_artifact_deletion_worker(unique_ids)
+        )
+
+    async def _operator_artifact_deletion_worker(
+        self, message_ids: tuple[int, ...]
+    ) -> None:
+        try:
+            await asyncio.sleep(OPERATOR_CONTROL_TTL_SECONDS)
+            await self.client.delete_messages("me", list(message_ids), revoke=True)
+            LOG.info("operator_artifacts_deleted")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOG.warning("operator_artifact_deletion_failed")
 
     def schedule_test_message_deletion(
         self, peer, sender_key: str, since: int, delete_at: int
