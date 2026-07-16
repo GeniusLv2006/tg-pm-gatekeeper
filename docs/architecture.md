@@ -205,6 +205,10 @@ polling only messages newer than its startup baseline every three seconds. Real-
 share a 15-minute message-ID deduplication map, so a delayed update cannot execute a command twice.
 The history query is restricted to `/gatekeeper` search matches rather than reading unrelated Saved
 Messages. The cursor is never persisted, preventing pre-start commands from replaying after a restart.
+Each processed command and every reply or case card created for it are collected as one in-memory
+artifact set and deleted from Saved Messages when the 15-minute control window ends. A service
+restart cancels unpersisted cleanup jobs, so Telegram artifacts from an interrupted window may
+require manual deletion.
 
 ## Implemented action policy
 
