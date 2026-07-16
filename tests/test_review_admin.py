@@ -572,6 +572,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Legacy HR Decision", detail)
         self.assertIn(b"<dt>Risk Score</dt><dd>Critical</dd>", detail)
         self.assertIn(b"Evidence Signals", detail)
+        self.assertIn(b"<ol class='signal-list'", detail)
+        self.assertIn(b"<li class='signal-item'>", detail)
         self.assertIn(b"HR-01 \xc2\xb7 Multiple Link Buttons", detail)
 
     async def test_active_case_shows_adaptive_signal_breakdown(self) -> None:
@@ -579,7 +581,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         reference = self.protector.seal_review_reference(
             123456789, -987654321, 42
         )
-        explanation = "Telegram webpage preview metadata contains promotional language."
+        explanation = "Telegram <preview> metadata contains promotional language."
         envelope = self.review_protector.seal(
             {
                 "schema_version": 5,
@@ -624,8 +626,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"<dt>Risk Score</dt><dd>30</dd>", detail)
         self.assertIn(b"<dt>Policy Decision</dt><dd>Strict Challenge</dd>", detail)
-        self.assertIn(b"Promotional Language \xc2\xb7 Preview \xc2\xb7 +20", detail)
-        self.assertIn(explanation.encode(), detail)
+        self.assertIn(b"<ol class='signal-list' aria-label='Evidence signals'>", detail)
+        self.assertIn(b"<strong>Promotional Language</strong>", detail)
+        self.assertIn(b"<span class='signal-source'>Preview</span>", detail)
+        self.assertIn(b"<span class='signal-score'>+20</span>", detail)
+        self.assertIn(b"Telegram &lt;preview&gt; metadata", detail)
+        self.assertNotIn(explanation.encode(), detail)
         self.assertNotIn(b"Legacy HR Decision", detail)
 
     async def test_dashboard_contains_only_actionable_review_areas(self) -> None:
