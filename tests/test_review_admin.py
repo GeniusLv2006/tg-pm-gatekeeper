@@ -575,6 +575,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"<ol class='signal-list'", detail)
         self.assertIn(b"<li class='signal-item'>", detail)
         self.assertIn(b"HR-01 \xc2\xb7 Multiple Link Buttons", detail)
+        self.assertNotIn(b"class=\"policy-map\"", detail)
 
     async def test_active_case_shows_adaptive_signal_breakdown(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -624,8 +625,14 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertIn(b"<dt>Risk Score</dt><dd>30</dd>", detail)
-        self.assertIn(b"<dt>Policy Decision</dt><dd>Strict Challenge</dd>", detail)
+        self.assertIn(b"class=\"policy-map\"", detail)
+        self.assertIn(b"Risk score 30; strict challenge starts at 30", detail)
+        self.assertIn(b"<strong>30</strong><small>additive points", detail)
+        self.assertIn(b"not a probability", detail)
+        self.assertIn(b"<strong>30 \xe2\x89\xa5 70</strong>", detail)
+        self.assertIn(b"gate-check unmet", detail)
+        self.assertIn(b"Final policy decision", detail)
+        self.assertIn(b"<strong>Strict Challenge</strong>", detail)
         self.assertIn(b"<ol class='signal-list' aria-label='Evidence signals'>", detail)
         self.assertIn(b"<strong>Promotional Language</strong>", detail)
         self.assertIn(b"<span class='signal-source'>Preview</span>", detail)
@@ -633,6 +640,38 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Telegram &lt;preview&gt; metadata", detail)
         self.assertNotIn(explanation.encode(), detail)
         self.assertNotIn(b"Legacy HR Decision", detail)
+
+    def test_policy_decision_panel_explains_both_permanent_gates(self) -> None:
+        no_destructive_gate = self.server._policy_decision_panel(
+            {
+                "risk_score": 70,
+                "planned_action": "strict_challenge",
+                "signals": [
+                    {"code": "FORWARDED_PAYLOAD"},
+                    {"code": "QUOTED_MULTIPLE_LINKS"},
+                    {"code": "QUOTED_PROMOTIONAL_LANGUAGE"},
+                ],
+            }
+        )
+        self.assertIn("<strong>70 ≥ 70</strong>", no_destructive_gate)
+        self.assertIn("gate-check met", no_destructive_gate)
+        self.assertIn("gate-check unmet", no_destructive_gate)
+        self.assertIn("Not met · No non-quoted denylist match", no_destructive_gate)
+        self.assertIn("score reached 70, but permanent suppression", no_destructive_gate)
+        self.assertIn("<strong>Strict Challenge</strong>", no_destructive_gate)
+
+        permanent = self.server._policy_decision_panel(
+            {
+                "risk_score": 100,
+                "planned_action": "permanent_suppression",
+                "signals": [{"code": "AUTHORED_DENIED_DOMAIN"}],
+            }
+        )
+        self.assertEqual(permanent.count("gate-check met"), 2)
+        self.assertNotIn("gate-check unmet", permanent)
+        self.assertIn("Met · Non-quoted owner-denied domain", permanent)
+        self.assertIn("<strong>Permanent Suppression</strong>", permanent)
+        self.assertIn("Both permanent-suppression conditions were met", permanent)
 
     async def test_dashboard_contains_only_actionable_review_areas(self) -> None:
         page = await self.server._dashboard_page()

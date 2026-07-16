@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 from telethon import functions, types
 
 from .message_facts import facts_from_message
+from .policy import PolicyEngine
 from .restriction_actions import RestrictionActions, RestrictionReleaseResult
 from .rules import url_evidence, url_shape
 from .service import GatekeeperService
@@ -710,6 +711,99 @@ class ReviewAdminServer:
             + "</ol>"
         )
 
+    @classmethod
+    def _policy_decision_panel(cls, payload: dict[str, object]) -> str:
+        raw_score = payload.get("risk_score")
+        if isinstance(raw_score, bool):
+            risk_score = None
+        else:
+            try:
+                risk_score = int(raw_score)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                risk_score = None
+        if risk_score is None:
+            return ""
+
+        raw_signals = payload.get("signals", [])
+        signal_codes = {
+            str(item["code"])
+            for item in raw_signals
+            if isinstance(item, dict) and item.get("code")
+        } if isinstance(raw_signals, list) else set()
+        gate_basis = PolicyEngine.destructive_gate_basis(signal_codes)
+        score_gate_met = risk_score >= PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD
+        destructive_gate_met = gate_basis is not None
+        planned_action = str(payload.get("planned_action", "not_recorded"))
+        action_label = cls._human_label(planned_action)
+        action_class = {
+            "standard_challenge": "standard",
+            "strict_challenge": "strict",
+            "permanent_suppression": "permanent",
+        }.get(planned_action, "unknown")
+        plotted_score = min(max(risk_score, 0), 100)
+
+        if gate_basis == "owner_denied_domain":
+            gate_label = "Met · Non-quoted owner-denied domain"
+        elif gate_basis == "corroborated_repeated_campaign":
+            gate_label = "Met · Corroborated cross-sender campaign"
+        else:
+            gate_label = (
+                "Not met · No non-quoted denylist match or corroborated "
+                "cross-sender campaign"
+            )
+
+        if planned_action == "permanent_suppression":
+            outcome_copy = (
+                "Both permanent-suppression conditions were met, so no challenge was sent."
+            )
+        elif score_gate_met and not destructive_gate_met:
+            outcome_copy = (
+                "The score reached 70, but permanent suppression also requires destructive "
+                f"evidence. The recorded decision was {action_label}."
+            )
+        elif planned_action == "strict_challenge":
+            outcome_copy = (
+                "The score reached the strict threshold but not both permanent-suppression "
+                "conditions."
+            )
+        else:
+            outcome_copy = "The score remained below the strict-challenge threshold."
+
+        score_state = "met" if score_gate_met else "unmet"
+        gate_state = "met" if destructive_gate_met else "unmet"
+        score_symbol = "✓" if score_gate_met else "×"
+        gate_symbol = "✓" if destructive_gate_met else "×"
+        return f"""
+        <section class="policy-map" aria-label="Policy decision explanation">
+          <div class="policy-score-head">
+            <div><span class="policy-kicker">Risk Score</span>
+              <strong>{risk_score}</strong><small>additive points · not a probability</small></div>
+            <span class="policy-version">adaptive-v1</span>
+          </div>
+          <div class="risk-track" role="img" aria-label="Risk score {risk_score}; strict challenge starts at {PolicyEngine.STRICT_CHALLENGE_THRESHOLD} and permanent score condition starts at {PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}">
+            <span class="risk-fill" style="width:{plotted_score}%"></span>
+            <span class="risk-mark strict-mark"><i>{PolicyEngine.STRICT_CHALLENGE_THRESHOLD}</i><b>Strict</b></span>
+            <span class="risk-mark permanent-mark"><i>{PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}</i><b>Permanent score</b></span>
+          </div>
+          <p class="gate-formula">Permanent suppression requires <strong>both</strong> conditions:</p>
+          <div class="gate-check {score_state}">
+            <span class="gate-symbol" aria-hidden="true">{score_symbol}</span>
+            <div><small>1 · Score condition</small>
+              <strong>{risk_score} ≥ {PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}</strong>
+              <p>Risk score reaches the permanent-suppression score threshold.</p></div>
+          </div>
+          <div class="gate-check {gate_state}">
+            <span class="gate-symbol" aria-hidden="true">{gate_symbol}</span>
+            <div><small>2 · Destructive evidence</small>
+              <strong>{html.escape(gate_label)}</strong>
+              <p>Requires a non-quoted denied domain, or a corroborated repeated campaign.</p></div>
+          </div>
+          <div class="policy-outcome {action_class}">
+            <small>Final policy decision</small><strong>{html.escape(action_label)}</strong>
+            <p>{html.escape(outcome_copy)}</p>
+          </div>
+        </section>"""
+
     @staticmethod
     def _is_legacy_payload(payload: dict[str, object]) -> bool:
         try:
@@ -965,18 +1059,20 @@ class ReviewAdminServer:
             risk_label = self._legacy_severity_label(payload, item.reason)
             policy_decision = "Legacy decision retained"
             decision_basis = "Recorded under rules-v2; not recalculated."
+            legacy_decision_rows = (
+                f"<dt>Risk Score</dt><dd>{html.escape(risk_label)}</dd>"
+                f"<dt>Policy Decision</dt><dd>{html.escape(policy_decision)}</dd>"
+                f"<dt>Decision Basis</dt><dd>{html.escape(decision_basis)}</dd>"
+            )
+            policy_panel = ""
             legacy_notice = (
                 "<div class='notice'><strong>Legacy HR Decision.</strong> "
                 "Recorded under rules-v2; not recalculated and no new action was added.</div>"
             )
         else:
             signal_breakdown = self._signal_breakdown(payload.get("signals", []))
-            risk_label = str(payload.get("risk_score", "Not recorded"))
-            planned_action = str(payload.get("planned_action", "not_recorded"))
-            policy_decision = self._human_label(planned_action)
-            decision_basis = self._human_label(
-                str(payload.get("decision_basis", "not_recorded"))
-            )
+            legacy_decision_rows = ""
+            policy_panel = self._policy_decision_panel(payload)
             legacy_notice = ""
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
         observed_at = item.evidence_created_at or item.updated_at
@@ -1050,9 +1146,9 @@ class ReviewAdminServer:
         </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
           <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
           <dt>Restriction Cause</dt><dd>{html.escape(self._human_label(item.reason))}</dd>
-          <dt>Risk Score</dt><dd>{html.escape(risk_label)}</dd>
-          <dt>Policy Decision</dt><dd>{html.escape(policy_decision)}</dd>
-          <dt>Decision Basis</dt><dd>{html.escape(decision_basis)}</dd>
+          {legacy_decision_rows}</dl>
+          {policy_panel}
+          <dl>
           <dt>Evidence Signals</dt><dd class="signal-breakdown">{signal_breakdown}</dd>
           <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
           <dt>Evidence Expires</dt><dd>{evidence_expiry}</dd></dl>
@@ -1750,6 +1846,7 @@ th,td{{padding:1rem;border-bottom:1px solid var(--line);text-align:left;vertical
 pre{{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}pre.message{{min-height:180px;margin:0 0 1.5rem;padding:1.4rem;background:var(--ink);color:#f7f1df;font:1rem/1.65 var(--font-ui);border-left:5px solid var(--signal)}}
 .content-label{{margin:1.5rem 0 .55rem;color:var(--muted);font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}}pre.message.quote{{min-height:96px;background:#27332e;border-left-color:#b88836}}
 .telegram-link{{display:inline-block;max-width:100%;font-weight:800;overflow-wrap:anywhere}}dt{{font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}dd{{margin:.2rem 0 1.2rem;overflow-wrap:anywhere}}.badge{{display:inline-block;max-width:100%;padding:.2rem .45rem;background:#f8e9d8;border:1px solid var(--signal);color:#9d3118;font-weight:800;overflow-wrap:anywhere}}
+.policy-map{{margin:.25rem 0 1.5rem;padding:1rem;border:1px solid var(--ink);background:#f7f2e7;box-shadow:4px 4px 0 #ded7c8}}.policy-score-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem}}.policy-score-head>div{{display:grid;grid-template-columns:auto 1fr;align-items:end;column-gap:.5rem}}.policy-kicker{{grid-column:1/-1;color:var(--muted);font-size:.62rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em}}.policy-score-head strong{{font:800 2.2rem/.95 var(--font-data);letter-spacing:-.06em}}.policy-score-head small{{padding-bottom:.15rem;color:var(--muted);font-size:.65rem}}.policy-version{{padding:.18rem .35rem;border:1px solid var(--line);background:var(--panel);color:var(--muted);font:700 .58rem/1.3 var(--font-data);letter-spacing:.04em}}.risk-track{{position:relative;height:.72rem;margin:1rem 0 3.15rem;background:#ded7c8;border:1px solid #aaa393}}.risk-fill{{display:block;height:100%;background:#b88836}}.risk-mark{{position:absolute;top:-.28rem;width:1px;height:1.2rem;background:var(--ink)}}.risk-mark i,.risk-mark b{{position:absolute;left:50%;transform:translateX(-50%);white-space:nowrap;font-family:var(--font-data);font-style:normal}}.risk-mark i{{top:1.35rem;font-size:.63rem;font-weight:800}}.risk-mark b{{top:2.25rem;color:var(--muted);font-size:.54rem;text-transform:uppercase;letter-spacing:.05em}}.strict-mark{{left:30%}}.permanent-mark{{left:70%;background:var(--signal)}}.permanent-mark i{{color:var(--signal)}}.gate-formula{{margin:0 0 .7rem;color:var(--muted);font-size:.7rem}}.gate-check{{display:grid;grid-template-columns:1.6rem minmax(0,1fr);gap:.6rem;padding:.7rem;border:1px solid var(--line);background:var(--panel)}}.gate-check+.gate-check{{margin-top:.55rem}}.gate-symbol{{display:grid;place-items:center;width:1.55rem;height:1.55rem;border-radius:50%;font:900 .85rem/1 var(--font-data)}}.gate-check small,.policy-outcome small{{display:block;color:var(--muted);font:700 .58rem/1.4 var(--font-data);text-transform:uppercase;letter-spacing:.07em}}.gate-check strong{{display:block;margin:.18rem 0 0;font-size:.72rem;line-height:1.4}}.gate-check p{{margin:.3rem 0 0;color:var(--muted);font-size:.67rem;line-height:1.45}}.gate-check.met{{border-left:3px solid var(--safe)}}.gate-check.met .gate-symbol{{background:#d8f0e6;color:var(--safe)}}.gate-check.unmet{{border-left:3px solid var(--signal)}}.gate-check.unmet .gate-symbol{{background:#f7d8cf;color:var(--signal)}}.policy-outcome{{margin-top:.75rem;padding:.8rem;border:1px solid var(--ink);background:var(--ink);color:var(--panel)}}.policy-outcome strong{{display:block;margin:.15rem 0 0;font-size:1rem}}.policy-outcome p{{margin:.4rem 0 0;color:#dcd7ca;font-size:.72rem;line-height:1.5}}.policy-outcome.strict{{border-left:5px solid #d6a13d}}.policy-outcome.permanent{{border-left:5px solid var(--signal)}}.policy-outcome.standard{{border-left:5px solid var(--safe)}}
 .signal-breakdown{{margin-top:.55rem}}.signal-list{{display:grid;gap:.65rem;margin:0 0 1.35rem;padding:0;list-style:none;counter-reset:evidence-signal}}.signal-item{{counter-increment:evidence-signal;display:grid;grid-template-columns:1.75rem minmax(0,1fr);gap:.65rem;padding:.75rem;background:#f7f2e7;border:1px solid var(--line);border-left:3px solid #b88836}}.signal-index{{display:grid;place-items:center;align-self:start;width:1.75rem;height:1.75rem;background:var(--ink);color:var(--panel);font:700 .64rem/1 var(--font-data)}}.signal-index:before{{content:counter(evidence-signal,decimal-leading-zero)}}.signal-copy{{min-width:0}}.signal-heading{{display:flex;align-items:flex-start;justify-content:space-between;gap:.55rem}}.signal-heading strong{{font-size:.82rem;line-height:1.35}}.signal-score{{flex:0 0 auto;padding:.18rem .38rem;background:#ead9ba;color:#724d0b;font:800 .68rem/1.2 var(--font-data);font-variant-numeric:tabular-nums}}.signal-source{{display:inline-block;margin-top:.35rem;padding:.12rem .3rem;border:1px solid var(--line);background:var(--panel);color:var(--muted);font:700 .64rem/1.3 var(--font-data);text-transform:uppercase;letter-spacing:.08em}}.signal-explanation{{margin:.5rem 0 0;color:#4f5953;font-size:.76rem;line-height:1.5}}.empty-value{{color:var(--muted)}}
 details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:pointer;font-weight:800}}details pre{{font-size:.75rem;color:var(--muted)}}.decision-panel{{position:relative;width:calc(100% - 2.5rem);max-width:1080px;margin:0 auto 4rem;border-top:5px solid var(--ink)}}.decision-panel h2{{font-size:1.7rem;margin-bottom:0}}
 .actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.75rem;margin-top:1.5rem}}.actions form{{display:flex;min-width:0}}button,.button-link{{display:inline-flex;align-items:center;justify-content:center;min-height:3.25rem;padding:.8rem 1rem;border:1px solid var(--ink);background:transparent;color:var(--ink);font:700 .78rem/1.35 var(--font-ui);cursor:pointer;box-shadow:3px 3px 0 var(--ink);transition:transform .12s,box-shadow .12s;white-space:normal;overflow-wrap:anywhere}}button{{width:100%}}button:hover,.button-link:hover{{transform:translate(2px,2px);box-shadow:1px 1px 0 var(--ink)}}button.danger{{background:var(--signal);color:#fff;border-color:#9d3118}}
