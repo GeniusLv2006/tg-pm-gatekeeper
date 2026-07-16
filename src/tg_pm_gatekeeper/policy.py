@@ -37,9 +37,8 @@ class PolicyEngine:
     STRICT_CHALLENGE_THRESHOLD = 30
     PERMANENT_SUPPRESSION_THRESHOLD = 70
 
-    def decide(self, signals: tuple[EvidenceSignal, ...]) -> ScreeningDecision:
-        risk_score = sum(signal.weight for signal in signals)
-        codes = {signal.code for signal in signals}
+    @staticmethod
+    def destructive_gate_basis(codes: set[str]) -> str | None:
         denied_authored_source = bool(
             codes.intersection(
                 {
@@ -59,16 +58,27 @@ class PolicyEngine:
                 {"PROMOTIONAL_LANGUAGE", "QUOTED_PROMOTIONAL_LANGUAGE"}
             )
         )
-        destructive_gate = denied_authored_source or repeated_campaign_gate
+        if denied_authored_source:
+            return "owner_denied_domain"
+        if repeated_campaign_gate:
+            return "corroborated_repeated_campaign"
+        return None
 
-        if risk_score >= self.PERMANENT_SUPPRESSION_THRESHOLD and destructive_gate:
-            basis = (
-                "owner_denied_domain"
-                if denied_authored_source
-                else "corroborated_repeated_campaign"
-            )
+    def decide(self, signals: tuple[EvidenceSignal, ...]) -> ScreeningDecision:
+        risk_score = sum(signal.weight for signal in signals)
+        codes = {signal.code for signal in signals}
+        destructive_basis = self.destructive_gate_basis(codes)
+
+        if (
+            risk_score >= self.PERMANENT_SUPPRESSION_THRESHOLD
+            and destructive_basis is not None
+        ):
             return ScreeningDecision(
-                signals, risk_score, None, "permanent_suppression", basis
+                signals,
+                risk_score,
+                None,
+                "permanent_suppression",
+                destructive_basis,
             )
         if risk_score >= self.STRICT_CHALLENGE_THRESHOLD:
             return ScreeningDecision(
