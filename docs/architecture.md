@@ -10,36 +10,46 @@
 ## Terms
 
 - **Unknown**: no local trust decision exists for the sender.
-- **Provisional**: the sender passed the arithmetic check; HR screening still applies.
+- **Provisional**: the sender passed the arithmetic check; adaptive screening still applies to later
+  risk-bearing messages.
 - **Allowed**: the owner, CLI, or review workflow explicitly trusted the sender.
-- **Quarantined**: Gatekeeper archived and muted the dialog for manual review; automatic
-  whole-dialog deletion has not been scheduled.
+- **Quarantined**: Gatekeeper could not safely complete normal delivery, archive, restore, quota, or
+  warning handling. It is an exception state, not a normal risk tier.
 - **Suppressed**: later messages are discarded and whole-dialog deletion may be scheduled until a
-  temporary suppression expires, or indefinitely after an HR match with `critical` severity. This is
-  not Telegram block.
+  temporary suppression expires, or indefinitely after an `adaptive-v1` destructive evidence gate.
+  This is not Telegram block.
 - **Review item**: one sender-level pending decision with a count and one encrypted Telegram reference,
   not a stored conversation transcript.
 - **Control identity**: a restriction-lifetime encrypted Telegram user ID and access hash used to
   keep a quarantine or suppression visible and reversible after message evidence expires.
-- **HR**: the deterministic Hard Rule identifier family. An HR match has `signal`, `high`, or
-  `critical` severity.
-- **Critical**: the highest HR severity, not a separate rule family. An HR match with `critical`
-  severity can trigger immediate deletion and indefinite suppression in `protect` mode.
+- **Evidence signal**: a code, source, fixed weight, and explanation produced from authored text,
+  buttons, previews, quoted context, behavior, or owner policy.
+- **Risk score**: the sum of evidence-signal weights under a named policy version. It is deterministic,
+  not a model confidence estimate.
+- **Destructive evidence gate**: the additional evidence requirement that must be met before a score
+  can authorize permanent suppression.
 
-### HR severity map
+### adaptive-v1 signal map
 
-| HR identifier | Meaning | Severity |
-| --- | --- | --- |
-| `HR-01_MULTIPLE_LINK_BUTTONS` | Multiple interactive link buttons | `critical` |
-| `HR-02_FORWARDED_LINK_BUTTON` | Forwarded message with an interactive link button | `critical` |
-| `HR-03_PROMOTION_WITH_LINK` | Promotional language combined with a link | `high` |
-| `HR-04_MULTIPLE_LINKS` | Multiple links combined with forwarding or promotion | `high` |
-| `HR-05_LINK_BURST` | Repeated link-bearing messages from the sender | `signal` |
-| `HR-06_DENIED_DOMAIN` | Domain matched by the owner's local denylist | `critical` |
-| `HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION` | Quoted crypto-service promotion pattern | `high` |
+| Evidence | Source | Weight |
+| --- | --- | ---: |
+| Low-information opener | Authored text | 5 |
+| Telegram invitation or one link button | Authored/quoted link or button | 10 |
+| Forwarding or a repeated link-bearing message | Behavior | 10 |
+| Multiple authored or quoted links | Authored or quoted context | 15 |
+| Quoted promotional language | Quoted context | 15 |
+| External landing page plus Telegram invitation | Behavior | 15 |
+| Promotional language | Authored text or preview | 20 |
+| Multiple link buttons or forwarded link button | Button | 25 |
+| Owner-denied domain in quoted context | Quoted context | 30 |
+| Same campaign across different senders within 24 hours | Behavior | 40 |
+| Owner-denied domain in authored text, button, or preview | Owner policy plus non-quoted source | 100 |
 
-Only a `critical` match takes the immediate critical-action path. `high` and `signal` matches retain
-their HR identifiers for review but follow the normal challenge path.
+Scores below 30 use `standard_challenge`; scores from 30 upward use `strict_challenge`. A score of 70
+or more uses `permanent_suppression` only when a non-quoted owner-denied domain is present, or when a
+cross-sender repeated campaign is also forwarded, promotional, and contains multiple links. Weak
+signals cannot accumulate past this destructive boundary, and a quoted denylist match alone cannot
+delete a dialog. Weights and thresholds are fixed in code under `adaptive-v1`.
 
 ## Sender states
 
@@ -48,40 +58,40 @@ unknown -> challenge_issuing -> challenge_archiving -> challenged
                                                      -> provisional -> allowed
                                                      -> suppressed (timeout or failed attempts)
 
-unknown -> suppressed (HR match with critical severity)
-provisional -> suppressed (HR match with critical severity)
-unknown -> quarantined (challenge outbound limit or manual spam review)
-challenged -> quarantined (manual spam review or warning failure)
+unknown/provisional -> suppressed (adaptive-v1 destructive evidence gate)
+unknown/provisional/challenged -> quarantined (delivery, archive, restore, warning, or quota exception)
+unknown/provisional/challenged/quarantined -> suppressed (explicit manual spam decision)
 unknown/provisional/challenged/quarantined/suppressed -> allowed (legitimate review)
 allowed -> unknown (manual revoke)
 ```
 
 The issuing and archiving states are internal recovery phases. A sender becomes `challenged` only
 after the prompt is sent and the dialog is confirmed archived and muted. `provisional` means the
-sender passed the interaction check and can message normally while HR screening remains active. Only a
-later manual reply from the account owner, an explicit review, or a safe operator allow action grants
-`allowed`. The CLI refuses challenge and quarantine states because it cannot restore Telegram state.
+sender passed the interaction check and can message normally while adaptive screening remains active.
+Only a later manual reply from the account owner, an explicit review, or a safe operator allow action
+grants `allowed`. The CLI refuses challenge and quarantine states because it cannot restore Telegram
+state.
 
 ## Decision pipeline
 
 1. Accept only incoming private-message events.
 2. Exclude contacts, local allowlist entries, service accounts, bots, and peers with a trusted prior conversation.
-3. Apply the deterministic HR family. Matches with `critical` severity are denylisted domains,
-   multiple interactive link buttons, and forwarded interactive link buttons. Matches with `high`
-   severity enter the challenge flow; a repeated-link burst has only `signal` severity. Authored text,
-   Telegram-supplied webpage preview
-   metadata, and links are kept separate from quoted text and links so quoted content cannot trigger
-   generic promotion or link-count rules. The dedicated quoted crypto-service rule still inspects
-   quote text in memory.
-4. In monitor mode, record the simulated result for operator review and take no Telegram action,
+3. Extract structured evidence signals and sum their fixed `adaptive-v1` weights. Authored text,
+   Telegram-supplied webpage previews, buttons, quoted context, behavior, and owner policy remain
+   separate sources in the decision record.
+4. For promotional payloads containing URLs, create a keyed HMAC campaign fingerprint. Prefer the
+   quoted promotional payload, exclude an outer low-information opener, normalize text and sorted URL
+   keys in memory, and count different derived sender keys seen during the last 24 hours. Store no
+   campaign plaintext, raw URL, or reversible digest. The dedicated test sender never participates.
+5. In monitor mode, record the simulated result for operator review and take no Telegram action,
    except for the explicitly configured dedicated test sender.
-5. In protect mode, persist and silently delete dialogs after an HR match with `critical` severity;
-   send one expiring challenge to ordinary and high-risk unknown senders and bind it to the outgoing
-   Telegram message ID.
-6. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
+6. In protect mode, permanently suppress only after the score and destructive gate both pass. Use a
+   strict one-attempt challenge at score 30 or above; otherwise use the configured standard challenge.
+7. Accept only a direct Reply to that message. Restore a correct sender as `provisional` and remove
    the verification exchange. After two incorrect numeric answers, warn that deletion is pending,
    wait 10 seconds, then delete the entire private conversation and suppress the sender for 24
-   hours. A timeout follows the same warned deletion flow with a two-hour suppression.
+   hours. A standard timeout follows the same warned deletion flow with a two-hour suppression. A
+   strict timeout or first wrong numeric answer uses a 24-hour suppression.
 
 In protect mode the challenge is written in English and defaults to 60 seconds. Its title is
 `⚠️ Verification Required`; Telegram-native bold entities emphasize the title, deadline, expression,
@@ -90,8 +100,9 @@ window starts only after Telegram confirms prompt delivery. The dialog is archiv
 the challenge becomes active. Replies to another message, standalone answers, and non-numeric replies
 do not consume an attempt or extend the deadline. At most one corrective hint is sent per challenge.
 Numeric input is NFKC-normalized before comparison. A correct answer restores the dialog and its
-previous archive, silent, and mute settings while keeping HR screening active. The success notice
-remains visible for 10 seconds, then one Telegram request deletes the complete explicitly indexed
+previous archive, silent, and mute settings while keeping adaptive screening active. A later
+risk-bearing provisional message can trigger another challenge or permanent suppression. The success
+notice remains visible for 10 seconds, then one Telegram request deletes the complete explicitly indexed
 challenge flow, including earlier incorrect answers, corrective notices, the correct answer, and the
 success notice.
 Restoration is retried three times; persistent failure creates an exception review instead of
@@ -104,7 +115,7 @@ Each challenge independently selects addition, non-negative subtraction, or basi
 operands are bounded so answers remain suitable for quick mental arithmetic.
 
 An optional single-account test path is enabled only when `TG_TEST_SENDER_ID` is configured. It
-bypasses contact, prior-history, HR, monitor-mode, and outbound-quota shortcuts so
+bypasses contact, prior-history, adaptive detection, monitor-mode, and outbound-quota shortcuts so
 repeated tests exercise the actual arithmetic flow. Successful and terminal-failure states are
 conditionally reset to `unknown` after 60 seconds; the conditional update prevents an older timer
 from resetting a newer challenge. Exhausted attempts use the normal warning plus delayed
@@ -112,14 +123,15 @@ whole-dialog deletion policy. A timeout sends a failure notice, then deletes onl
 recorded during that challenge after 10 seconds. Delayed test-account cleanup and state reset are
 reconstructed after restart.
 
-Monitor mode records HMAC-keyed rule outcomes and creates a pending review item for each sender
-with a simulated challenge or quarantine. Further messages from that sender update the same item and
+Monitor mode records HMAC-keyed decisions and creates a pending review item for each sender with a
+simulated standard challenge, strict challenge, or permanent suppression. Further messages from that
+sender update the same item and
 increment its message counter. The retained reference normally follows the newest message. If a row
 already represents a simulated quarantine, a later lower-risk message increments the counter without
-replacing that higher-severity classification or its referenced message. Monitor mode sends no
+replacing the higher-impact classification or its referenced message. Monitor mode sends no
 challenges and changes no Telegram dialog unless `TG_TEST_SENDER_ID` explicitly selects that sender.
-Protection must be enabled with `mode protect`; `mode monitor` cancels pending non-test destructive
-jobs.
+Protection must be enabled with `mode protect`; `mode monitor` cancels automatically generated
+destructive jobs but not explicit manual spam decisions or dedicated-test cleanup.
 
 ## Post-event review
 
@@ -128,7 +140,7 @@ published by Docker and is intended to be reached only through SSH local forward
 live Telethon client as the only Telegram connection and avoids exposing an administrative TCP
 service.
 
-The queue stores one pending row per sender: the simulated decision, rule identifiers, non-content
+The queue stores one pending row per sender: the simulated decision, evidence signals, non-content
 structural features, a consolidated message count, and one authenticated encrypted reference
 containing peer access data and a message ID. It is not a conversation archive. When an operator
 opens an item, the running client decrypts that single reference and fetches the referenced message
@@ -159,8 +171,9 @@ remain behind the same owner-only Unix socket, SSH tunnel, and capability path.
 
 An operator can mark an item as legitimate, confirmed spam, or dismissed. Legitimate senders enter
 the local allowlist and are restored first when Gatekeeper previously archived the dialog. Confirmed
-spam is archived and muted unless the sender is already quarantined. Dismiss performs no new action
-through Telegram and therefore leaves a rate-limit fallback quarantine in place, but it cancels any
+spam becomes a manual permanent suppression with a persistent, mode-independent deletion job. Dismiss
+performs no new action through Telegram and therefore leaves a rate-limit fallback quarantine in
+place, but it cancels any
 pending or failed Gatekeeper deletion jobs for that sender. A decision immediately removes the
 encrypted reference. Pending references, including reviews created while changing mode or recording
 an action failure, consistently use the configured one-to-seven-day retention. Non-reversible
@@ -173,8 +186,8 @@ without changing sender state.
 Protect-mode terminal states have a separate **Active Cases** surface. It lists every current
 quarantine and suppression, independent of evidence availability. The service captures the
 original triggering text/caption, Telegram-provided quote and preview, text-link entities, visible
-URL entities, button text, full URLs,
-normalized domains, URL shape, matched HR identifiers, and severity before a challenge begins,
+URL entities, button text, full URLs, normalized domains, URL shape, evidence-signal breakdown, risk
+score, challenge profile, planned action, decision basis, and policy version before a challenge begins,
 encrypts it with the active-case review key, and exposes it only after the sender becomes quarantined
 or suppressed. A correct answer, challenge rollback, or manual allowance erases the evidence.
 Temporary suppression expiry is reconciled only when that sender next messages; otherwise the
@@ -184,9 +197,9 @@ retention, capped at 30 days.
 Each active restriction separately retains an authenticated encrypted control identity containing
 only Telegram user ID and access hash. It contains no message ID or evidence and remains until the
 restriction is allowed, revoked, or automatically released. Active Cases uses it to resolve the live
-identity and restore saved Telegram folder and notification settings even after evidence expires. An
-HR case with no dialog snapshot is moved to the main folder and notifications are enabled instead;
-failure leaves policy state unchanged. Leaving the restriction unchanged records an operator
+identity and restore saved Telegram folder and notification settings even after evidence expires. A
+permanently suppressed case with no dialog snapshot is moved to the main folder and notifications
+are enabled instead; failure leaves policy state unchanged. Leaving the restriction unchanged records an operator
 decision but does not extend a temporary suppression. A manual numeric-ID recovery form is retained
 only for legacy states without a control identity; the ID is HMAC-derived in memory and not stored.
 
@@ -215,31 +228,37 @@ require manual deletion.
 | Input | Monitor mode | Protect mode |
 | --- | --- | --- |
 | Trusted sender | Allow | Allow |
-| Ordinary unknown sender | Queue simulated challenge | Temporary archive/mute and challenge |
-| Provisional sender | Continue HR screening | Continue HR screening |
-| HR match with `critical` severity | Queue planned deletion | Persist, delete, and suppress |
-| HR match with `high` severity | Queue simulated challenge | Challenge |
-| HR match with `signal` severity | Queue simulated challenge | Challenge |
+| Score below 30 | Queue simulated standard challenge | Standard challenge |
+| Score at least 30 without destructive gate | Queue simulated strict challenge | Strict one-attempt challenge |
+| Score at least 70 with destructive gate | Queue planned permanent suppression | Persist, delete, and suppress indefinitely |
+| Provisional sender without new evidence | Retain provisional state | Retain provisional state |
+| Provisional sender with new evidence | Reapply adaptive policy | Reapply adaptive policy |
 | Challenge send limit reached | Not applicable | Archive, mute, and queue review |
 | Manual legitimate review | Allow sender | Allow sender |
-| Manual spam review | Archive, mute, and quarantine | Archive, mute, and quarantine |
+| Manual spam review | Explicit permanent suppression and deletion | Explicit permanent suppression and deletion |
 | Dedicated test sender | Run the real challenge flow | Run the real challenge flow |
 
-Whole-dialog deletion is used for HR matches with `critical` severity and warned challenge failure.
+Whole-dialog deletion is used for permanent suppression and warned challenge failure.
 Pending deletions persist across restart and execute only when mode, sender status, and state revision still
-match. Dedicated-test-sender deletions are intentionally mode-independent; other destructive jobs are
-cancelled by `mode monitor`. Blocking, reporting, model inference, and unrelated conversation cleanup
-are not implemented.
+match. Dedicated-test-sender deletions and explicit manual spam decisions are intentionally
+mode-independent; automatic policy jobs are cancelled by `mode monitor`. Blocking, reporting, model
+inference, and unrelated conversation cleanup are not implemented.
 
 ## Data boundaries
 
 The persistent store contains sender state, challenge metadata, generated challenge prompts while
-delivery is incomplete, rule identifiers, timestamps, action outcomes, structural review features,
+delivery is incomplete, evidence-signal metadata, timestamps, action outcomes, structural review
+features,
 automated outgoing message IDs, encrypted short-lived Telegram references, the prior archive and
 notification settings needed to reverse a Gatekeeper action, encrypted restriction-lifetime control
 identities, pending action jobs, suppression state, privacy-safe detector decisions, and encrypted
 Active Case envelopes. The state database does not store message bodies, quoted text, raw
 identities, or profile data in plaintext.
+
+The `campaign_events` table contains only a keyed HMAC fingerprint, an already-derived sender key,
+and an observation time. A candidate is created only for promotional content that also contains a
+URL. Matching rows are pruned after 24 hours and count distinct senders through a composite primary
+key. The canonical text and URL keys exist only in memory before HMAC derivation.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 
@@ -273,9 +292,14 @@ authorization key without persisting Telethon's entity cache of names, usernames
 Active Case snapshots use AES-256-GCM with a key derived through HKDF from the dedicated owner-only
 `review.key` secret. The runtime reads it through `TG_REVIEW_KEY_FILE`. A snapshot includes the
 original trigger, quoted context, Telegram preview text, button text, full URLs, normalized domains,
-URL shape, matched HR identifiers, severity, and structural features, but never verification
-answers, webpage bodies, or media. Snapshots expire after no more than 30 days and are removed sooner
-after successful verification, rollback, or manual allowance.
+URL shape, evidence signals, risk score, challenge profile, decision basis, policy version, and
+structural features, but never verification answers, webpage bodies, or media. Snapshots expire after
+no more than 30 days and are removed sooner after successful verification, rollback, or manual
+allowance.
+
+Schema 1 through 4 Active Case snapshots remain read-only compatible. The dashboard labels them
+`Legacy HR Decision · recorded under rules-v2; not recalculated`; migration does not recalculate
+their scores, replace their evidence, or schedule any new action.
 
 ## Failure behavior
 

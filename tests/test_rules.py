@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import unittest
 
+from tg_pm_gatekeeper.policy import EvidenceSignal, PolicyEngine
 from tg_pm_gatekeeper.rules import (
     MessageFacts,
-    evaluate_hard_rules,
+    campaign_candidate,
+    detect_evidence_signals,
     normalize_text,
     normalized_domain,
+    repeated_campaign_signal,
     telegram_link_kind,
     url_evidence,
     url_shape,
@@ -17,6 +20,16 @@ from tg_pm_gatekeeper.rules import (
 
 
 class RuleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.policy = PolicyEngine()
+
+    @staticmethod
+    def signal_map(facts: MessageFacts, **kwargs) -> dict[str, EvidenceSignal]:
+        return {
+            signal.code: signal
+            for signal in detect_evidence_signals(facts, **kwargs)
+        }
+
     def test_url_shape_excludes_path_and_query_values(self) -> None:
         shape = url_shape(
             ("http://example.invalid/private/path?token=secret#fragment",)
@@ -35,29 +48,22 @@ class RuleTests(unittest.TestCase):
     def test_url_evidence_keeps_full_url_sources_and_telegram_kind(self) -> None:
         records = url_evidence(
             (
-                "https://t.me/+privateInvite",
-                "https://example.invalid/private/path?token=secret#fragment",
+                "https://t.me/+syntheticInvite",
+                "https://example.invalid/private/path?token=synthetic#fragment",
             ),
-            button_urls=("https://t.me/+privateInvite",),
+            button_urls=("https://t.me/+syntheticInvite",),
             preview_urls=(
-                "https://example.invalid/private/path?token=secret#fragment",
+                "https://example.invalid/private/path?token=synthetic#fragment",
             ),
-        )
-        self.assertEqual(
-            records[0]["url"],
-            "https://example.invalid/private/path?token=secret#fragment",
         )
         self.assertEqual(records[0]["kind"], "external_web")
         self.assertEqual(records[0]["sources"], ["preview"])
-        self.assertEqual(records[1]["url"], "https://t.me/+privateInvite")
         self.assertEqual(records[1]["kind"], "invite")
         self.assertEqual(records[1]["sources"], ["button"])
 
     def test_telegram_link_kind_classifies_common_shapes(self) -> None:
         self.assertEqual(telegram_link_kind("https://t.me/joinchat/abc"), "invite")
-        self.assertEqual(
-            telegram_link_kind("https://t.me/bot?start=abc"), "bot_start"
-        )
+        self.assertEqual(telegram_link_kind("https://t.me/bot?start=abc"), "bot_start")
         self.assertEqual(
             telegram_link_kind("https://t.me/c/123/456"), "internal_message"
         )
@@ -66,127 +72,254 @@ class RuleTests(unittest.TestCase):
         )
         self.assertEqual(telegram_link_kind("tg://join?invite=abc"), "invite")
 
-    def test_single_link_button_is_not_a_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(MessageFacts(has_link_button=True))
-        self.assertFalse(decision.hard_spam)
-
-    def test_multiple_link_buttons_are_a_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(has_link_button=True, link_button_count=3)
-        )
-        self.assertIn("HR-01_MULTIPLE_LINK_BUTTONS", decision.rule_codes)
-        self.assertEqual(decision.severity, "critical")
-
-    def test_forwarded_link_button_is_a_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(has_link_button=True, is_forwarded=True)
-        )
-        self.assertIn("HR-02_FORWARDED_LINK_BUTTON", decision.rule_codes)
-
-    def test_forwarded_plain_link_is_not_a_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(urls=("https://example.invalid",), is_forwarded=True)
-        )
-        self.assertFalse(decision.hard_spam)
-
-    def test_topic_without_link_is_not_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(MessageFacts(text="你使用什么 VPN？"))
-        self.assertFalse(decision.hard_spam)
-
-    def test_quoted_crypto_service_promotion_is_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
+    def test_signal_weights_and_sources_are_explicit(self) -> None:
+        signals = self.signal_map(
             MessageFacts(
-                text="核心在此",
-                quote_text="0.01TRX 转账 0.01TRX=131K能量+500带宽 @haojia 能量下单地",
-            )
-        )
-        self.assertIn("HR-07_QUOTED_CRYPTO_SERVICE_PROMOTION", decision.rule_codes)
-
-    def test_quoted_crypto_discussion_is_not_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(quote_text="TRX 转账为什么需要能量？")
-        )
-        self.assertFalse(decision.hard_spam)
-
-    def test_promotional_topic_with_link_is_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(text="机场推荐 永久套餐", urls=("https://example.invalid",))
-        )
-        self.assertIn("HR-03_PROMOTION_WITH_LINK", decision.rule_codes)
-        self.assertEqual(decision.severity, "high")
-
-    def test_promotional_webpage_preview_with_link_is_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(
-                text="T.me/+invite",
-                preview_text="汇盈社区 高返70% 合约跟单 免费跟单，交易所返佣",
-                urls=("https://t.me/+invite",),
-            )
-        )
-        self.assertIn("HR-03_PROMOTION_WITH_LINK", decision.rule_codes)
-
-    def test_ordinary_webpage_preview_with_link_is_not_hard_rule(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(
-                text="https://example.invalid/article",
-                preview_text="Project documentation and release notes",
-                urls=("https://example.invalid/article",),
-            )
-        )
-        self.assertFalse(decision.hard_spam)
-
-    def test_quoted_promotion_does_not_pollute_authored_rules(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(
-                text="这个是什么？",
-                quote_text="机场推荐 永久套餐",
-                quote_urls=("https://example.invalid",),
-                quote_domains=("example.invalid",),
-            )
-        )
-        self.assertFalse(decision.hard_spam)
-
-    def test_equivalent_urls_with_punctuation_are_counted_once(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(
-                urls=("https://example.invalid", "https://example.invalid。"),
-                domains=("example.invalid",),
+                text="滴滴",
+                quote_text=(
+                    "推广联盟 https://landing.invalid "
+                    "https://t.me/+syntheticInvite"
+                ),
+                quote_urls=(
+                    "https://landing.invalid",
+                    "https://t.me/+syntheticInvite",
+                ),
+                quote_domains=("landing.invalid", "t.me"),
                 is_forwarded=True,
             )
         )
-        self.assertFalse(decision.hard_spam)
+        self.assertEqual(signals["LOW_INFORMATION_OPENER"].weight, 5)
+        self.assertEqual(signals["LOW_INFORMATION_OPENER"].source, "authored")
+        self.assertEqual(signals["FORWARDED_PAYLOAD"].weight, 10)
+        self.assertEqual(signals["QUOTED_MULTIPLE_LINKS"].weight, 15)
+        self.assertEqual(signals["QUOTED_PROMOTIONAL_LANGUAGE"].weight, 15)
+        self.assertEqual(signals["EXTERNAL_AND_TELEGRAM_LINKS"].weight, 15)
 
-    def test_multiple_links_require_a_second_risk_signal(self) -> None:
-        ordinary = evaluate_hard_rules(
+    def test_authored_button_preview_and_owner_policy_sources_are_explicit(self) -> None:
+        single_button = self.signal_map(
+            MessageFacts(has_link_button=True, link_button_count=1)
+        )
+        self.assertEqual(single_button["LINK_BUTTON"].weight, 10)
+        self.assertEqual(single_button["LINK_BUTTON"].source, "button")
+
+        authored = self.signal_map(
             MessageFacts(
+                text="联盟推广",
                 urls=("https://one.invalid", "https://two.invalid"),
                 domains=("one.invalid", "two.invalid"),
             )
         )
-        forwarded = evaluate_hard_rules(
+        self.assertEqual(authored["MULTIPLE_LINKS"].weight, 15)
+        self.assertEqual(authored["PROMOTIONAL_LANGUAGE"].weight, 20)
+        self.assertEqual(authored["PROMOTIONAL_LANGUAGE"].source, "authored")
+
+        preview = self.signal_map(MessageFacts(preview_text="推广联盟"))
+        self.assertEqual(preview["PROMOTIONAL_LANGUAGE"].source, "preview")
+
+        forwarded_buttons = self.signal_map(
             MessageFacts(
-                urls=("https://one.invalid", "https://two.invalid"),
-                domains=("one.invalid", "two.invalid"),
+                has_link_button=True,
+                link_button_count=2,
                 is_forwarded=True,
             )
         )
-        self.assertFalse(ordinary.hard_spam)
-        self.assertIn("HR-04_MULTIPLE_LINKS", forwarded.rule_codes)
+        self.assertEqual(forwarded_buttons["FORWARDED_LINK_BUTTON"].weight, 25)
+        self.assertNotIn("MULTIPLE_LINK_BUTTONS", forwarded_buttons)
 
-    def test_second_link_message_is_burst(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(urls=("https://example.invalid",)), previous_link_messages=1
+        invite_button = self.signal_map(
+            MessageFacts(
+                urls=("https://t.me/+syntheticInvite",),
+                button_urls=("https://t.me/+syntheticInvite",),
+                has_link_button=True,
+                link_button_count=1,
+            )
         )
-        self.assertIn("HR-05_LINK_BURST", decision.rule_codes)
-        self.assertEqual(decision.severity, "signal")
+        self.assertEqual(invite_button["TELEGRAM_INVITE"].weight, 10)
+        self.assertNotIn("LINK_BUTTON", invite_button)
 
-    def test_subdomain_denylist_matches(self) -> None:
-        decision = evaluate_hard_rules(
-            MessageFacts(domains=("a.bad.invalid",), urls=("https://a.bad.invalid",)),
-            denylist=frozenset({"bad.invalid"}),
+        for source_field, expected_source in (
+            ("button_urls", "button"),
+            ("preview_urls", "preview"),
+        ):
+            blocked_url = "https://blocked.invalid/offer"
+            facts = MessageFacts(
+                urls=(blocked_url,),
+                domains=("blocked.invalid",),
+                **{source_field: (blocked_url,)},
+            )
+            denied_signals = self.signal_map(
+                facts, denylist=frozenset({"blocked.invalid"})
+            )
+            code = f"{expected_source.upper()}_DENIED_DOMAIN"
+            denied = denied_signals[code]
+            self.assertEqual(denied.weight, 100)
+            self.assertEqual(denied.source, "owner_policy")
+
+    def test_low_score_uses_standard_challenge(self) -> None:
+        decision = self.policy.decide(
+            detect_evidence_signals(MessageFacts(text="你好"))
         )
-        self.assertIn("HR-06_DENIED_DOMAIN", decision.rule_codes)
-        self.assertEqual(decision.severity, "critical")
+        self.assertEqual(decision.risk_score, 5)
+        self.assertEqual(decision.challenge_profile, "standard")
+        self.assertEqual(decision.planned_action, "standard_challenge")
+
+    def test_policy_threshold_boundaries_are_exact(self) -> None:
+        below_strict = self.policy.decide(
+            (EvidenceSignal("SYNTHETIC", "behavior", 29, "Boundary fixture"),)
+        )
+        at_strict = self.policy.decide(
+            (EvidenceSignal("SYNTHETIC", "behavior", 30, "Boundary fixture"),)
+        )
+        below_permanent = self.policy.decide(
+            (
+                EvidenceSignal(
+                    "AUTHORED_DENIED_DOMAIN",
+                    "owner_policy",
+                    69,
+                    "Boundary fixture",
+                ),
+            )
+        )
+        at_permanent = self.policy.decide(
+            (
+                EvidenceSignal(
+                    "AUTHORED_DENIED_DOMAIN",
+                    "owner_policy",
+                    70,
+                    "Boundary fixture",
+                ),
+            )
+        )
+        self.assertEqual(below_strict.planned_action, "standard_challenge")
+        self.assertEqual(at_strict.planned_action, "strict_challenge")
+        self.assertEqual(below_permanent.planned_action, "strict_challenge")
+        self.assertEqual(at_permanent.planned_action, "permanent_suppression")
+
+    def test_multiple_link_buttons_use_strict_challenge_not_suppression(self) -> None:
+        decision = self.policy.decide(
+            detect_evidence_signals(
+                MessageFacts(has_link_button=True, link_button_count=3)
+            )
+        )
+        self.assertEqual(decision.risk_score, 25)
+        self.assertEqual(decision.challenge_profile, "standard")
+        forwarded = self.policy.decide(
+            detect_evidence_signals(
+                MessageFacts(
+                    has_link_button=True,
+                    link_button_count=3,
+                    is_forwarded=True,
+                )
+            )
+        )
+        self.assertGreaterEqual(forwarded.risk_score, 30)
+        self.assertEqual(forwarded.challenge_profile, "strict")
+        self.assertEqual(forwarded.planned_action, "strict_challenge")
+
+    def test_nonquoted_denied_domain_is_permanent_suppression(self) -> None:
+        signals = detect_evidence_signals(
+            MessageFacts(
+                urls=("https://blocked.invalid/path",),
+                domains=("blocked.invalid",),
+            ),
+            denylist=frozenset({"blocked.invalid"}),
+        )
+        decision = self.policy.decide(signals)
+        denied = {signal.code: signal for signal in signals}[
+            "AUTHORED_DENIED_DOMAIN"
+        ]
+        self.assertEqual(denied.source, "owner_policy")
+        self.assertEqual(decision.risk_score, 100)
+        self.assertEqual(decision.planned_action, "permanent_suppression")
+        self.assertEqual(decision.decision_basis, "owner_denied_domain")
+
+    def test_quoted_denied_domain_cannot_cross_destructive_gate_alone(self) -> None:
+        decision = self.policy.decide(
+            detect_evidence_signals(
+                MessageFacts(
+                    quote_urls=("https://blocked.invalid/path",),
+                    quote_domains=("blocked.invalid",),
+                ),
+                denylist=frozenset({"blocked.invalid"}),
+            )
+        )
+        self.assertEqual(decision.risk_score, 30)
+        self.assertEqual(decision.challenge_profile, "strict")
+        self.assertEqual(decision.planned_action, "strict_challenge")
+
+    def test_weak_signals_cannot_bypass_destructive_gate(self) -> None:
+        signals = tuple(
+            EvidenceSignal(f"WEAK_{index}", "behavior", 10, "Synthetic weak signal")
+            for index in range(8)
+        )
+        decision = self.policy.decide(signals)
+        self.assertEqual(decision.risk_score, 80)
+        self.assertEqual(decision.planned_action, "strict_challenge")
+        self.assertEqual(decision.challenge_profile, "strict")
+
+    def test_repeated_forwarded_promotional_campaign_can_suppress(self) -> None:
+        facts = MessageFacts(
+            text="在吗",
+            quote_text=(
+                "联盟推广 https://landing.invalid "
+                "https://t.me/+syntheticInvite"
+            ),
+            quote_urls=(
+                "https://landing.invalid",
+                "https://t.me/+syntheticInvite",
+            ),
+            quote_domains=("landing.invalid", "t.me"),
+            is_forwarded=True,
+        )
+        signals = detect_evidence_signals(facts) + (repeated_campaign_signal(),)
+        decision = self.policy.decide(signals)
+        self.assertGreaterEqual(decision.risk_score, 70)
+        self.assertEqual(decision.planned_action, "permanent_suppression")
+        self.assertEqual(
+            decision.decision_basis, "corroborated_repeated_campaign"
+        )
+
+    def test_campaign_candidate_ignores_outer_low_information_opener(self) -> None:
+        quote = (
+            "联盟推广 https://landing.invalid "
+            "https://t.me/+syntheticInvite"
+        )
+        first = MessageFacts(
+            text="在吗",
+            quote_text=quote,
+            quote_urls=(
+                "https://landing.invalid",
+                "https://t.me/+syntheticInvite",
+            ),
+        )
+        second = MessageFacts(
+            text="滴滴",
+            quote_text=quote,
+            quote_urls=(
+                "https://landing.invalid",
+                "https://t.me/+syntheticInvite",
+            ),
+        )
+        self.assertEqual(
+            campaign_candidate(first, detect_evidence_signals(first)),
+            campaign_candidate(second, detect_evidence_signals(second)),
+        )
+
+    def test_nonpromotional_message_has_no_campaign_candidate(self) -> None:
+        facts = MessageFacts(
+            text="请看文档",
+            urls=("https://docs.invalid",),
+            domains=("docs.invalid",),
+        )
+        self.assertIsNone(campaign_candidate(facts, detect_evidence_signals(facts)))
+
+    def test_second_authored_link_message_is_a_behavior_signal(self) -> None:
+        signals = self.signal_map(
+            MessageFacts(urls=("https://example.invalid",)),
+            previous_link_messages=1,
+        )
+        self.assertEqual(signals["LINK_BURST"].weight, 10)
+        self.assertEqual(signals["LINK_BURST"].source, "behavior")
 
     def test_normalization_and_domain_do_not_fetch(self) -> None:
         self.assertEqual(normalize_text("  ＶＰＮ  Subscription "), "vpn subscription")

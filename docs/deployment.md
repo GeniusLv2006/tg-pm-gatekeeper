@@ -173,7 +173,8 @@ Return to the safe observation mode at any time:
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor'
 ```
 
-Returning to `monitor` keeps message processing active but cancels non-test pending destructive jobs.
+Returning to `monitor` keeps message processing active but cancels automatically generated pending
+destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent.
 
 ## Dashboard and daily operation
 
@@ -245,7 +246,7 @@ reference, not a stored conversation history. Opening it fetches one referenced 
 sender from Telegram.
 
 - **Legitimate** restores a Gatekeeper-managed archive when needed and allows the sender.
-- **Spam** archives and mutes the dialog, then quarantines the sender.
+- **Spam** records an explicit manual permanent suppression and schedules whole-dialog deletion.
 - **Dismiss and Cancel Pending Jobs** records no classification, performs no immediate Telegram
   action, and cancels pending or failed Gatekeeper deletion jobs for that sender.
 
@@ -260,8 +261,10 @@ expires. **Allow Now** restores saved dialog settings when available; cases with
 are moved to the main folder and notifications are enabled. The second action records that the
 restriction was left unchanged and does not extend a temporary suppression.
 
-The detail page separates **Restriction Cause**, **Severity**, and **Matched HR Rules**. HR identifies
-the deterministic rule family; `critical` is one severity within that family, not another rule name.
+New `adaptive-v1` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and
+**Evidence Signals**, including each signal's source, weight, and explanation. Schema 1 through 4
+snapshots show `Legacy HR Decision · recorded under rules-v2; not recalculated`; the migration does
+not reclassify them or add an action.
 
 Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance
 removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but
@@ -382,15 +385,17 @@ docker compose logs --tail=100 gatekeeper
 '
 ```
 
-For this migration, the first command must print `5`.
+For this migration, the first command must print `6`.
 
-Schema 5 replaces the schema 4 `outbound_events` rows with categorized events. Existing rows become
-`legacy`, retain no sender identity, and continue to count toward the hard total until their one-hour
-window expires. New rows contain only the existing HMAC-derived sender key, never a raw Telegram ID.
+Schema 6 adds the recoverable challenge profile and backfills every active pre-migration challenge as
+`standard`. It renames pending-review rule identifiers to evidence signals, updates decision-event
+columns without rewriting their contents, and creates the 24-hour keyed-HMAC campaign-event table.
+Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not
+recalculated and do not schedule a new action.
 
-Schema 5 is not writable by pre-schema-5 code. A code rollback to an earlier commit therefore also
+Schema 6 is not writable by pre-schema-6 code. A code rollback to an earlier commit therefore also
 requires the pre-migration database. Record the earlier commit before updating. If startup or live
-validation fails, keep the schema 5 database for diagnosis and restore both code and data together:
+validation fails, keep the schema 6 database for diagnosis and restore both code and data together:
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -399,11 +404,11 @@ cd /opt/tg-pm-gatekeeper
 previous_commit=REPLACE_WITH_RECORDED_COMMIT
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 docker compose down
-mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v5.$stamp.sqlite3"
+mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v6.$stamp.sqlite3"
 for suffix in -wal -shm; do
     path="/var/lib/tg-pm-gatekeeper/state.sqlite3$suffix"
     if [ -e "$path" ]; then
-        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v5.$stamp.sqlite3$suffix"
+        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v6.$stamp.sqlite3$suffix"
     fi
 done
 cp --preserve=mode,ownership,timestamps /var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3 /var/lib/tg-pm-gatekeeper/state.sqlite3
@@ -415,7 +420,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 ```
 
-Do not substitute the schema 5 database into an older image or delete the failed database before
+Do not substitute the schema 6 database into an older image or delete the failed database before
 diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt;
 do not merge the incompatible database files.
 
@@ -446,7 +451,9 @@ The total limit is always the hard upper bound. New challenges stop at
 `limit - notice reserve`; verification hints, corrections, timeout warnings, and result notices can
 use the remaining capacity but cannot exceed either the total limit or the per-sender notice limit.
 The `status` command reports `outbound_total_1h`, `outbound_challenge_1h`,
-`outbound_notice_1h`, and `outbound_quota_rejected_1h` without raw sender identifiers.
+`outbound_notice_1h`, and `outbound_quota_rejected_1h` without raw sender identifiers. It also reports
+the last seven days through `standard_challenge_7d`, `strict_challenge_7d`,
+`permanent_suppression_7d`, and `repeated_campaign_7d` without content or fingerprints.
 
 ### Dedicated test sender
 
@@ -457,7 +464,8 @@ TG_TEST_SENDER_ID=REPLACE_WITH_DEDICATED_TEST_ACCOUNT_ID
 ```
 
 This account runs the real arithmetic and cleanup flow even in `monitor`, bypasses the outbound
-quota, and can lose its entire test dialog after exhausted attempts. Remove the value after testing.
+quota, never contributes a campaign fingerprint, and can lose its entire test dialog after exhausted
+attempts. Remove the value after testing.
 
 ## Troubleshooting
 

@@ -354,6 +354,7 @@ class TelegramAdapter:
             self.client,
             mute_days=settings.mute_days,
             cancel_timeout=self.cancel_timeout,
+            schedule_dialog_deletion=self.schedule_dialog_deletion,
             restriction_actions=self._restriction_actions,
         )
 

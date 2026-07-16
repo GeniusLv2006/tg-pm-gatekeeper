@@ -66,6 +66,9 @@ flow, see [Architecture](docs/architecture.md).
   separate encrypted control identity containing only Telegram user ID and access hash for each
   active quarantine or suppression.
 - Raw user IDs, usernames, profile names, and message content are not stored in plaintext.
+- Cross-sender campaign detection stores only a keyed HMAC fingerprint, an already-derived sender
+  key, and a timestamp for at most 24 hours. Canonical text, raw URLs, and reversible hashes must not
+  be persisted or logged, and the dedicated test sender must not contribute an event.
 - The control identity uses keys domain-separated from message-review references. It remains only
   while the restriction remains active and is erased on allowance, revocation, or temporary
   suppression release. Evidence expiry does not erase this operator control path.
@@ -77,7 +80,8 @@ flow, see [Architecture](docs/architecture.md).
 
 - Active quarantines and suppressions may retain an AES-256-GCM encrypted snapshot for at most 30
   days. It can include text/caption, Telegram-provided quoted and preview text, button text, full URLs,
-  normalized domains, URL shape, matched rules, and structural features.
+  normalized domains, URL shape, evidence signals, risk score, challenge profile, decision basis,
+  policy version, and structural features.
 - The dedicated `review.key` secret derives the Active Case encryption key through HKDF. It is
   separate from the Telegram session and state HMAC key.
 - Webpage bodies, media, profile data, raw IDs, access hashes, and verification answers are not
@@ -95,13 +99,19 @@ flow, see [Architecture](docs/architecture.md).
 
 - Arithmetic verification adds interaction friction; it is not a CAPTCHA or proof that a sender is
   human.
+- A score alone must never authorize permanent suppression. The action additionally requires either
+  a non-quoted owner-denied domain or a repeated cross-sender campaign corroborated by forwarding,
+  promotional language, and multiple links. A quoted denylist match alone is non-destructive.
+- `adaptive-v1` weights, thresholds, and destructive gates are code-versioned and must not be
+  silently overridden through deployment environment variables.
 - Message handling, challenge timeout, recovery, and review transitions are serialized per derived
   sender identifier.
 - Exhausting the outbound-message limit must not bypass screening.
 - Whole-dialog deletion is represented by a persistent action tied to an expected sender-state
   revision. Normal deletion jobs run only in `protect`; switching to `monitor` cancels them.
-- `TG_TEST_SENDER_ID` is the only mode-independent exception: exhausted attempts can delete that
-  dedicated test dialog in either mode. Never assign a real correspondent to this setting.
+- `TG_TEST_SENDER_ID` cleanup and an explicit dashboard Spam decision are the only mode-independent
+  deletion paths. Never assign a real correspondent to the test setting; the dashboard action must
+  remain visibly destructive and CSRF-protected.
 - The application must not expose a listening TCP port or mount the Docker socket.
 
 ## Supported versions

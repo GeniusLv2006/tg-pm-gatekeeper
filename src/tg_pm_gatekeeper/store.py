@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -33,6 +33,7 @@ CREATE TABLE sender_state (
     challenge_expires_at INTEGER,
     challenge_message_id INTEGER,
     challenge_prompt TEXT,
+    challenge_profile TEXT CHECK (challenge_profile IN ('standard', 'strict')),
     challenge_action_reference BLOB,
     restriction_reference BLOB,
     guidance_sent INTEGER NOT NULL DEFAULT 0 CHECK (guidance_sent IN (0, 1)),
@@ -99,7 +100,7 @@ CREATE TABLE IF NOT EXISTS review_queue (
     sender_key TEXT NOT NULL,
     reference BLOB,
     classification TEXT NOT NULL,
-    rule_codes TEXT NOT NULL,
+    signals TEXT NOT NULL,
     features TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'legitimate', 'spam', 'dismissed')),
@@ -132,9 +133,10 @@ CREATE TABLE IF NOT EXISTS decision_events (
     sender_key TEXT NOT NULL,
     detector TEXT NOT NULL,
     signals TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    score REAL,
+    assessment TEXT NOT NULL,
+    risk_score REAL,
     model_version TEXT,
+    decision_basis TEXT NOT NULL,
     planned_action TEXT NOT NULL,
     actual_action TEXT NOT NULL,
     policy_version TEXT NOT NULL,
@@ -142,6 +144,14 @@ CREATE TABLE IF NOT EXISTS decision_events (
 );
 CREATE INDEX IF NOT EXISTS decision_events_created_idx
     ON decision_events(created_at);
+CREATE TABLE IF NOT EXISTS campaign_events (
+    fingerprint TEXT NOT NULL,
+    sender_key TEXT NOT NULL,
+    observed_at INTEGER NOT NULL,
+    PRIMARY KEY (fingerprint, sender_key)
+);
+CREATE INDEX IF NOT EXISTS campaign_events_fingerprint_time_idx
+    ON campaign_events(fingerprint, observed_at);
 CREATE TABLE IF NOT EXISTS enforcement_reviews (
     sender_key TEXT PRIMARY KEY,
     reference BLOB,
@@ -164,6 +174,7 @@ class SenderState:
     challenge_expires_at: int | None
     challenge_message_id: int | None
     challenge_prompt: str | None
+    challenge_profile: str | None
     challenge_action_reference: bytes | None
     restriction_reference: bytes | None
     guidance_sent: bool
@@ -184,7 +195,7 @@ class ReviewItem:
     sender_key: str
     reference: bytes | None
     classification: str
-    rule_codes: str
+    signals: str
     features: str
     status: str
     message_count: int
@@ -291,6 +302,9 @@ class StateStore:
         if version == 4:
             self._migrate_v4_to_v5()
             version = 5
+        if version == 5:
+            self._migrate_v5_to_v6()
+            version = 6
         if version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
@@ -397,6 +411,69 @@ class StateStore:
                 "ON outbound_events(sender_key,category,created_at)"
             )
             self._connection.execute("PRAGMA user_version=5")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _migrate_v5_to_v6(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            sender_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(sender_state)")
+            }
+            if "challenge_profile" not in sender_columns:
+                self._connection.execute(
+                    "ALTER TABLE sender_state ADD COLUMN challenge_profile TEXT "
+                    "CHECK (challenge_profile IN ('standard','strict'))"
+                )
+            self._connection.execute(
+                "UPDATE sender_state SET challenge_profile='standard' "
+                "WHERE status IN ('challenge_issuing','challenge_archiving','challenged') "
+                "AND challenge_profile IS NULL"
+            )
+            review_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(review_queue)")
+            }
+            if "rule_codes" in review_columns and "signals" not in review_columns:
+                self._connection.execute(
+                    "ALTER TABLE review_queue RENAME COLUMN rule_codes TO signals"
+                )
+            decision_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(decision_events)")
+            }
+            if "severity" in decision_columns and "assessment" not in decision_columns:
+                self._connection.execute(
+                    "ALTER TABLE decision_events RENAME COLUMN severity TO assessment"
+                )
+            if "score" in decision_columns and "risk_score" not in decision_columns:
+                self._connection.execute(
+                    "ALTER TABLE decision_events RENAME COLUMN score TO risk_score"
+                )
+            decision_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(decision_events)")
+            }
+            if decision_columns and "decision_basis" not in decision_columns:
+                self._connection.execute(
+                    "ALTER TABLE decision_events ADD COLUMN decision_basis TEXT "
+                    "NOT NULL DEFAULT 'legacy_rules_v2'"
+                )
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS campaign_events ("
+                "fingerprint TEXT NOT NULL,sender_key TEXT NOT NULL,"
+                "observed_at INTEGER NOT NULL,PRIMARY KEY (fingerprint,sender_key))"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS campaign_events_fingerprint_time_idx "
+                "ON campaign_events(fingerprint,observed_at)"
+            )
+            self._connection.execute("PRAGMA user_version=6")
         except Exception:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -525,7 +602,7 @@ class StateStore:
                     if not exists:
                         self._connection.execute(
                             "INSERT INTO review_queue(sender_key,reference,classification,"
-                            "rule_codes,features,created_at,updated_at,expires_at) "
+                            "signals,features,created_at,updated_at,expires_at) "
                             "VALUES (?,?,?,'[]','{}',?,?,?)",
                             (
                                 item["sender_key"],
@@ -599,7 +676,8 @@ class StateStore:
         with self._lock:
             row = self._connection.execute(
                 "SELECT status, challenge_id, answer_digest, challenge_expires_at, "
-                "challenge_message_id, challenge_prompt, challenge_action_reference, "
+                "challenge_message_id, challenge_prompt, challenge_profile, "
+                "challenge_action_reference, "
                 "restriction_reference, guidance_sent, attempts, suppression_reason, suppressed_until, "
                 "revision, updated_at "
                 "FROM sender_state WHERE sender_key=?",
@@ -608,6 +686,7 @@ class StateStore:
         if not row:
             return SenderState(
                 "unknown",
+                None,
                 None,
                 None,
                 None,
@@ -629,6 +708,7 @@ class StateStore:
             row["challenge_expires_at"],
             row["challenge_message_id"],
             row["challenge_prompt"],
+            row["challenge_profile"],
             row["challenge_action_reference"],
             row["restriction_reference"],
             bool(row["guidance_sent"]),
@@ -665,7 +745,8 @@ class StateStore:
                 "challenge_id=excluded.challenge_id, answer_digest=excluded.answer_digest, "
                 "challenge_expires_at=excluded.challenge_expires_at, attempts=excluded.attempts, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
-                "challenge_action_reference=NULL, restriction_reference=excluded.restriction_reference, guidance_sent=0, "
+                "challenge_profile=NULL, challenge_action_reference=NULL, "
+                "restriction_reference=excluded.restriction_reference, guidance_sent=0, "
                 "suppression_reason=NULL, suppressed_until=NULL, "
                 "revision=sender_state.revision+1, updated_at=excluded.updated_at",
                 (
@@ -708,6 +789,7 @@ class StateStore:
                 "UPDATE sender_state SET status='unknown', challenge_id=NULL, "
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
+                "challenge_profile=NULL, "
                 "challenge_action_reference=NULL, restriction_reference=NULL, guidance_sent=0, attempts=0, "
                 "suppression_reason=NULL, suppressed_until=NULL, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND updated_at=? "
@@ -751,6 +833,7 @@ class StateStore:
                 "VALUES (?,'suppressed',?,?,?,?,1,?) ON CONFLICT(sender_key) DO UPDATE SET "
                 "status='suppressed',challenge_id=NULL,answer_digest=NULL,"
                 "challenge_expires_at=NULL,challenge_message_id=NULL,challenge_prompt=NULL,"
+                "challenge_profile=NULL,"
                 "challenge_action_reference=COALESCE(excluded.challenge_action_reference,"
                 "sender_state.challenge_action_reference),"
                 "restriction_reference=COALESCE(excluded.restriction_reference,"
@@ -801,13 +884,15 @@ class StateStore:
             self._connection.execute(
                 "INSERT INTO sender_state(sender_key, status, challenge_id, "
                 "answer_digest, challenge_expires_at, challenge_message_id, "
-                "guidance_sent, attempts, updated_at) VALUES (?, 'challenged', ?, "
-                "?, ?, ?, 0, 0, ?) ON CONFLICT(sender_key) DO UPDATE SET "
+                "challenge_profile, guidance_sent, attempts, updated_at) "
+                "VALUES (?, 'challenged', ?, ?, ?, ?, 'standard', 0, 0, ?) "
+                "ON CONFLICT(sender_key) DO UPDATE SET "
                 "status='challenged', challenge_id=excluded.challenge_id, "
                 "answer_digest=excluded.answer_digest, "
                 "challenge_expires_at=excluded.challenge_expires_at, "
                 "challenge_message_id=excluded.challenge_message_id, "
-                "challenge_prompt=NULL, challenge_action_reference=NULL, "
+                "challenge_prompt=NULL, challenge_profile='standard', "
+                "challenge_action_reference=NULL, "
                 "restriction_reference=NULL, "
                 "guidance_sent=0, attempts=0, updated_at=excluded.updated_at",
                 (
@@ -829,19 +914,24 @@ class StateStore:
         prompt: str,
         action_reference: bytes | None,
         now: int | None = None,
+        *,
+        challenge_profile: str = "standard",
     ) -> None:
+        if challenge_profile not in {"standard", "strict"}:
+            raise ValueError("invalid challenge profile")
         timestamp = now or int(time.time())
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT INTO sender_state(sender_key, status, challenge_id, "
                 "answer_digest, challenge_expires_at, challenge_message_id, "
-                "challenge_prompt, challenge_action_reference, guidance_sent, "
-                "attempts, updated_at) VALUES (?, 'challenge_issuing', ?, ?, ?, "
-                "NULL, ?, ?, 0, 0, ?) ON CONFLICT(sender_key) DO UPDATE SET "
+                "challenge_prompt, challenge_profile, challenge_action_reference, "
+                "guidance_sent, attempts, updated_at) VALUES (?, 'challenge_issuing', "
+                "?, ?, ?, NULL, ?, ?, ?, 0, 0, ?) ON CONFLICT(sender_key) DO UPDATE SET "
                 "status='challenge_issuing', challenge_id=excluded.challenge_id, "
                 "answer_digest=excluded.answer_digest, "
                 "challenge_expires_at=excluded.challenge_expires_at, "
                 "challenge_message_id=NULL, challenge_prompt=excluded.challenge_prompt, "
+                "challenge_profile=excluded.challenge_profile, "
                 "challenge_action_reference=excluded.challenge_action_reference, "
                 "restriction_reference=NULL, guidance_sent=0, attempts=0, "
                 "updated_at=excluded.updated_at",
@@ -851,6 +941,7 @@ class StateStore:
                     answer_digest,
                     expires_at,
                     prompt,
+                    challenge_profile,
                     action_reference,
                     timestamp,
                 ),
@@ -889,6 +980,7 @@ class StateStore:
                 "UPDATE sender_state SET status='unknown', challenge_id=NULL, "
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
+                "challenge_profile=NULL, "
                 "challenge_action_reference=NULL, restriction_reference=NULL, "
                 "guidance_sent=0, attempts=0, "
                 "updated_at=? WHERE sender_key=? AND status IN "
@@ -1200,6 +1292,7 @@ class StateStore:
                 "UPDATE sender_state SET status='suppressed', challenge_id=NULL, "
                 "answer_digest=NULL, challenge_expires_at=NULL, "
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
+                "challenge_profile=NULL, "
                 "guidance_sent=0, attempts=0, suppression_reason='challenge_timeout', "
                 "suppressed_until=?, restriction_reference=?, revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND status='challenged' "
@@ -1253,9 +1346,10 @@ class StateStore:
         *,
         detector: str,
         signals: str,
-        severity: str,
-        score: float | None,
+        assessment: str,
+        risk_score: float | None,
         model_version: str | None,
+        decision_basis: str,
         planned_action: str,
         actual_action: str,
         policy_version: str,
@@ -1264,16 +1358,17 @@ class StateStore:
         timestamp = int(time.time()) if now is None else now
         with self._lock, self._connection:
             self._connection.execute(
-                "INSERT INTO decision_events(sender_key,detector,signals,severity,score,"
-                "model_version,planned_action,actual_action,policy_version,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO decision_events(sender_key,detector,signals,assessment,"
+                "risk_score,model_version,decision_basis,planned_action,actual_action,"
+                "policy_version,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     sender_key,
                     detector,
                     signals,
-                    severity,
-                    score,
+                    assessment,
+                    risk_score,
                     model_version,
+                    decision_basis,
                     planned_action,
                     actual_action,
                     policy_version,
@@ -1387,7 +1482,7 @@ class StateStore:
             ).fetchone()
             if not exists:
                 self._connection.execute(
-                    "INSERT INTO review_queue(sender_key,reference,classification,rule_codes,"
+                    "INSERT INTO review_queue(sender_key,reference,classification,signals,"
                     "features,created_at,updated_at,expires_at) "
                     "VALUES (?,?,?,'[]','{}',?,?,?)",
                     (
@@ -1405,7 +1500,7 @@ class StateStore:
         sender_key: str,
         reference: bytes,
         classification: str,
-        rule_codes: str,
+        signals: str,
         features: str,
         expires_at: int,
         now: int | None = None,
@@ -1424,12 +1519,12 @@ class StateStore:
                 ):
                     self._connection.execute(
                         "UPDATE review_queue SET reference=?, classification=?, "
-                        "rule_codes=?, features=?, message_count=message_count+1, "
+                        "signals=?, features=?, message_count=message_count+1, "
                         "updated_at=?, expires_at=? WHERE id=?",
                         (
                             reference,
                             classification,
-                            rule_codes,
+                            signals,
                             features,
                             timestamp,
                             expires_at,
@@ -1445,13 +1540,13 @@ class StateStore:
                 return int(pending["id"])
             cursor = self._connection.execute(
                 "INSERT INTO review_queue(sender_key, reference, classification, "
-                "rule_codes, features, created_at, updated_at, expires_at) "
+                "signals, features, created_at, updated_at, expires_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sender_key,
                     reference,
                     classification,
-                    rule_codes,
+                    signals,
                     features,
                     timestamp,
                     timestamp,
@@ -1468,7 +1563,7 @@ class StateStore:
         timestamp = int(time.time()) if now is None else now
         with self._lock:
             rows = self._connection.execute(
-                "SELECT id, sender_key, reference, classification, rule_codes, "
+                "SELECT id, sender_key, reference, classification, signals, "
                 "features, status, message_count, created_at, updated_at, "
                 "expires_at, reviewed_at "
                 "FROM review_queue WHERE status='pending' AND expires_at>? "
@@ -1490,7 +1585,7 @@ class StateStore:
     def review_item(self, review_id: int) -> ReviewItem | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT id, sender_key, reference, classification, rule_codes, "
+                "SELECT id, sender_key, reference, classification, signals, "
                 "features, status, message_count, created_at, updated_at, "
                 "expires_at, reviewed_at "
                 "FROM review_queue WHERE id=?",
@@ -1549,6 +1644,33 @@ class StateStore:
                 "INSERT INTO link_events(sender_key, created_at) VALUES (?, ?)",
                 (sender_key, timestamp),
             )
+
+    def observe_campaign(
+        self,
+        fingerprint: str,
+        sender_key: str,
+        *,
+        window_seconds: int = 24 * 3600,
+        now: int | None = None,
+    ) -> int:
+        timestamp = int(time.time()) if now is None else now
+        cutoff = timestamp - window_seconds
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM campaign_events WHERE observed_at < ?", (cutoff,)
+            )
+            self._connection.execute(
+                "INSERT INTO campaign_events(fingerprint,sender_key,observed_at) "
+                "VALUES (?,?,?) ON CONFLICT(fingerprint,sender_key) DO UPDATE SET "
+                "observed_at=excluded.observed_at",
+                (fingerprint, sender_key, timestamp),
+            )
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM campaign_events "
+                "WHERE fingerprint=? AND observed_at>=?",
+                (fingerprint, cutoff),
+            ).fetchone()
+        return int(row["count"])
 
     def claim_outbound_slot(
         self,
@@ -1738,6 +1860,10 @@ class StateStore:
                 "DELETE FROM outbound_events WHERE created_at < ?", (timestamp - 3600,)
             )
             self._connection.execute(
+                "DELETE FROM campaign_events WHERE observed_at < ?",
+                (timestamp - 24 * 3600,),
+            )
+            self._connection.execute(
                 "DELETE FROM automated_messages WHERE created_at < ?", (cutoff,)
             )
             self._connection.execute(
@@ -1791,6 +1917,23 @@ class StateStore:
                     (timestamp - 7 * 86400,),
                 )
             }
+            adaptive_metrics = {
+                row["assessment"]: int(row["count"])
+                for row in self._connection.execute(
+                    "SELECT assessment, COUNT(*) AS count FROM decision_events "
+                    "WHERE created_at>=? AND policy_version='adaptive-v1' "
+                    "GROUP BY assessment",
+                    (timestamp - 7 * 86400,),
+                )
+            }
+            repeated_campaigns = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM decision_events WHERE created_at>=? "
+                    "AND policy_version='adaptive-v1' "
+                    "AND signals LIKE '%\"code\":\"REPEATED_CAMPAIGN\"%'",
+                    (timestamp - 7 * 86400,),
+                ).fetchone()[0]
+            )
             pending_actions = int(
                 self._connection.execute(
                     "SELECT COUNT(*) FROM pending_actions WHERE status='pending'"
@@ -1828,6 +1971,12 @@ class StateStore:
             "challenge_restore_failed_7d": challenge_metrics.get(
                 "CHALLENGE_RESTORE", 0
             ),
+            "standard_challenge_7d": adaptive_metrics.get("standard", 0),
+            "strict_challenge_7d": adaptive_metrics.get("strict", 0),
+            "permanent_suppression_7d": adaptive_metrics.get(
+                "permanent_suppression", 0
+            ),
+            "repeated_campaign_7d": repeated_campaigns,
         }
         result.update(self.outbound_statistics(now=timestamp))
         return result
