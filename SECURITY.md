@@ -94,6 +94,11 @@ flow, see [Architecture](docs/architecture.md).
   contains only an opaque page-state fingerprint and check time; it does not contain message content,
   Telegram identity, encrypted references, or evidence. Content Security Policy permits scripts and
   connection checks only from the same origin; no external browser dependency is loaded.
+- Dashboard access requires both a process-local capability path and an independent HttpOnly browser
+  session cookie. Copying the URL alone must not transfer access to another browser. A new login or
+  explicit logout revokes the previous session, and server-side idle and absolute timeouts bound its
+  lifetime. The cookie is scoped beneath its capability path and uses `SameSite=Strict`; it is not
+  marked `Secure` because the supported endpoint is loopback HTTP carried inside the SSH tunnel.
 
 ### Actions and failure handling
 

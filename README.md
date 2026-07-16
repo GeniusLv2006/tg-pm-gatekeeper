@@ -113,9 +113,10 @@ The dashboard is available only through an SSH tunnel; Docker publishes no Gatek
 scripts/dashboard-tunnel.sh root@server.example
 ```
 
-The one-time login redirects to a random, process-local capability path instead of setting an
-authentication cookie. Treat the resulting address as a secret: do not bookmark, share, or paste it
-into an untrusted page. A new login rotates the path and immediately invalidates the previous one.
+The one-time login creates a browser-bound session protected by both a random, process-local
+capability path and a path-scoped HttpOnly cookie. Copying the resulting address into another browser
+does not transfer access. A new login or **Sign Out** immediately invalidates the previous session;
+sessions also expire after 30 minutes without a dashboard request or eight hours in total.
 
 It has two main areas:
 

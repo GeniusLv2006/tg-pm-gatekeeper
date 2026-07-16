@@ -16,7 +16,12 @@ from telethon import functions, types
 
 from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
 from tg_pm_gatekeeper.message_facts import facts_from_message
-from tg_pm_gatekeeper.review_admin import ReviewAdminServer
+from tg_pm_gatekeeper.review_admin import (
+    DASHBOARD_SESSION_ABSOLUTE_SECONDS,
+    DASHBOARD_SESSION_COOKIE,
+    DASHBOARD_SESSION_IDLE_SECONDS,
+    ReviewAdminServer,
+)
 from tg_pm_gatekeeper.service import GatekeeperService
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 
@@ -97,6 +102,17 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             100,
         )
 
+    def authenticated_headers(self, **extra: str) -> dict[str, str]:
+        if self.server._session_token is None:
+            self.server._activate_session()
+        return {
+            "host": "127.0.0.1:8765",
+            "cookie": (
+                f"{DASHBOARD_SESSION_COOKIE}={self.server._session_token}"
+            ),
+            **extra,
+        }
+
     def tearDown(self) -> None:
         self.store.close()
         self.temp.cleanup()
@@ -162,10 +178,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST",
             f"/{self.server._capability_token}/review/{self.review_id}",
             body,
-            request_headers={
-                "host": "127.0.0.1:8765",
-                "origin": "http://127.0.0.1:8765",
-            },
+            request_headers=self.authenticated_headers(
+                origin="http://127.0.0.1:8765"
+            ),
         )
         self.assertEqual(status, 303)
         self.assertEqual(
@@ -182,9 +197,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST",
             f"/{self.server._capability_token}/review/{self.review_id}",
             body,
-            request_headers={
-                "host": "127.0.0.1:8765",
-            },
+            request_headers=self.authenticated_headers(),
         )
         self.assertEqual(status, 303)
         self.assertEqual(
@@ -200,10 +213,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST",
             f"/{self.server._capability_token}/review/{self.review_id}",
             body,
-            request_headers={
-                "host": "127.0.0.1:8765",
-                "origin": "null",
-            },
+            request_headers=self.authenticated_headers(origin="null"),
         )
         self.assertEqual(status, 303)
         self.assertEqual(
@@ -219,10 +229,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                     "POST",
                     f"/{self.server._capability_token}/review/{self.review_id}",
                     body,
-                    request_headers={
-                        "host": "127.0.0.1:8765",
-                        "origin": origin,
-                    },
+                    request_headers=self.authenticated_headers(origin=origin),
                 )
                 self.assertEqual(status, 400)
                 self.assertIn(b"Invalid Action Token", response)
@@ -239,6 +246,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Checked ", response)
         self.assertIn(b"checked quietly while this tab is visible", response)
         self.assertIn(b"updates in place only when review state changes", response)
+        self.assertIn(b"class='logout-form' method='post' action='/logout'", response)
+        self.assertIn(b">Sign Out</button>", response)
         self.assertIn(b"Test Sender (@testsender)", response)
         self.assertIn(b"ID 123456789", response)
         self.assertIn(b"Review Reason", response)
@@ -258,6 +267,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
         self.assertIn(b"document.visibilityState", response)
         self.assertIn(b"region.replaceWith(replacement)", response)
+        self.assertIn(b"form:not(.logout-form) button", response)
+        self.assertNotIn(b"querySelectorAll('form button')", response)
 
     async def test_status_version_changes_without_exposing_review_content(self) -> None:
         status, headers, response = await self.server._dispatch(
@@ -357,10 +368,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 stat.S_IMODE(self.server.socket_path.stat().st_mode), 0o600
             )
             reader, writer = await asyncio.open_unix_connection(self.server.socket_path)
+            self.server._activate_session()
             writer.write(
                 (
                     f"GET /{self.server._capability_token}/dashboard.js HTTP/1.1\r\n"
-                    "Host: 127.0.0.1:8765\r\n\r\n"
+                    "Host: 127.0.0.1:8765\r\n"
+                    f"Cookie: {DASHBOARD_SESSION_COOKIE}="
+                    f"{self.server._session_token}\r\n\r\n"
                 ).encode("ascii")
             )
             await writer.drain()
@@ -403,8 +417,14 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 303)
         self.assertNotEqual(self.server._access_token, login_token)
         capability = self.server._capability_token
+        session_token = self.server._session_token
         self.assertEqual(headers["Location"], f"/{capability}/")
-        self.assertNotIn("Set-Cookie", headers)
+        self.assertIsNotNone(session_token)
+        self.assertEqual(
+            headers["Set-Cookie"],
+            f"{DASHBOARD_SESSION_COOKIE}={session_token}; Path=/{capability}/; "
+            f"Max-Age={DASHBOARD_SESSION_ABSOLUTE_SECONDS}; HttpOnly; SameSite=Strict",
+        )
         replay_status, _, _ = await self.server._dispatch(
             "GET",
             f"/login?token={login_token}",
@@ -412,14 +432,31 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             request_headers={"host": "127.0.0.1:8765"},
         )
         self.assertEqual(replay_status, 400)
-        status, _, page = await self.server._dispatch(
+        copied_status, _, copied_page = await self.server._dispatch(
+            "GET",
+            f"/{capability}/",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(copied_status, 404)
+        self.assertIn(b"Dashboard Access Missing", copied_page)
+        wrong_cookie_status, _, _ = await self.server._dispatch(
             "GET",
             f"/{capability}/",
             b"",
             request_headers={
                 "host": "127.0.0.1:8765",
-                "cookie": "gatekeeper_session=unrelated-local-service-cookie",
+                "cookie": (
+                    f"{DASHBOARD_SESSION_COOKIE}=unrelated-local-service-cookie"
+                ),
             },
+        )
+        self.assertEqual(wrong_cookie_status, 404)
+        status, _, page = await self.server._dispatch(
+            "GET",
+            f"/{capability}/",
+            b"",
+            request_headers=self.authenticated_headers(),
         )
         self.assertEqual(status, 200)
         self.assertIn(f"href='/{capability}/review'".encode(), page)
@@ -433,7 +470,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 "GET",
                 f"/{capability}{protected_path}",
                 b"",
-                request_headers={"host": "127.0.0.1:8765"},
+                request_headers=self.authenticated_headers(),
             )
             self.assertEqual(protected_status, 200)
 
@@ -453,9 +490,104 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "GET",
             f"/{capability}/",
             b"",
-            request_headers={"host": "127.0.0.1:8765"},
+            request_headers={
+                "host": "127.0.0.1:8765",
+                "cookie": f"{DASHBOARD_SESSION_COOKIE}={session_token}",
+            },
         )
         self.assertEqual(stale_status, 404)
+
+    async def test_dashboard_session_enforces_idle_and_absolute_timeouts(self) -> None:
+        self.server._activate_session()
+        headers = self.authenticated_headers()
+        now = time.monotonic()
+
+        self.server._session_started_at = now - DASHBOARD_SESSION_IDLE_SECONDS + 5
+        self.server._session_last_seen_at = now - DASHBOARD_SESSION_IDLE_SECONDS + 5
+        status, _, _ = await self.server._dispatch(
+            "GET", f"/{self.server._capability_token}/", b"", request_headers=headers
+        )
+        self.assertEqual(status, 200)
+
+        self.server._session_last_seen_at = (
+            time.monotonic() - DASHBOARD_SESSION_IDLE_SECONDS
+        )
+        status, _, response = await self.server._dispatch(
+            "GET", f"/{self.server._capability_token}/", b"", request_headers=headers
+        )
+        self.assertEqual(status, 404)
+        self.assertIn(b"Dashboard Access Missing", response)
+
+        self.server._activate_session()
+        headers = self.authenticated_headers()
+        self.server._session_started_at = (
+            time.monotonic() - DASHBOARD_SESSION_ABSOLUTE_SECONDS
+        )
+        status, _, response = await self.server._dispatch(
+            "GET", f"/{self.server._capability_token}/", b"", request_headers=headers
+        )
+        self.assertEqual(status, 404)
+        self.assertIn(b"Dashboard Access Missing", response)
+
+    async def test_logout_revokes_session_capability_and_login_token(self) -> None:
+        self.server._activate_session()
+        capability = self.server._capability_token
+        session_token = self.server._session_token
+        access_token = self.server._access_token
+        body = urlencode({"token": self.server._csrf_token}).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST",
+            f"/{capability}/logout",
+            body,
+            request_headers=self.authenticated_headers(),
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/logged-out")
+        self.assertEqual(
+            headers["Set-Cookie"],
+            f"{DASHBOARD_SESSION_COOKIE}=; Path=/{capability}/; Max-Age=0; "
+            "HttpOnly; SameSite=Strict",
+        )
+        self.assertIsNone(self.server._session_token)
+        self.assertNotEqual(self.server._capability_token, capability)
+        self.assertNotEqual(self.server._access_token, access_token)
+        stale_status, _, _ = await self.server._dispatch(
+            "GET",
+            f"/{capability}/",
+            b"",
+            request_headers={
+                "host": "127.0.0.1:8765",
+                "cookie": f"{DASHBOARD_SESSION_COOKIE}={session_token}",
+            },
+        )
+        self.assertEqual(stale_status, 404)
+        signed_out_status, _, signed_out_page = await self.server._dispatch(
+            "GET",
+            "/logged-out",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(signed_out_status, 200)
+        self.assertIn(b"Dashboard Signed Out", signed_out_page)
+
+    async def test_logout_requires_post_and_valid_csrf(self) -> None:
+        self.server._activate_session()
+        path = f"/{self.server._capability_token}/logout"
+        status, headers, _ = await self.server._dispatch(
+            "GET", path, b"", request_headers=self.authenticated_headers()
+        )
+        self.assertEqual(status, 405)
+        self.assertEqual(headers["Allow"], "POST")
+        session_token = self.server._session_token
+        status, _, response = await self.server._dispatch(
+            "POST",
+            path,
+            urlencode({"token": "invalid"}).encode(),
+            request_headers=self.authenticated_headers(),
+        )
+        self.assertEqual(status, 400)
+        self.assertIn(b"Invalid Action Token", response)
+        self.assertEqual(self.server._session_token, session_token)
 
     async def test_pending_reviews_are_paginated_with_stable_page_links(self) -> None:
         now = int(time.time())
