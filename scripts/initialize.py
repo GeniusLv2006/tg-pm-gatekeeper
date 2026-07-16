@@ -48,6 +48,7 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_OUTBOUND_LIMIT_PER_HOUR=10\n"
         "TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR=3\n"
         "TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR=3\n"
+        "TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false\n"
         "TG_TEST_SENDER_ID=\n"
     ).encode("ascii")
 

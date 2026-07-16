@@ -7,6 +7,8 @@ import asyncio
 import logging
 import os
 import time
+import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,6 +17,7 @@ from telethon.sessions import StringSession
 
 from .config import ConfigurationError, Settings, read_private_file
 from .message_facts import facts_from_message
+from .restriction_actions import RestrictionActions, RestrictionReleaseResult
 from .review_admin import ReviewAdminServer
 from .rules import normalized_domain
 from .service import (
@@ -30,6 +33,9 @@ LOG = logging.getLogger("gatekeeper.telegram")
 SERVICE_USER_IDS = {777000, 42777}
 HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
 PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
+OPERATOR_CASE_LIMIT = 5
+OPERATOR_CONTROL_TTL_SECONDS = 15 * 60
+OPERATOR_IDENTITY_TIMEOUT_SECONDS = 5
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
     "⚠️ Verification Required",
@@ -54,6 +60,12 @@ GATEKEEPER_MESSAGE_PREFIXES = (
 
 class TelegramAuthorizationError(RuntimeError):
     """Raised when the configured Telegram session cannot operate the client."""
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorCaseControl:
+    sender_key: str
+    expires_at: float
 
 
 def formatting_entities_from_spans(
@@ -322,6 +334,15 @@ class TelegramAdapter:
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._maintenance_tasks: set[asyncio.Task] = set()
         self._heartbeat_task: asyncio.Task | None = None
+        self._self_user_id: int | None = None
+        self._operator_case_controls: dict[int, OperatorCaseControl] = {}
+        self._operator_command_lock = asyncio.Lock()
+        self._restriction_actions = RestrictionActions(
+            store,
+            service,
+            self.client,
+            cancel_timeout=self.cancel_timeout,
+        )
         self._review_admin = ReviewAdminServer(
             settings.review_socket_path,
             store,
@@ -329,13 +350,15 @@ class TelegramAdapter:
             self.client,
             mute_days=settings.mute_days,
             cancel_timeout=self.cancel_timeout,
+            restriction_actions=self._restriction_actions,
         )
 
     async def run(self) -> None:
         await self.client.connect()
         if not await self.client.is_user_authorized():
             raise TelegramAuthorizationError("telegram session is not authorized")
-        await self.client.get_me()
+        me = await self.client.get_me()
+        self._self_user_id = int(me.id)
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
         await self._recover_pending_actions()
@@ -343,6 +366,10 @@ class TelegramAdapter:
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
         )
+        if self.settings.telegram_operator_controls_enabled:
+            self.client.add_event_handler(
+                self._on_operator_message, events.NewMessage(outgoing=True)
+            )
         disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         LOG.info("service_started")
@@ -443,6 +470,194 @@ class TelegramAdapter:
             LOG.info(f"message_handled:{outcome}")
         except Exception:
             LOG.error("event_handler_failed")
+
+    async def _on_operator_message(self, event) -> None:
+        if (
+            not self.settings.telegram_operator_controls_enabled
+            or self._self_user_id is None
+            or not event.is_private
+            or not event.outgoing
+            or event.chat_id != self._self_user_id
+        ):
+            return
+        text = (event.raw_text or "").strip()
+        if text != "/gatekeeper" and not text.startswith("/gatekeeper "):
+            return
+        try:
+            async with self._operator_command_lock:
+                if text in {"/gatekeeper", "/gatekeeper help"}:
+                    await event.respond(
+                        self._operator_help(), link_preview=False, parse_mode=None
+                    )
+                elif text == "/gatekeeper ping":
+                    await event.respond(
+                        "✅ Gatekeeper operator controls are online.",
+                        link_preview=False,
+                        parse_mode=None,
+                    )
+                elif text == "/gatekeeper cases":
+                    await self._send_operator_cases(event)
+                elif text == "/gatekeeper allow":
+                    await self._allow_operator_case(event)
+                else:
+                    await event.respond(
+                        "Unknown Gatekeeper command. Send /gatekeeper help.",
+                        link_preview=False,
+                        parse_mode=None,
+                    )
+        except Exception:
+            LOG.error("operator_command_failed")
+            try:
+                await event.respond(
+                    "❌ Gatekeeper could not process that operator command.",
+                    link_preview=False,
+                    parse_mode=None,
+                )
+            except Exception:
+                LOG.error("operator_response_failed")
+
+    async def _send_operator_cases(self, event) -> None:
+        self._operator_case_controls.clear()
+        total = self.store.active_restriction_count()
+        items = self.store.active_restrictions(limit=OPERATOR_CASE_LIMIT)
+        if not items:
+            await event.respond(
+                "✅ Gatekeeper has no active restrictions.",
+                link_preview=False,
+                parse_mode=None,
+            )
+            return
+        await event.respond(
+            f"Gatekeeper Active Cases · showing {len(items)} of {total}",
+            link_preview=False,
+            parse_mode=None,
+        )
+        expires_at = time.monotonic() + OPERATOR_CONTROL_TTL_SECONDS
+        for item in items:
+            identity = await self._operator_identity(item.reference)
+            actionable = item.reference is not None
+            instruction = (
+                "Reply to this message with /gatekeeper allow\n"
+                "This control is single-use and expires in 15 minutes."
+                if actionable
+                else "Telegram identity is unavailable. Use Dashboard legacy recovery."
+            )
+            message = await event.respond(
+                "Gatekeeper Active Case\n\n"
+                f"Sender: {identity}\n"
+                f"State: {item.status.title()}\n"
+                f"Reason: {self._operator_reason(item.reason)}\n"
+                f"Updated: {self._operator_age(item.updated_at)}\n\n"
+                f"{instruction}",
+                link_preview=False,
+                parse_mode=None,
+            )
+            if actionable:
+                self._operator_case_controls[int(message.id)] = OperatorCaseControl(
+                    item.sender_key,
+                    expires_at,
+                )
+
+    async def _allow_operator_case(self, event) -> None:
+        reply_id = reply_to_message_id(event.message)
+        now = time.monotonic()
+        self._operator_case_controls = {
+            message_id: control
+            for message_id, control in self._operator_case_controls.items()
+            if control.expires_at > now
+        }
+        control = (
+            self._operator_case_controls.pop(reply_id, None)
+            if reply_id is not None
+            else None
+        )
+        if control is None:
+            await event.respond(
+                "Reply to a current case from /gatekeeper cases. "
+                "Case controls expire after 15 minutes.",
+                link_preview=False,
+                parse_mode=None,
+            )
+            return
+        result = await self._restriction_actions.allow(control.sender_key)
+        response = {
+            RestrictionReleaseResult.ALLOWED: (
+                "✅ Restriction removed. The sender is now allowed and pending "
+                "Gatekeeper deletion jobs were cancelled."
+            ),
+            RestrictionReleaseResult.NOT_ACTIVE: (
+                "ℹ️ This restriction was already resolved. No action was taken."
+            ),
+            RestrictionReleaseResult.IDENTITY_UNAVAILABLE: (
+                "⚠️ Telegram identity is unavailable. Use Dashboard legacy recovery."
+            ),
+            RestrictionReleaseResult.TELEGRAM_ACTION_FAILED: (
+                "❌ Telegram restore failed. The restriction was left unchanged."
+            ),
+        }[result]
+        await event.respond(response, link_preview=False, parse_mode=None)
+
+    async def _operator_identity(self, reference: bytes | None) -> str:
+        if reference is None:
+            return "Identity unavailable"
+        try:
+            user_id, access_hash = self.service.protector.open_restriction_reference(
+                reference
+            )
+            sender = await asyncio.wait_for(
+                self.client.get_entity(
+                    types.InputPeerUser(user_id=user_id, access_hash=access_hash)
+                ),
+                timeout=OPERATOR_IDENTITY_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return "Name unavailable"
+        name = " ".join(
+            self._operator_text(value)
+            for value in (
+                getattr(sender, "first_name", None),
+                getattr(sender, "last_name", None),
+            )
+            if value
+        ).strip() or "Unnamed sender"
+        name = name[:120]
+        username = getattr(sender, "username", None)
+        clean_username = self._operator_text(username)[:64] if username else ""
+        return f"{name} (@{clean_username})" if clean_username else name
+
+    @staticmethod
+    def _operator_text(value: object) -> str:
+        return " ".join(
+            "".join(
+                (" " if unicodedata.category(char) == "Cc" else char)
+                for char in str(value)
+                if unicodedata.category(char) != "Cf"
+            ).split()
+        )
+
+    @staticmethod
+    def _operator_reason(reason: str) -> str:
+        return reason.replace("_", " ").title()
+
+    @staticmethod
+    def _operator_age(updated_at: int) -> str:
+        age = max(0, int(time.time()) - updated_at)
+        if age < 60:
+            return "just now"
+        if age < 3600:
+            return f"{age // 60} minutes ago"
+        if age < 86400:
+            return f"{age // 3600} hours ago"
+        return f"{age // 86400} days ago"
+
+    @staticmethod
+    def _operator_help() -> str:
+        return (
+            "Gatekeeper operator controls work only in Saved Messages.\n\n"
+            "/gatekeeper ping — check the control channel\n"
+            "/gatekeeper cases — list up to 5 active restrictions\n"
+            "Reply to a case with /gatekeeper allow — restore and allow the sender"
+        )
 
     def _review_reference(self, sender, message_id: int) -> bytes | None:
         sender_id = getattr(sender, "id", None)

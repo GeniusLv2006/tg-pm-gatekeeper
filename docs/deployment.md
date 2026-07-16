@@ -193,6 +193,43 @@ Losing the SSH tunnel leaves the current page visible while the connection indic
 failure. List pages retain their current page during refresh and show 50 rows per page in stable
 most-recently-updated order.
 
+### Telegram operator controls
+
+This feature is disabled by default. To opt in, set the following deployment value and recreate the
+service:
+
+```shell
+TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true
+```
+
+When enabled, Gatekeeper accepts a small owner-only command set in the logged-in account's Telegram
+Saved Messages. This provides quick restriction recovery from any Telegram client without exposing
+the dashboard or configuring SSH on that device:
+
+```text
+/gatekeeper ping
+/gatekeeper help
+/gatekeeper cases
+```
+
+`cases` returns at most five current restrictions as separate case cards. Reply to the intended card
+with `/gatekeeper allow` within 15 minutes. A successful allowance restores the saved Telegram folder
+and notification settings when available, marks the sender allowed, cancels pending or failed
+Gatekeeper deletion jobs, and removes the Active Case evidence. The reply-bound control is single-use
+and kept only in process memory; a restart, a newer `cases` command, or expiry invalidates it.
+
+Commands are ignored outside Saved Messages, including messages sent to private users or groups.
+Case cards contain the resolved name or username, restriction state, reason, and age. They do not
+copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved
+Messages. The cards themselves remain in Telegram until the owner deletes them.
+
+Legacy restrictions without an encrypted control identity cannot be released this way. Use the
+dashboard's **Legacy Recovery** path for those cases. Pending Review decisions and detailed evidence
+inspection also remain dashboard-only.
+
+Set `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false` and recreate the service to disable command
+handling. Disabled deployments do not register the outgoing Telegram event handler.
+
 ### Pending Reviews
 
 One row represents one sender. The row contains a consolidated message count and one encrypted
@@ -391,6 +428,7 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 | `TG_ACTIVE_CASE_RETENTION_DAYS` | `30` | Active Case snapshot retention; 1–30 days |
 | `TG_MUTE_DAYS` | `3650` | Quarantine mute duration |
 | `TG_REVIEW_KEY_FILE` | `/run/secrets/review_key` | Active Case snapshot encryption key |
+| `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED` | `false` | Enable owner commands in Telegram Saved Messages |
 | `TG_TEST_SENDER_ID` | empty | Dedicated arithmetic-flow test account |
 | `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only dashboard Unix socket |
 

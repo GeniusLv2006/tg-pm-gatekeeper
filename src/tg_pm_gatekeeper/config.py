@@ -68,6 +68,15 @@ def _optional_positive_int(name: str) -> int | None:
     return value
 
 
+def _boolean(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "true" if default else "false").strip().casefold()
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
+
+
 def read_private_file(
     path: Path, *, minimum_bytes: int = 1, strip: bool = False
 ) -> bytes:
@@ -108,6 +117,7 @@ class Settings:
     outbound_limit_per_hour: int
     outbound_notice_reserve_per_hour: int
     outbound_notice_limit_per_sender_per_hour: int
+    telegram_operator_controls_enabled: bool
     test_sender_id: int | None
     review_key_file: Path
 
@@ -166,6 +176,9 @@ class Settings:
             ),
             outbound_notice_limit_per_sender_per_hour=_bounded_int(
                 "TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR", 3, 1, 100
+            ),
+            telegram_operator_controls_enabled=_boolean(
+                "TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED"
             ),
             test_sender_id=_optional_positive_int("TG_TEST_SENDER_ID"),
             review_key_file=Path(
