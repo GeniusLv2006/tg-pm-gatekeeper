@@ -165,6 +165,9 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.adapter = TelegramAdapter.__new__(TelegramAdapter)
         self.adapter.store = self.store
         self.adapter.service = self.service
+        self.adapter.settings = SimpleNamespace(
+            telegram_operator_controls_enabled=True
+        )
         self.adapter._self_user_id = 1000
         self.adapter._operator_case_controls = {}
         self.adapter._operator_command_lock = asyncio.Lock()
@@ -221,6 +224,14 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         incoming = self.event("/gatekeeper ping", outgoing=False)
         await self.adapter._on_operator_message(incoming)
         incoming.respond.assert_not_awaited()
+
+    async def test_disabled_operator_controls_ignore_saved_messages(self) -> None:
+        self.adapter.settings.telegram_operator_controls_enabled = False
+        event = self.event("/gatekeeper ping")
+
+        await self.adapter._on_operator_message(event)
+
+        event.respond.assert_not_awaited()
 
     async def test_cases_create_reply_bound_controls_without_evidence(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -651,7 +662,7 @@ class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
-    def make_adapter(self) -> TelegramAdapter:
+    def make_adapter(self, *, operator_controls: bool = False) -> TelegramAdapter:
         adapter = TelegramAdapter.__new__(TelegramAdapter)
         adapter.client = SimpleNamespace(
             connect=AsyncMock(),
@@ -668,6 +679,9 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         adapter._timeout_tasks = {}
         adapter._maintenance_tasks = set()
         adapter._heartbeat_task = None
+        adapter.settings = SimpleNamespace(
+            telegram_operator_controls_enabled=operator_controls
+        )
         return adapter
 
     async def test_heartbeat_failure_terminates_runtime(self) -> None:
@@ -700,6 +714,20 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(adapter._heartbeat_task.done())
         adapter._review_admin.stop.assert_awaited_once()
         adapter.client.disconnect.assert_awaited_once()
+
+    async def test_operator_handler_registration_is_opt_in(self) -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        disabled = self.make_adapter()
+        disabled._heartbeat_loop = AsyncMock(side_effect=wait_forever)
+        await disabled.run()
+        self.assertEqual(disabled.client.add_event_handler.call_count, 1)
+
+        enabled = self.make_adapter(operator_controls=True)
+        enabled._heartbeat_loop = AsyncMock(side_effect=wait_forever)
+        await enabled.run()
+        self.assertEqual(enabled.client.add_event_handler.call_count, 2)
 
 
 if __name__ == "__main__":

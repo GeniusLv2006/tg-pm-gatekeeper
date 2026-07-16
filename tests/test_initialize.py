@@ -31,6 +31,7 @@ class InitializeTests(unittest.TestCase):
         self.assertIn("TG_ACTIVE_CASE_RETENTION_DAYS=30", config)
         self.assertIn("TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR=3", config)
         self.assertIn("TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR=3", config)
+        self.assertIn("TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false", config)
         self.assertIn("TG_TEST_SENDER_ID=\n", config)
         self.assertNotIn("REPLACE_WITH_", config)
 
@@ -52,6 +53,25 @@ class InitializeTests(unittest.TestCase):
     def test_challenge_configuration_is_bounded(self) -> None:
         with patch.dict("os.environ", {"TG_CHALLENGE_TTL_SECONDS": "10"}, clear=True):
             with self.assertRaisesRegex(ConfigurationError, "between 30 and 600"):
+                Settings.from_environment(require_telegram=False)
+
+    def test_operator_controls_are_opt_in_and_strictly_boolean(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings.from_environment(require_telegram=False)
+            self.assertFalse(settings.telegram_operator_controls_enabled)
+        with patch.dict(
+            os.environ,
+            {"TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED": "true"},
+            clear=True,
+        ):
+            settings = Settings.from_environment(require_telegram=False)
+            self.assertTrue(settings.telegram_operator_controls_enabled)
+        with patch.dict(
+            os.environ,
+            {"TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ConfigurationError, "must be true or false"):
                 Settings.from_environment(require_telegram=False)
 
     def test_review_key_must_be_cryptographically_separate(self) -> None:

@@ -366,9 +366,10 @@ class TelegramAdapter:
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
         )
-        self.client.add_event_handler(
-            self._on_operator_message, events.NewMessage(outgoing=True)
-        )
+        if self.settings.telegram_operator_controls_enabled:
+            self.client.add_event_handler(
+                self._on_operator_message, events.NewMessage(outgoing=True)
+            )
         disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         LOG.info("service_started")
@@ -472,7 +473,8 @@ class TelegramAdapter:
 
     async def _on_operator_message(self, event) -> None:
         if (
-            self._self_user_id is None
+            not self.settings.telegram_operator_controls_enabled
+            or self._self_user_id is None
             or not event.is_private
             or not event.outgoing
             or event.chat_id != self._self_user_id
