@@ -199,7 +199,12 @@ actionable card's Telegram message ID maps to a derived sender key in process me
 Replying to that exact card with `/gatekeeper allow` consumes the mapping, rechecks the restriction
 under the sender lock, restores the dialog, allows the sender, and cancels pending work. Restart,
 expiry, or a newer case listing invalidates earlier mappings. Telegram retains the case-card messages
-until the owner deletes them.
+until the owner deletes them. Because Telegram may not deliver another device's outgoing Saved
+Messages as a real-time update, the enabled runtime also advances an in-memory message-ID cursor by
+polling only messages newer than its startup baseline every three seconds. Real-time and polled paths
+share a 15-minute message-ID deduplication map, so a delayed update cannot execute a command twice.
+The history query is restricted to `/gatekeeper` search matches rather than reading unrelated Saved
+Messages. The cursor is never persisted, preventing pre-start commands from replaying after a restart.
 
 ## Implemented action policy
 

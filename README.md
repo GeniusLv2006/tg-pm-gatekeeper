@@ -129,7 +129,8 @@ dashboard: send `/gatekeeper cases` in Telegram Saved Messages. Gatekeeper retur
 restrictions. Reply to the intended case card with `/gatekeeper allow` within 15 minutes to restore
 the dialog, allow the sender, and cancel pending Gatekeeper deletion jobs. The optional commands are
 accepted only from the logged-in account in its own Saved Messages; case cards contain identity and
-restriction metadata, not retained message evidence.
+restriction metadata, not retained message evidence. Responses can take a few seconds when Telegram
+does not deliver another device's outgoing-message update in real time.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
 referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Archive and
