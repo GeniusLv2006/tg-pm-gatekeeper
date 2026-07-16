@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 from telethon import functions, types
 
 from .message_facts import facts_from_message
+from .restriction_actions import RestrictionActions, RestrictionReleaseResult
 from .rules import url_evidence, url_shape
 from .service import GatekeeperService
 from .store import ActiveRestriction, DialogSnapshot, ReviewItem, StateStore
@@ -178,6 +179,7 @@ class ReviewAdminServer:
         *,
         mute_days: int,
         cancel_timeout: Callable[[str], None] = lambda _sender_key: None,
+        restriction_actions: RestrictionActions | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.store = store
@@ -186,6 +188,12 @@ class ReviewAdminServer:
         self.telegram_client = telegram_client
         self.mute_days = mute_days
         self.cancel_timeout = cancel_timeout
+        self.restriction_actions = restriction_actions or RestrictionActions(
+            store,
+            service,
+            telegram_client,
+            cancel_timeout=cancel_timeout,
+        )
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
         self._access_token = secrets.token_urlsafe(32)
@@ -694,24 +702,16 @@ class ReviewAdminServer:
             return 303, {"Location": "/cases"}, b""
         if action != "allow":
             return 400, {}, self._page("Unknown Action")
-        async with self.service.sender_lock(sender_key):
-            item = self.store.active_restriction(sender_key)
-            if item is None:
-                return 409, {}, self._page("This Restriction Is No Longer Active")
-            if item.reference is None:
-                return 409, {}, self._page("Telegram Identity Is Unavailable")
-            try:
-                user_id, access_hash = self.protector.open_restriction_reference(
-                    item.reference
-                )
-            except ValueError:
-                return 409, {}, self._page("Telegram Identity Is Unavailable")
-            peer = types.InputPeerUser(user_id=user_id, access_hash=access_hash)
-            if not await self._restore(peer, sender_key):
-                return 500, {}, self._page("Telegram Action Failed; Item Was Not Changed")
-            self.store.allow(sender_key)
-            self.cancel_timeout(sender_key)
-            self._identity_cache.pop(sender_key, None)
+        result = await self.restriction_actions.allow(sender_key)
+        if result == RestrictionReleaseResult.NOT_ACTIVE:
+            return 409, {}, self._page("This Restriction Is No Longer Active")
+        if result == RestrictionReleaseResult.IDENTITY_UNAVAILABLE:
+            return 409, {}, self._page("Telegram Identity Is Unavailable")
+        if result == RestrictionReleaseResult.TELEGRAM_ACTION_FAILED:
+            return 500, {}, self._page("Telegram Action Failed; Item Was Not Changed")
+        if result != RestrictionReleaseResult.ALLOWED:
+            return 500, {}, self._page("Restriction Release Failed")
+        self._identity_cache.pop(sender_key, None)
         return 303, {"Location": "/cases"}, b""
 
     async def _dispatch_legacy_release(
@@ -1162,34 +1162,7 @@ class ReviewAdminServer:
             return False
 
     async def _restore(self, peer: types.InputPeerUser, sender_key: str) -> bool:
-        try:
-            snapshot = self.store.dialog_snapshot(sender_key)
-            folder_id = snapshot.folder_id if snapshot is not None else 0
-            silent = snapshot.silent if snapshot is not None else False
-            mute_until = (
-                datetime.fromtimestamp(snapshot.mute_until, timezone.utc)
-                if snapshot is not None and snapshot.mute_until is not None
-                else datetime.now(timezone.utc)
-            )
-            await self.telegram_client(
-                functions.folders.EditPeerFoldersRequest(
-                    [types.InputFolderPeer(peer=peer, folder_id=folder_id)]
-                )
-            )
-            await self.telegram_client(
-                functions.account.UpdateNotifySettingsRequest(
-                    peer=types.InputNotifyPeer(peer),
-                    settings=types.InputPeerNotifySettings(
-                        silent=silent,
-                        mute_until=mute_until,
-                    ),
-                )
-            )
-            self.store.clear_dialog_snapshot(sender_key)
-            return True
-        except Exception:
-            LOG.error("review_restore_failed")
-            return False
+        return await self.restriction_actions.restore_dialog(peer, sender_key)
 
     async def _dashboard_page(self) -> bytes:
         pending_reviews = self.store.pending_review_count()

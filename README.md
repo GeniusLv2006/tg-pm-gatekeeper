@@ -124,6 +124,12 @@ It has two main areas:
 
 Both lists are ordered by most recent activity and paginated at 50 rows per page.
 
+For a quick recovery without opening the dashboard, send `/gatekeeper cases` in Telegram Saved
+Messages. Gatekeeper returns up to five current restrictions. Reply to the intended case card with
+`/gatekeeper allow` within 15 minutes to restore the dialog, allow the sender, and cancel pending
+Gatekeeper deletion jobs. Operator commands are accepted only from the logged-in account in its own
+Saved Messages; case cards contain identity and restriction metadata, not retained message evidence.
+
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
 referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Archive and
 Mute** archives and mutes the dialog, and **Dismiss and Cancel Pending Jobs** closes the review and

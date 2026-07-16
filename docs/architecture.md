@@ -190,6 +190,15 @@ failure leaves policy state unchanged. Leaving the restriction unchanged records
 decision but does not extend a temporary suppression. A manual numeric-ID recovery form is retained
 only for legacy states without a control identity; the ID is HMAC-derived in memory and not stored.
 
+The same restriction-release operation is available through owner commands in Telegram Saved
+Messages. The runtime listens separately for outgoing commands whose sender and chat both match the
+logged-in account. `/gatekeeper cases` resolves at most five live identities and sends metadata-only
+case cards; it does not decrypt or copy Active Case message evidence. Each actionable card's Telegram
+message ID maps to a derived sender key in process memory for 15 minutes. Replying to that exact card
+with `/gatekeeper allow` consumes the mapping, rechecks the restriction under the sender lock, restores
+the dialog, allows the sender, and cancels pending work. Restart, expiry, or a newer case listing
+invalidates earlier mappings. Telegram retains the case-card messages until the owner deletes them.
+
 ## Implemented action policy
 
 | Input | Monitor mode | Protect mode |
