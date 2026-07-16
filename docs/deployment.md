@@ -142,10 +142,11 @@ scripts/dashboard-tunnel.sh "$DEPLOY_HOST"
 ```
 
 Keep the terminal open. Press Enter when prompted to open the one-time login link, or pass `-o` to
-open it immediately. Login redirects to a random capability path and does not set an authentication
-cookie. Treat the entire resulting address as a secret and do not bookmark, share, or paste it into
-an untrusted page. Each successful login rotates the capability and invalidates the previous address.
-`Ctrl+C` closes the tunnel.
+open it immediately. Login creates a browser-bound session protected by a random capability path and
+a path-scoped HttpOnly cookie. Copying the address into another browser does not transfer access.
+Each successful login rotates both credentials and invalidates the previous session. Use **Sign Out**
+to revoke the session explicitly. Sessions expire after 30 minutes without a dashboard request or
+eight hours in total. `Ctrl+C` closes the tunnel but does not replace **Sign Out** as revocation.
 
 ### 3. Send a safe test
 
@@ -180,9 +181,12 @@ destructive jobs. Explicit manual spam decisions and dedicated-test cleanup rema
 
 The dashboard has no public TCP listener. The tunnel helper connects local port `8765` to the
 owner-only Unix socket on the server and reads a one-time access token. Login rotates that token and
-redirects to a process-local 256-bit capability path; the dashboard does not send an authentication
-cookie. While the tab is visible, the browser performs a capability-prefixed lightweight connection
-check every 15 seconds; checks pause while the tab is hidden. The indicator changes between
+redirects to a process-local 256-bit capability path while setting a host-only, path-scoped HttpOnly
+cookie with `SameSite=Strict`. The cookie is intentionally not marked `Secure` because the supported
+transport is loopback HTTP inside the SSH tunnel, not direct HTTPS; the remote service remains an
+owner-only Unix socket with no TCP listener. While the tab is visible, the browser performs an
+authenticated lightweight connection check every 15 seconds; checks pause while the tab is hidden.
+The indicator changes between
 **Connected** and **Disconnected**, and its **Checked** timestamp updates without reloading the page.
 Use the adjacent refresh control to check immediately.
 

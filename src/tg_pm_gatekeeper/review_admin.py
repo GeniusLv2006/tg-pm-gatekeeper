@@ -14,6 +14,7 @@ import stat
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from http.cookies import CookieError, SimpleCookie
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlsplit, urlunsplit
@@ -35,6 +36,9 @@ IDENTITY_FAILURE_CACHE_SECONDS = 30
 IDENTITY_BATCH_SIZE = 100
 IDENTITY_FETCH_TIMEOUT_SECONDS = 5
 DASHBOARD_POLL_SECONDS = 15
+DASHBOARD_SESSION_IDLE_SECONDS = 30 * 60
+DASHBOARD_SESSION_ABSOLUTE_SECONDS = 8 * 60 * 60
+DASHBOARD_SESSION_COOKIE = "tg_pm_gatekeeper_session"
 PAGE_SIZE = 50
 
 
@@ -100,7 +104,7 @@ DASHBOARD_SCRIPT = r"""(() => {
   const markChanged = () => {
     if (!changeNotice) return;
     changeNotice.hidden = false;
-    document.querySelectorAll('form button').forEach((button) => {
+    document.querySelectorAll('form:not(.logout-form) button').forEach((button) => {
       button.disabled = true;
     });
   };
@@ -203,6 +207,9 @@ class ReviewAdminServer:
         self._csrf_token = secrets.token_urlsafe(32)
         self._access_token = secrets.token_urlsafe(32)
         self._capability_token = secrets.token_urlsafe(32)
+        self._session_token: str | None = None
+        self._session_started_at: float | None = None
+        self._session_last_seen_at: float | None = None
         self.access_token_path = socket_path.with_suffix(".access-token")
         self._identity_cache: dict[str, tuple[float, str | None, str | None]] = {}
 
@@ -321,17 +328,46 @@ class ReviewAdminServer:
         host = request_headers.get("host", "")
         if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
             return 400, {}, self._page("Invalid Host")
+        if parsed.path == "/logged-out":
+            if method != "GET":
+                return 405, {"Allow": "GET"}, b""
+            return 200, {}, self._page("Dashboard Signed Out")
         if parsed.path == "/login":
             token = parse_qs(parsed.query).get("token", [""])[0]
             if not secrets.compare_digest(token, self._access_token):
                 return 400, {}, self._page("Invalid Access Token")
             self._access_token = secrets.token_urlsafe(32)
             self._capability_token = secrets.token_urlsafe(32)
+            self._activate_session()
             self._write_access_token()
-            return 303, {"Location": f"/{self._capability_token}/"}, b""
+            return (
+                303,
+                {
+                    "Location": f"/{self._capability_token}/",
+                    "Set-Cookie": self._session_cookie_header(),
+                },
+                b"",
+            )
         logical_path = self._logical_path(parsed.path)
-        if logical_path is None:
+        if logical_path is None or not self._has_valid_session(request_headers):
             return 404, {}, self._page("Dashboard Access Missing")
+        if logical_path == "/logout":
+            if method != "POST":
+                return 405, {"Allow": "POST"}, b""
+            try:
+                values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+            except (UnicodeDecodeError, ValueError):
+                return 400, {}, self._page("Invalid Action Token")
+            token = values.get("token", [""])[0]
+            if not secrets.compare_digest(token, self._csrf_token):
+                return 400, {}, self._page("Invalid Action Token")
+            expired_cookie = self._expired_session_cookie_header()
+            self._invalidate_session()
+            return (
+                303,
+                {"Location": "/logged-out", "Set-Cookie": expired_cookie},
+                b"",
+            )
         logical_target = urlunsplit(parsed._replace(path=logical_path))
         status, headers, response = await self._dispatch_routes(
             method, logical_target, body
@@ -486,6 +522,62 @@ class ReviewAdminServer:
         if not secrets.compare_digest(candidate, self._capability_token):
             return None
         return "/" + parts[2] if len(parts) == 3 else "/"
+
+    def _activate_session(self) -> None:
+        now = time.monotonic()
+        self._session_token = secrets.token_urlsafe(32)
+        self._session_started_at = now
+        self._session_last_seen_at = now
+
+    def _invalidate_session(self) -> None:
+        self._session_token = None
+        self._session_started_at = None
+        self._session_last_seen_at = None
+        self._access_token = secrets.token_urlsafe(32)
+        self._capability_token = secrets.token_urlsafe(32)
+        self._write_access_token()
+
+    def _has_valid_session(self, request_headers: dict[str, str]) -> bool:
+        token = self._session_cookie_value(request_headers.get("cookie", ""))
+        if (
+            token is None
+            or self._session_token is None
+            or self._session_started_at is None
+            or self._session_last_seen_at is None
+            or not secrets.compare_digest(token, self._session_token)
+        ):
+            return False
+        now = time.monotonic()
+        if (
+            now - self._session_last_seen_at >= DASHBOARD_SESSION_IDLE_SECONDS
+            or now - self._session_started_at >= DASHBOARD_SESSION_ABSOLUTE_SECONDS
+        ):
+            return False
+        self._session_last_seen_at = now
+        return True
+
+    @staticmethod
+    def _session_cookie_value(raw_cookie: str) -> str | None:
+        cookies = SimpleCookie()
+        try:
+            cookies.load(raw_cookie)
+        except CookieError:
+            return None
+        morsel = cookies.get(DASHBOARD_SESSION_COOKIE)
+        return morsel.value if morsel is not None else None
+
+    def _session_cookie_header(self) -> str:
+        return (
+            f"{DASHBOARD_SESSION_COOKIE}={self._session_token}; "
+            f"Path=/{self._capability_token}/; Max-Age={DASHBOARD_SESSION_ABSOLUTE_SECONDS}; "
+            "HttpOnly; SameSite=Strict"
+        )
+
+    def _expired_session_cookie_header(self) -> str:
+        return (
+            f"{DASHBOARD_SESSION_COOKIE}=; Path=/{self._capability_token}/; "
+            "Max-Age=0; HttpOnly; SameSite=Strict"
+        )
 
     def _capability_headers(self, headers: dict[str, str]) -> dict[str, str]:
         location = headers.get("Location")
@@ -972,7 +1064,9 @@ class ReviewAdminServer:
             else " Every active restriction has a retained encrypted control identity."
         )
         content = (
-            self._masthead("Active Cases", f"{total} Restrictions")
+            self._masthead(
+                "Active Cases", f"{total} Restrictions", csrf_token=self._csrf_token
+            )
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
             + "<main data-live-region='active-cases'><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
             + "<h2>Review Active Restrictions</h2>"
@@ -1133,7 +1227,7 @@ class ReviewAdminServer:
             else "Leave Restriction Unchanged"
         )
         content = f"""
-        {self._masthead("Active Cases", self._human_label(item.status))}
+        {self._masthead("Active Cases", self._human_label(item.status), csrf_token=self._csrf_token)}
         <p class="back"><a href="/cases">← Active Cases</a></p>
         {self._change_notice()}
         <main class="review-grid"><section class="message-panel">
@@ -1245,7 +1339,7 @@ class ReviewAdminServer:
         )
         if message is None:
             content = f"""
-            {self._masthead("Review Item", f"Review #{item.id}")}
+            {self._masthead("Review Item", f"Review #{item.id}", csrf_token=self._csrf_token)}
             <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
             {self._change_notice()}
             <main class="review-grid">
@@ -1279,7 +1373,7 @@ class ReviewAdminServer:
             )
         text = message.message or f"[Non-text message: {type(message.media).__name__}]"
         content = f"""
-        {self._masthead("Review Item", f"Review #{item.id}")}
+        {self._masthead("Review Item", f"Review #{item.id}", csrf_token=self._csrf_token)}
         <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
         {self._change_notice()}
         <main class="review-grid">
@@ -1375,7 +1469,9 @@ class ReviewAdminServer:
         active_restrictions = active_stats["quarantined"] + active_stats["suppressed"]
         mode = self.store.get_mode()
         content = (
-            self._masthead("Operations Dashboard", mode.title())
+            self._masthead(
+                "Operations Dashboard", mode.title(), csrf_token=self._csrf_token
+            )
             + "<main data-live-region='operations'><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
             "<h2>Operations Dashboard</h2>"
             "<p>Use Active Cases for recovery after a possible false positive. "
@@ -1416,7 +1512,9 @@ class ReviewAdminServer:
         if not rows:
             rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
         return self._page(
-            self._masthead("Pending Reviews", f"{total} Pending")
+            self._masthead(
+                "Pending Reviews", f"{total} Pending", csrf_token=self._csrf_token
+            )
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
             + "<main data-live-region='pending-reviews'><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
             "<h2>Review Pending Senders</h2>"
@@ -1646,8 +1744,17 @@ class ReviewAdminServer:
         )
 
     @staticmethod
-    def _masthead(section: str, status: str) -> str:
+    def _masthead(
+        section: str, status: str, *, csrf_token: str | None = None
+    ) -> str:
         checked_at = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        logout = (
+            "<form class='logout-form' method='post' action='/logout'>"
+            f"<input type='hidden' name='token' value='{csrf_token}'>"
+            "<button type='submit'>Sign Out</button></form>"
+            if csrf_token is not None
+            else ""
+        )
         return (
             "<header class='masthead'><div><span class='mark'>TG</span>"
             "<span class='product'>PM Gatekeeper</span></div>"
@@ -1658,7 +1765,8 @@ class ReviewAdminServer:
             f"<small data-checked-at>Checked {checked_at}</small></div>"
             "<button class='refresh-control' type='button' data-dashboard-refresh "
             "aria-label='Check now' title='Check now'>↻</button></div>"
-            "</header>"
+            + logout
+            + "</header>"
         )
 
     @staticmethod
@@ -1786,8 +1894,12 @@ class ReviewAdminServer:
                     "dashboard."
                 ),
                 "Dashboard Access Missing": (
-                    "This address does not contain a valid dashboard capability. Run the "
-                    "tunnel helper again and open its new one-time link."
+                    "This address does not contain a valid dashboard session. Run the tunnel "
+                    "helper again and open its new one-time link in this browser."
+                ),
+                "Dashboard Signed Out": (
+                    "This browser session has been revoked. Run the tunnel helper again when "
+                    "you need to reopen the dashboard."
                 ),
                 "Request Failed": (
                     "The request could not be completed. No dashboard action was confirmed."
@@ -1795,7 +1907,12 @@ class ReviewAdminServer:
             }.get(content, "Check the request and return to the dashboard.")
             return_action = (
                 ""
-                if content in {"Invalid Access Token", "Dashboard Access Missing"}
+                if content
+                in {
+                    "Invalid Access Token",
+                    "Dashboard Access Missing",
+                    "Dashboard Signed Out",
+                }
                 else "<a class='button-link' href='/'>Return to Dashboard</a>"
             )
             body = (
@@ -1829,10 +1946,11 @@ class ReviewAdminServer:
 *{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}
 .masthead,main,.back{{position:relative;max-width:1120px;margin-left:auto;margin-right:auto}}
-.masthead{{display:grid;grid-template-columns:1fr auto auto;gap:2.5rem;align-items:center;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}}.masthead>div{{min-width:0}}
+.masthead{{display:grid;grid-template-columns:1fr auto auto auto;gap:2.5rem;align-items:center;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}}.masthead>div{{min-width:0}}
 .mark{{display:inline-grid;place-items:center;width:2.5rem;height:2.5rem;margin-right:.8rem;color:var(--paper);background:var(--ink);font-weight:800;letter-spacing:-.08em}}
 .product{{font-size:1.15rem;font-weight:750;letter-spacing:-.01em}}.section{{text-transform:uppercase;font:700 .72rem/1.4 var(--font-data);letter-spacing:.08em;text-align:right;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}
 .section span{{display:block;color:var(--signal);font-weight:800;margin-top:.25rem}}main{{padding:3rem 1.25rem 5rem}}
+.logout-form{{margin:0}}.logout-form button{{min-height:2.5rem;padding:.45rem .7rem;box-shadow:none;font-size:.7rem}}.logout-form button:hover{{transform:none;box-shadow:none;background:var(--field)}}
 .connection{{display:flex;align-items:center;gap:.7rem;padding:.5rem .55rem .5rem .75rem;border:1px solid var(--line);background:var(--panel)}}.connection small{{display:block;margin-top:.2rem;color:var(--muted);font:400 .65rem/1.4 var(--font-data);letter-spacing:.03em;font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.live{{display:flex;align-items:center;gap:.5rem;color:var(--safe);font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}}.live i{{width:.55rem;height:.55rem;border-radius:50%;background:#2cab76;box-shadow:0 0 0 4px #d8f0e6;animation:pulse 2s infinite}}.connection[data-state="disconnected"] .live{{color:var(--signal)}}.connection[data-state="disconnected"] .live i{{background:var(--signal);box-shadow:0 0 0 4px #f7d8cf;animation:none}}@keyframes pulse{{50%{{box-shadow:0 0 0 7px transparent}}}}.refresh-control{{display:none;width:2rem;min-height:2rem;padding:0;border-color:var(--line);box-shadow:none;font:800 1rem/1 var(--font-data)}}body[data-live-refresh] .refresh-control{{display:inline-flex}}.refresh-control:hover{{transform:none;box-shadow:none;border-color:var(--ink)}}.refresh-control:disabled{{opacity:.45}}
 .queue-intro{{max-width:none;margin-bottom:2.5rem}}h1,h2{{font-family:var(--font-ui);line-height:1.12;letter-spacing:-.025em}}.queue-intro h2{{font-size:clamp(1.85rem,3.6vw,3rem);font-weight:720;margin:.55rem 0 1rem}}
 .queue-intro p{{max-width:none;color:var(--muted)}}.refresh-note{{margin-top:1.2rem;padding-left:1rem;border-left:3px solid var(--safe);font-size:.78rem}}.eyebrow{{margin:0;text-transform:uppercase;letter-spacing:.13em;font-size:.7rem;font-weight:800;color:var(--signal)}}
@@ -1855,5 +1973,5 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions.one{{grid-template-columns:minmax(0,24rem)}}.notice,.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
 .manual-release{{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(16rem,1.4fr);gap:.75rem;align-items:end;margin-top:1.5rem}}.manual-release label{{grid-column:1/-1;font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}.manual-release input{{min-height:3.25rem;width:100%;padding:.8rem 1rem;border:1px solid var(--ink);background:var(--panel);color:var(--ink);font:700 .9rem/1.35 var(--font-data)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{width:100%;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
-@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid,.manual-release{{grid-template-columns:1fr}}}}
+@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.logout-form{{grid-column:3;grid-row:1}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid,.manual-release{{grid-template-columns:1fr}}}}
 </style>{dashboard_script}</head><body{live_attributes}>{body}</body></html>""".encode("utf-8")

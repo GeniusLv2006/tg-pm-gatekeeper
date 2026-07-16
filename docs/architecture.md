@@ -151,13 +151,17 @@ IDs and resolve names and usernames from Telegram in bounded batches. Both lists
 most-recently-updated ordering and 50-row pages. Profile names are cached only in process memory for
 five minutes; failed lookups are retried after 30 seconds. Review decisions evict the matching cached
 identity. Responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, although
-rendered identity and the capability address remain visible in the owner's browser memory and
-screenshots like any other displayed page.
+rendered identity remains visible in the owner's browser memory and screenshots like any other
+displayed page.
 
-The one-time login rotates both the access token and a random 256-bit capability path. No dashboard
-authentication cookie is set. A new successful login immediately invalidates the previous capability,
-and an absent or incorrect capability receives the same 404 response. Every internal link, form,
-script, page refresh, and status request remains beneath that path.
+The one-time login rotates the access token, a random 256-bit capability path, and an independent
+256-bit browser session token. The session token is stored only in process memory and a host-only,
+path-scoped HttpOnly cookie with `SameSite=Strict`; the capability remains in the URL. Both credentials
+are required, so copying the URL into another browser does not transfer access. A new login or
+CSRF-protected logout immediately invalidates both credentials. The server also rejects a session
+after 30 minutes without a dashboard request or eight hours from login. Missing, incorrect, expired,
+or superseded credentials receive the same 404 response. Every internal link, form, script, page
+refresh, and status request remains beneath the capability path.
 
 Authenticated dashboard pages load a same-origin script that checks the capability-prefixed status
 route every 15 seconds while the tab is visible. The status response contains only an opaque
