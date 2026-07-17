@@ -226,15 +226,20 @@ and kept only in process memory; a restart, a newer `cases` command, or expiry i
 Commands are ignored outside Saved Messages, including messages sent to private users or groups.
 Case cards contain the resolved name or username, restriction state, reason, and age. They do not
 copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved
-Messages. The cards themselves remain in Telegram until the owner deletes them. Telegram may omit
-real-time outgoing updates created by another client, so Gatekeeper also checks only Saved Messages
-newer than its startup cursor every three seconds. Commands are deduplicated across both paths and
-are never replayed from before the current service start. The fallback history query searches only
-for `/gatekeeper` matches and does not retrieve unrelated Saved Messages.
+Messages. Telegram may omit real-time outgoing updates created by another client, so Gatekeeper also
+checks only Saved Messages newer than its startup cursor every three seconds. Commands are
+deduplicated across both paths and are never replayed from before the current service start. The
+fallback history query searches only for `/gatekeeper` matches and does not retrieve unrelated Saved
+Messages.
 
 Processed command messages and all responses or case cards generated for them are automatically
-deleted after 15 minutes, matching the reply-control lifetime. Cleanup jobs are held only in process
-memory; if the service restarts during that window, delete any remaining artifacts manually.
+deleted after 15 minutes, matching the reply-control lifetime. Only their Telegram message IDs,
+deletion deadlines, and retry counts are stored in the local database; no Saved Messages text is
+persisted. Cleanup resumes after a restart and Telegram deletion failures use capped exponential
+backoff. On startup, a seven-day bounded reconciliation searches only `/gatekeeper`, `Gatekeeper`,
+and `restriction`, then retains only exact outgoing, non-forwarded Gatekeeper command or response
+templates. This removes artifacts orphaned by older process-local cleanup without deleting general
+Saved Messages or storing fetched text.
 
 Legacy restrictions without an encrypted control identity cannot be released this way. Use the
 dashboard's **Legacy Recovery** path for those cases. Pending Review decisions and detailed evidence
@@ -389,17 +394,17 @@ docker compose logs --tail=100 gatekeeper
 '
 ```
 
-For this migration, the first command must print `6`.
+For this migration, the first command must print `7`.
 
-Schema 6 adds the recoverable challenge profile and backfills every active pre-migration challenge as
-`standard`. It renames pending-review rule identifiers to evidence signals, updates decision-event
-columns without rewriting their contents, and creates the 24-hour keyed-HMAC campaign-event table.
+Schema 7 adds the persistent Saved Messages operator-artifact cleanup queue. It stores only Telegram
+message IDs, deletion deadlines, and retry counts. Schema 6 previously added the recoverable
+challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table.
 Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not
 recalculated and do not schedule a new action.
 
-Schema 6 is not writable by pre-schema-6 code. A code rollback to an earlier commit therefore also
+Schema 7 is not writable by pre-schema-7 code. A code rollback to an earlier commit therefore also
 requires the pre-migration database. Record the earlier commit before updating. If startup or live
-validation fails, keep the schema 6 database for diagnosis and restore both code and data together:
+validation fails, keep the schema 7 database for diagnosis and restore both code and data together:
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -408,11 +413,11 @@ cd /opt/tg-pm-gatekeeper
 previous_commit=REPLACE_WITH_RECORDED_COMMIT
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 docker compose down
-mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v6.$stamp.sqlite3"
+mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v7.$stamp.sqlite3"
 for suffix in -wal -shm; do
     path="/var/lib/tg-pm-gatekeeper/state.sqlite3$suffix"
     if [ -e "$path" ]; then
-        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v6.$stamp.sqlite3$suffix"
+        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v7.$stamp.sqlite3$suffix"
     fi
 done
 cp --preserve=mode,ownership,timestamps /var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3 /var/lib/tg-pm-gatekeeper/state.sqlite3
@@ -424,7 +429,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 ```
 
-Do not substitute the schema 6 database into an older image or delete the failed database before
+Do not substitute the schema 7 database into an older image or delete the failed database before
 diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt;
 do not merge the incompatible database files.
 

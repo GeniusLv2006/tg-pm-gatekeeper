@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -89,6 +89,13 @@ CREATE TABLE IF NOT EXISTS automated_messages (
 );
 CREATE INDEX IF NOT EXISTS automated_messages_created_idx
     ON automated_messages(created_at);
+CREATE TABLE IF NOT EXISTS operator_artifacts (
+    message_id INTEGER PRIMARY KEY,
+    delete_at INTEGER NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0)
+);
+CREATE INDEX IF NOT EXISTS operator_artifacts_delete_at_idx
+    ON operator_artifacts(delete_at);
 CREATE TABLE IF NOT EXISTS dialog_snapshots (
     sender_key TEXT PRIMARY KEY,
     folder_id INTEGER NOT NULL,
@@ -305,6 +312,9 @@ class StateStore:
         if version == 5:
             self._migrate_v5_to_v6()
             version = 6
+        if version == 6:
+            self._migrate_v6_to_v7()
+            version = 7
         if version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
@@ -474,6 +484,26 @@ class StateStore:
                 "ON campaign_events(fingerprint,observed_at)"
             )
             self._connection.execute("PRAGMA user_version=6")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
+
+    def _migrate_v6_to_v7(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute(
+                "CREATE TABLE IF NOT EXISTS operator_artifacts ("
+                "message_id INTEGER PRIMARY KEY,delete_at INTEGER NOT NULL,"
+                "retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count>=0))"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS operator_artifacts_delete_at_idx "
+                "ON operator_artifacts(delete_at)"
+            )
+            self._connection.execute("PRAGMA user_version=7")
         except Exception:
             if self._connection.in_transaction:
                 self._connection.execute("ROLLBACK")
@@ -1410,6 +1440,67 @@ class StateStore:
             )
         return int(cursor.lastrowid)
 
+    def schedule_operator_artifacts(
+        self, message_ids: list[int] | tuple[int, ...], delete_at: int
+    ) -> None:
+        unique_ids = tuple(dict.fromkeys(message_ids))
+        if not unique_ids:
+            return
+        if delete_at < 0 or any(message_id <= 0 for message_id in unique_ids):
+            raise ValueError("invalid operator artifact cleanup")
+        with self._lock, self._connection:
+            self._connection.executemany(
+                "INSERT INTO operator_artifacts(message_id,delete_at) VALUES (?,?) "
+                "ON CONFLICT(message_id) DO UPDATE SET "
+                "delete_at=MIN(operator_artifacts.delete_at,excluded.delete_at)",
+                ((message_id, delete_at) for message_id in unique_ids),
+            )
+
+    def due_operator_artifacts(
+        self, now: int, *, limit: int = 100
+    ) -> list[tuple[int, int]]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("invalid operator artifact limit")
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT message_id,retry_count FROM operator_artifacts "
+                "WHERE delete_at<=? ORDER BY delete_at,message_id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+        return [(int(row["message_id"]), int(row["retry_count"])) for row in rows]
+
+    def next_operator_artifact_delete_at(self) -> int | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT MIN(delete_at) AS delete_at FROM operator_artifacts"
+            ).fetchone()
+        return int(row["delete_at"]) if row and row["delete_at"] is not None else None
+
+    def complete_operator_artifacts(
+        self, message_ids: list[int] | tuple[int, ...]
+    ) -> None:
+        unique_ids = tuple(dict.fromkeys(message_ids))
+        if not unique_ids:
+            return
+        with self._lock, self._connection:
+            self._connection.executemany(
+                "DELETE FROM operator_artifacts WHERE message_id=?",
+                ((message_id,) for message_id in unique_ids),
+            )
+
+    def retry_operator_artifacts(
+        self, message_ids: list[int] | tuple[int, ...], retry_at: int
+    ) -> None:
+        unique_ids = tuple(dict.fromkeys(message_ids))
+        if not unique_ids:
+            return
+        with self._lock, self._connection:
+            self._connection.executemany(
+                "UPDATE operator_artifacts SET delete_at=?,retry_count=retry_count+1 "
+                "WHERE message_id=?",
+                ((retry_at, message_id) for message_id in unique_ids),
+            )
+
     def pending_actions(self) -> list[PendingAction]:
         with self._lock:
             rows = self._connection.execute(
@@ -1944,6 +2035,16 @@ class StateStore:
                     "SELECT COUNT(*) FROM pending_actions WHERE status='failed'"
                 ).fetchone()[0]
             )
+            operator_cleanup_pending = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM operator_artifacts"
+                ).fetchone()[0]
+            )
+            operator_cleanup_retrying = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM operator_artifacts WHERE retry_count>0"
+                ).fetchone()[0]
+            )
         result: dict[str, int | str | None] = {
             "mode": self.get_mode(),
             "allowed": states.get("allowed", 0),
@@ -1957,6 +2058,8 @@ class StateStore:
             "pending_reviews": pending_reviews,
             "pending_actions": pending_actions,
             "action_failures": action_failures,
+            "operator_cleanup_pending": operator_cleanup_pending,
+            "operator_cleanup_retrying": operator_cleanup_retrying,
             "heartbeat": int(heartbeat["value"]) if heartbeat else None,
             "challenge_sent_7d": challenge_metrics.get("CHALLENGE_SENT", 0),
             "challenge_correct_7d": challenge_metrics.get("CHALLENGE_CORRECT", 0),

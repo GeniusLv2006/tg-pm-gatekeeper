@@ -133,7 +133,8 @@ the dialog, allow the sender, and cancel pending Gatekeeper deletion jobs. The o
 accepted only from the logged-in account in its own Saved Messages; case cards contain identity and
 restriction metadata, not retained message evidence. Responses can take a few seconds when Telegram
 does not deliver another device's outgoing-message update in real time. Gatekeeper automatically
-deletes processed commands and all replies or case cards they create after 15 minutes.
+deletes processed commands and all replies or case cards they create after 15 minutes. Cleanup is
+persisted and resumes after a service restart; Telegram deletion failures are retried automatically.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
 referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Permanently
