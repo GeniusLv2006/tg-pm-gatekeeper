@@ -65,6 +65,8 @@ flow, see [Architecture](docs/architecture.md).
   incomplete, authenticated encrypted short-lived references needed for message review, and a
   separate encrypted control identity containing only Telegram user ID and access hash for each
   active quarantine or suppression.
+- Saved Messages operator cleanup stores only artifact message IDs, deletion deadlines, and retry
+  counts. It never persists command, response, case-card, or unrelated Saved Messages text.
 - Raw user IDs, usernames, profile names, and message content are not stored in plaintext.
 - Cross-sender campaign detection stores only a keyed HMAC fingerprint, an already-derived sender
   key, and a timestamp for at most 24 hours. Canonical text, raw URLs, and reversible hashes must not

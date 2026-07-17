@@ -173,6 +173,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.adapter._operator_command_lock = asyncio.Lock()
         self.adapter._operator_sync_cursor = 0
         self.adapter._operator_handled_message_ids = {}
+        self.adapter._operator_cleanup_wakeup = asyncio.Event()
         self.adapter.schedule_operator_artifact_deletion = Mock()
         self.adapter._restriction_actions = SimpleNamespace(allow=AsyncMock())
         self.adapter.client = SimpleNamespace(
@@ -253,13 +254,96 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_operator_artifacts_are_deleted_after_control_ttl(self) -> None:
         self.adapter.client.delete_messages = AsyncMock()
-        with patch("tg_pm_gatekeeper.telegram_adapter.asyncio.sleep") as sleep:
-            await self.adapter._operator_artifact_deletion_worker((10, 11, 12))
-
-        sleep.assert_awaited_once_with(15 * 60)
+        self.adapter.schedule_operator_artifact_deletion = (
+            TelegramAdapter.schedule_operator_artifact_deletion.__get__(self.adapter)
+        )
+        with patch("tg_pm_gatekeeper.telegram_adapter.time.time", return_value=100):
+            self.adapter.schedule_operator_artifact_deletion([10, 11, 12])
+        self.assertEqual(self.store.due_operator_artifacts(999), [])
+        self.assertTrue(await self.adapter._delete_due_operator_artifacts(1000))
         self.adapter.client.delete_messages.assert_awaited_once_with(
             "me", [10, 11, 12], revoke=True
         )
+        self.assertEqual(self.store.due_operator_artifacts(1000), [])
+
+    async def test_operator_artifact_deletion_failure_is_persisted_for_retry(
+        self,
+    ) -> None:
+        self.adapter.client.delete_messages = AsyncMock(
+            side_effect=RuntimeError("synthetic deletion failure")
+        )
+        self.store.schedule_operator_artifacts([10, 11], 1000)
+
+        self.assertTrue(await self.adapter._delete_due_operator_artifacts(1000))
+
+        self.assertEqual(self.store.due_operator_artifacts(1029), [])
+        self.assertEqual(self.store.due_operator_artifacts(1030), [(10, 1), (11, 1)])
+        self.assertEqual(
+            self.store.statistics(now=1030)["operator_cleanup_retrying"], 2
+        )
+
+    async def test_startup_reconciles_only_recognized_operator_artifacts(self) -> None:
+        now = int(time.time())
+        recognized = SimpleNamespace(
+            id=10,
+            out=True,
+            fwd_from=None,
+            message=(
+                "Gatekeeper Active Case\n\n"
+                "Sender: Synthetic Sender\n"
+                "State: Suppressed\n"
+                "Reason: Synthetic Rule\n"
+                "Updated: 10 minutes ago\n\n"
+                "Reply to this message with /gatekeeper allow\n"
+                "This control is single-use and expires in 15 minutes."
+            ),
+            date=datetime.fromtimestamp(now - 1000, timezone.utc),
+        )
+        command = SimpleNamespace(
+            id=11,
+            out=True,
+            fwd_from=None,
+            message="/gatekeeper cases",
+            date=datetime.fromtimestamp(now - 10, timezone.utc),
+        )
+        unrelated = SimpleNamespace(
+            id=12,
+            out=True,
+            fwd_from=None,
+            message="Personal note about Gatekeeper architecture",
+            date=datetime.fromtimestamp(now - 1000, timezone.utc),
+        )
+        forwarded = SimpleNamespace(
+            id=13,
+            out=True,
+            fwd_from=SimpleNamespace(from_id=2000),
+            message="/gatekeeper cases",
+            date=datetime.fromtimestamp(now - 1000, timezone.utc),
+        )
+        self.adapter.client.get_messages = AsyncMock(
+            side_effect=[
+                [command, forwarded],
+                [recognized, unrelated],
+                [],
+            ]
+        )
+
+        with patch("tg_pm_gatekeeper.telegram_adapter.time.time", return_value=now):
+            await self.adapter._reconcile_operator_artifacts()
+
+        self.assertEqual(self.store.due_operator_artifacts(now), [(10, 0)])
+        self.assertEqual(self.store.next_operator_artifact_delete_at(), now)
+        rows = self.store._connection.execute(
+            "SELECT message_id,delete_at FROM operator_artifacts ORDER BY message_id"
+        ).fetchall()
+        self.assertEqual(
+            [(int(row["message_id"]), int(row["delete_at"])) for row in rows],
+            [(10, now), (11, now + 890)],
+        )
+        database_files = Path(self.temp.name).glob("state.sqlite3*")
+        persisted = b"".join(path.read_bytes() for path in database_files)
+        self.assertNotIn(b"Synthetic Sender", persisted)
+        self.assertNotIn(b"Personal note", persisted)
 
     async def test_cases_create_reply_bound_controls_without_evidence(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -732,6 +816,8 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         adapter._recover_challenges = AsyncMock()
         adapter._recover_test_sender_cleanup = AsyncMock()
         adapter._recover_pending_actions = AsyncMock()
+        adapter._reconcile_operator_artifacts = AsyncMock()
+        adapter._operator_artifact_cleanup_loop = AsyncMock()
         adapter._review_admin = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
         adapter._timeout_tasks = {}
         adapter._maintenance_tasks = set()
@@ -787,6 +873,7 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         enabled._heartbeat_loop = AsyncMock(side_effect=wait_forever)
         await enabled.run()
         self.assertEqual(enabled.client.add_event_handler.call_count, 2)
+        enabled._reconcile_operator_artifacts.assert_awaited_once()
 
 
 if __name__ == "__main__":

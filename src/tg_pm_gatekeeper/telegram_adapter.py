@@ -38,6 +38,13 @@ OPERATOR_CONTROL_TTL_SECONDS = 15 * 60
 OPERATOR_IDENTITY_TIMEOUT_SECONDS = 5
 OPERATOR_SYNC_INTERVAL_SECONDS = 3
 OPERATOR_SYNC_BATCH_LIMIT = 100
+OPERATOR_CLEANUP_BATCH_LIMIT = 100
+OPERATOR_CLEANUP_RETRY_BASE_SECONDS = 30
+OPERATOR_CLEANUP_RETRY_MAX_SECONDS = 60 * 60
+OPERATOR_CLEANUP_POLL_SECONDS = 60
+OPERATOR_ORPHAN_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
+OPERATOR_ORPHAN_SEARCH_LIMIT = 200
+OPERATOR_ORPHAN_SEARCH_QUERIES = ("/gatekeeper", "Gatekeeper", "restriction")
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
     "⚠️ Verification Required",
@@ -341,6 +348,7 @@ class TelegramAdapter:
         self._operator_command_lock = asyncio.Lock()
         self._operator_sync_cursor: int | None = None
         self._operator_handled_message_ids: dict[int, float] = {}
+        self._operator_cleanup_wakeup = asyncio.Event()
         self._restriction_actions = RestrictionActions(
             store,
             service,
@@ -366,6 +374,7 @@ class TelegramAdapter:
         self._self_user_id = int(me.id)
         if self.settings.telegram_operator_controls_enabled:
             await self._initialize_operator_sync_cursor()
+            await self._reconcile_operator_artifacts()
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
         await self._recover_pending_actions()
@@ -378,6 +387,7 @@ class TelegramAdapter:
                 self._on_operator_message, events.NewMessage(outgoing=True)
             )
             self._track_maintenance_task(self._operator_sync_loop())
+            self._track_maintenance_task(self._operator_artifact_cleanup_loop())
         disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         LOG.info("service_started")
@@ -606,6 +616,88 @@ class TelegramAdapter:
                 await self._on_operator_message(message)
             if len(messages) < OPERATOR_SYNC_BATCH_LIMIT:
                 return
+
+    async def _reconcile_operator_artifacts(self) -> None:
+        now = int(time.time())
+        cutoff = now - OPERATOR_ORPHAN_LOOKBACK_SECONDS
+        artifacts: dict[int, int] = {}
+        try:
+            for query in OPERATOR_ORPHAN_SEARCH_QUERIES:
+                messages = await self.client.get_messages(
+                    "me",
+                    limit=OPERATOR_ORPHAN_SEARCH_LIMIT,
+                    search=query,
+                )
+                for message in messages:
+                    message_id = getattr(message, "id", None)
+                    sent_at = getattr(message, "date", None)
+                    if (
+                        not isinstance(message_id, int)
+                        or not isinstance(sent_at, datetime)
+                        or int(sent_at.timestamp()) < cutoff
+                        or not bool(getattr(message, "out", False))
+                        or getattr(message, "fwd_from", None) is not None
+                        or not self._is_operator_artifact_text(
+                            getattr(message, "message", "")
+                        )
+                    ):
+                        continue
+                    artifacts[message_id] = max(
+                        now,
+                        int(sent_at.timestamp()) + OPERATOR_CONTROL_TTL_SECONDS,
+                    )
+        except Exception:
+            LOG.warning("operator_artifact_reconciliation_failed")
+            return
+        if not artifacts:
+            return
+        for message_id, delete_at in artifacts.items():
+            self.store.schedule_operator_artifacts([message_id], delete_at)
+        self._operator_cleanup_wakeup.set()
+        LOG.info("operator_artifacts_reconciled")
+
+    @staticmethod
+    def _is_operator_artifact_text(value: object) -> bool:
+        text = str(value or "").strip()
+        if text == "/gatekeeper" or text.startswith("/gatekeeper "):
+            return True
+        if text in {
+            TelegramAdapter._operator_help(),
+            "✅ Gatekeeper operator controls are online.",
+            "Unknown Gatekeeper command. Send /gatekeeper help.",
+            "❌ Gatekeeper could not process that operator command.",
+            "✅ Gatekeeper has no active restrictions.",
+            "Reply to a current case from /gatekeeper cases. "
+            "Case controls expire after 15 minutes.",
+            "✅ Restriction removed. The sender is now allowed and pending "
+            "Gatekeeper deletion jobs were cancelled.",
+            "ℹ️ This restriction was already resolved. No action was taken.",
+            "⚠️ Telegram identity is unavailable. Use Dashboard legacy recovery.",
+            "❌ Telegram restore failed. The restriction was left unchanged.",
+        }:
+            return True
+        if text.startswith("Gatekeeper Active Cases · showing "):
+            counts = text.removeprefix("Gatekeeper Active Cases · showing ").split(
+                " of ", 1
+            )
+            return len(counts) == 2 and all(value.isdecimal() for value in counts)
+        lines = text.splitlines()
+        return (
+            len(lines) >= 8
+            and lines[0] == "Gatekeeper Active Case"
+            and lines[1] == ""
+            and lines[2].startswith("Sender: ")
+            and lines[3].startswith("State: ")
+            and lines[4].startswith("Reason: ")
+            and lines[5].startswith("Updated: ")
+            and lines[6] == ""
+            and "\n".join(lines[7:])
+            in {
+                "Reply to this message with /gatekeeper allow\n"
+                "This control is single-use and expires in 15 minutes.",
+                "Telegram identity is unavailable. Use Dashboard legacy recovery.",
+            }
+        )
 
     async def _send_operator_cases(self, event, artifact_ids: list[int]) -> None:
         self._operator_case_controls.clear()
@@ -941,21 +1033,56 @@ class TelegramAdapter:
 
     def schedule_operator_artifact_deletion(self, message_ids: list[int]) -> None:
         unique_ids = tuple(dict.fromkeys(message_ids))
-        self._track_maintenance_task(
-            self._operator_artifact_deletion_worker(unique_ids)
+        self.store.schedule_operator_artifacts(
+            unique_ids,
+            int(time.time()) + OPERATOR_CONTROL_TTL_SECONDS,
         )
+        self._operator_cleanup_wakeup.set()
 
-    async def _operator_artifact_deletion_worker(
-        self, message_ids: tuple[int, ...]
-    ) -> None:
+    async def _operator_artifact_cleanup_loop(self) -> None:
+        while True:
+            now = int(time.time())
+            if await self._delete_due_operator_artifacts(now):
+                continue
+            next_delete_at = self.store.next_operator_artifact_delete_at()
+            delay = OPERATOR_CLEANUP_POLL_SECONDS
+            if next_delete_at is not None:
+                delay = max(
+                    0,
+                    min(OPERATOR_CLEANUP_POLL_SECONDS, next_delete_at - now),
+                )
+            self._operator_cleanup_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self._operator_cleanup_wakeup.wait(), timeout=delay
+                )
+            except TimeoutError:
+                pass
+
+    async def _delete_due_operator_artifacts(self, now: int) -> bool:
+        due = self.store.due_operator_artifacts(
+            now, limit=OPERATOR_CLEANUP_BATCH_LIMIT
+        )
+        if not due:
+            return False
+        message_ids = [message_id for message_id, _ in due]
         try:
-            await asyncio.sleep(OPERATOR_CONTROL_TTL_SECONDS)
-            await self.client.delete_messages("me", list(message_ids), revoke=True)
-            LOG.info("operator_artifacts_deleted")
+            await self.client.delete_messages("me", message_ids, revoke=True)
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception:
+            retry_count = max(count for _, count in due) + 1
+            retry_delay = min(
+                OPERATOR_CLEANUP_RETRY_MAX_SECONDS,
+                OPERATOR_CLEANUP_RETRY_BASE_SECONDS
+                * (2 ** min(retry_count - 1, 7)),
+            )
+            self.store.retry_operator_artifacts(message_ids, now + retry_delay)
             LOG.warning("operator_artifact_deletion_failed")
+        else:
+            self.store.complete_operator_artifacts(message_ids)
+            LOG.info("operator_artifacts_deleted")
+        return True
 
     def schedule_test_message_deletion(
         self, peer, sender_key: str, since: int, delete_at: int

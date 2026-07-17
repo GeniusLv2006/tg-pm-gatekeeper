@@ -215,17 +215,21 @@ sends metadata-only case cards; it does not decrypt or copy Active Case message 
 actionable card's Telegram message ID maps to a derived sender key in process memory for 15 minutes.
 Replying to that exact card with `/gatekeeper allow` consumes the mapping, rechecks the restriction
 under the sender lock, restores the dialog, allows the sender, and cancels pending work. Restart,
-expiry, or a newer case listing invalidates earlier mappings. Telegram retains the case-card messages
-until the owner deletes them. Because Telegram may not deliver another device's outgoing Saved
-Messages as a real-time update, the enabled runtime also advances an in-memory message-ID cursor by
-polling only messages newer than its startup baseline every three seconds. Real-time and polled paths
-share a 15-minute message-ID deduplication map, so a delayed update cannot execute a command twice.
-The history query is restricted to `/gatekeeper` search matches rather than reading unrelated Saved
-Messages. The cursor is never persisted, preventing pre-start commands from replaying after a restart.
-Each processed command and every reply or case card created for it are collected as one in-memory
-artifact set and deleted from Saved Messages when the 15-minute control window ends. A service
-restart cancels unpersisted cleanup jobs, so Telegram artifacts from an interrupted window may
-require manual deletion.
+expiry, or a newer case listing invalidates earlier mappings. Because Telegram may not deliver
+another device's outgoing Saved Messages as a real-time update, the enabled runtime also advances an
+in-memory message-ID cursor by polling only messages newer than its startup baseline every three
+seconds. Real-time and polled paths share a 15-minute message-ID deduplication map, so a delayed update
+cannot execute a command twice. The cursor is never persisted, preventing pre-start commands from
+replaying after a restart.
+
+Each processed command and every reply or case card created for it are collected as one artifact set.
+Schema 7 persists only the Telegram message IDs, deletion deadlines, and retry counts. A maintenance
+loop deletes due batches after 15 minutes, removes rows only after Telegram confirms deletion, and
+uses capped exponential backoff after failures. Restarting the service recovers the queue. To repair
+artifacts left by the older process-local implementation, startup performs a seven-day bounded search
+using only `/gatekeeper`, `Gatekeeper`, and `restriction`; it schedules only outgoing, non-forwarded
+messages whose complete text matches a known command or generated-response template. Fetched text is
+not persisted or logged, and general Saved Messages are not enumerated.
 
 ## Implemented action policy
 

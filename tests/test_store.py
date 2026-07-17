@@ -170,6 +170,32 @@ class StoreTests(unittest.TestCase):
         self.store.prune(1, now=86_501)
         self.assertFalse(self.store.is_automated_message("sender", 42))
 
+    def test_operator_artifact_cleanup_survives_restart_and_retries(self) -> None:
+        self.store.schedule_operator_artifacts([10, 11, 10], 200)
+        self.assertEqual(self.store.next_operator_artifact_delete_at(), 200)
+        self.assertEqual(self.store.due_operator_artifacts(199), [])
+        self.assertEqual(
+            self.store.statistics(now=199)["operator_cleanup_pending"], 2
+        )
+
+        self.store.close()
+        self.store = StateStore(Path(self.temp.name) / "state.sqlite3")
+        self.assertEqual(self.store.due_operator_artifacts(200), [(10, 0), (11, 0)])
+
+        self.store.retry_operator_artifacts([10], 230)
+        self.store.complete_operator_artifacts([11])
+        self.assertEqual(self.store.due_operator_artifacts(229), [])
+        self.assertEqual(self.store.due_operator_artifacts(230), [(10, 1)])
+        statistics = self.store.statistics(now=230)
+        self.assertEqual(statistics["operator_cleanup_pending"], 1)
+        self.assertEqual(statistics["operator_cleanup_retrying"], 1)
+
+        self.store.complete_operator_artifacts([10])
+        self.assertIsNone(self.store.next_operator_artifact_delete_at())
+        self.assertEqual(
+            self.store.statistics(now=230)["operator_cleanup_pending"], 0
+        )
+
     def test_heartbeat_health(self) -> None:
         self.store.heartbeat(100)
         self.assertTrue(self.store.healthy(now=95))
@@ -513,7 +539,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -528,6 +554,7 @@ class StoreMigrationTests(unittest.TestCase):
             }
             self.assertIn("automated_messages", tables)
             self.assertIn("enforcement_reviews", tables)
+            self.assertIn("operator_artifacts", tables)
         finally:
             store.close()
 
@@ -551,7 +578,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                6,
+                7,
             )
         finally:
             reopened.close()
@@ -585,7 +612,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.sender("sender").revision, 0)
             self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 6
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 7
             )
         finally:
             store.close()
@@ -605,7 +632,7 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
             )
         finally:
             reopened.close()
@@ -629,7 +656,7 @@ class StoreMigrationTests(unittest.TestCase):
             }
             self.assertIn("restriction_reference", columns)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
             )
         finally:
             reopened.close()
@@ -663,7 +690,7 @@ class StoreMigrationTests(unittest.TestCase):
                 reopened.outbound_statistics(now=1001)["outbound_total_1h"], 2
             )
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
             )
         finally:
             reopened.close()
@@ -718,8 +745,29 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(legacy_state.suppression_reason, "critical_rule")
             self.assertEqual(reopened.pending_actions(), [])
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 6
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
             )
+        finally:
+            reopened.close()
+
+    def test_v6_database_adds_operator_artifact_cleanup_queue(self) -> None:
+        store = StateStore(self.path)
+        store._connection.executescript(
+            "DROP TABLE operator_artifacts; PRAGMA user_version=6;"
+        )
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            table = reopened._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='operator_artifacts'"
+            ).fetchone()
+            self.assertIsNotNone(table)
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
+            )
+            self.assertEqual(reopened.due_operator_artifacts(100), [])
         finally:
             reopened.close()
 
@@ -727,18 +775,18 @@ class StoreMigrationTests(unittest.TestCase):
         store = StateStore(self.path)
         store.close()
         connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA user_version=7")
+        connection.execute("PRAGMA user_version=8")
         connection.close()
 
         with self.assertRaisesRegex(
-            StoreMigrationError, "unsupported database schema version: 7"
+            StoreMigrationError, "unsupported database schema version: 8"
         ):
             StateStore(self.path)
 
         connection = sqlite3.connect(self.path)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 7
+                connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
         finally:
             connection.close()
