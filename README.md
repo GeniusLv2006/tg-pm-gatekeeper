@@ -31,12 +31,14 @@ public administration port.
 | Mode | What happens to unknown senders | Telegram changes |
 | --- | --- | --- |
 | `monitor` (default) | Records what Gatekeeper would have done for your review | None |
-| `protect` | Applies the adaptive-v1 policy: standard challenge, strict challenge, or permanent suppression | Yes |
+| `protect` | Applies the adaptive-v2 policy: standard challenge, strict challenge, or permanent suppression | Yes |
 
 Permanent suppression requires either a non-quoted owner-denied domain or a corroborated repeated
-campaign across different senders. Strict challenges allow one numeric attempt; a wrong answer or
-timeout warns before deleting the dialog and suppresses the sender for 24 hours. The arithmetic check
-adds interaction friction; it is not a CAPTCHA or proof that a sender is human.
+campaign template across different senders. Repeated campaigns must also be promotional, contain
+multiple links, and be forwarded or carried by a promotional Telegram webpage preview. Strict
+challenges allow one numeric attempt; a wrong answer or timeout warns before deleting the dialog and
+suppresses the sender for 24 hours. The arithmetic check adds interaction friction; it is not a
+CAPTCHA or proof that a sender is human.
 
 ## Project direction
 
@@ -49,9 +51,9 @@ commitment or compatibility promise; priorities and interfaces may change before
 - The dashboard is intentionally limited to **Pending Reviews** and **Active Cases**. The standalone
   labeling workflow was removed after the local model-training direction was abandoned because the
   available sample volume was not sufficient.
-- The `adaptive-v1` weights, thresholds, and destructive gates are code-versioned. They cannot be
-  changed through environment variables; changing an automatic-deletion boundary requires tests and
-  normal code review.
+- The `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned.
+  They cannot be changed through environment variables; changing an automatic-deletion boundary
+  requires tests and normal code review.
 
 The current release does not send message content to an AI provider. Features documented elsewhere
 in this repository describe shipped behavior unless they are explicitly marked as a possible

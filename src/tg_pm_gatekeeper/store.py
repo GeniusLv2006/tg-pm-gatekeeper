@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA_VERSION = 7
+CAMPAIGN_WINDOW_SECONDS = 7 * 24 * 3600
 SENDER_STATUSES = (
     "unknown",
     "challenge_issuing",
@@ -1741,7 +1742,7 @@ class StateStore:
         fingerprint: str,
         sender_key: str,
         *,
-        window_seconds: int = 24 * 3600,
+        window_seconds: int = CAMPAIGN_WINDOW_SECONDS,
         now: int | None = None,
     ) -> int:
         timestamp = int(time.time()) if now is None else now
@@ -1952,7 +1953,7 @@ class StateStore:
             )
             self._connection.execute(
                 "DELETE FROM campaign_events WHERE observed_at < ?",
-                (timestamp - 24 * 3600,),
+                (timestamp - CAMPAIGN_WINDOW_SECONDS,),
             )
             self._connection.execute(
                 "DELETE FROM automated_messages WHERE created_at < ?", (cutoff,)
@@ -2012,7 +2013,8 @@ class StateStore:
                 row["assessment"]: int(row["count"])
                 for row in self._connection.execute(
                     "SELECT assessment, COUNT(*) AS count FROM decision_events "
-                    "WHERE created_at>=? AND policy_version='adaptive-v1' "
+                    "WHERE created_at>=? "
+                    "AND policy_version IN ('adaptive-v1','adaptive-v2') "
                     "GROUP BY assessment",
                     (timestamp - 7 * 86400,),
                 )
@@ -2020,7 +2022,7 @@ class StateStore:
             repeated_campaigns = int(
                 self._connection.execute(
                     "SELECT COUNT(*) FROM decision_events WHERE created_at>=? "
-                    "AND policy_version='adaptive-v1' "
+                    "AND policy_version IN ('adaptive-v1','adaptive-v2') "
                     "AND signals LIKE '%\"code\":\"REPEATED_CAMPAIGN\"%'",
                     (timestamp - 7 * 86400,),
                 ).fetchone()[0]

@@ -721,7 +721,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 "text": "synthetic",
                 "signals": [
                     {
-                        "code": "PROMOTIONAL_LANGUAGE",
+                        "code": "PREVIEW_PROMOTIONAL_LANGUAGE",
                         "source": "preview",
                         "weight": 20,
                         "explanation": explanation,
@@ -731,7 +731,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 "challenge_profile": "strict",
                 "planned_action": "strict_challenge",
                 "decision_basis": "risk_score_requires_strict_challenge",
-                "policy_version": "adaptive-v1",
+                "policy_version": "adaptive-v2",
                 "features": {},
             }
         )
@@ -760,6 +760,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"class=\"policy-map\"", detail)
         self.assertIn(b"Risk score 30; strict challenge starts at 30", detail)
         self.assertIn(b"<strong>30</strong><small>additive points", detail)
+        self.assertIn(b"<span class=\"policy-version\">adaptive-v2</span>", detail)
         self.assertIn(b"not a probability", detail)
         self.assertIn(b"<strong>30 \xe2\x89\xa5 70</strong>", detail)
         self.assertIn(b"gate-check unmet", detail)
@@ -773,7 +774,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"background:var(--field);color:var(--ink)", detail)
         self.assertNotIn(b"background:var(--ink);color:#f7f1df", detail)
         self.assertIn(b"<ol class='signal-list' aria-label='Evidence signals'>", detail)
-        self.assertIn(b"<strong>Promotional Language</strong>", detail)
+        self.assertIn(b"<strong>Preview Promotional Language</strong>", detail)
         self.assertIn(b"<span class='signal-source'>Preview</span>", detail)
         self.assertIn(b"<span class='signal-score'>+20</span>", detail)
         self.assertIn(b"Telegram &lt;preview&gt; metadata", detail)

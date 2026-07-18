@@ -270,7 +270,7 @@ expires. **Allow Now** restores saved dialog settings when available; cases with
 are moved to the main folder and notifications are enabled. The second action records that the
 restriction was left unchanged and does not extend a temporary suppression.
 
-New `adaptive-v1` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and
+New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and
 **Evidence Signals**, including each signal's source, weight, and explanation. Schema 1 through 4
 snapshots show `Legacy HR Decision · recorded under rules-v2; not recalculated`; the migration does
 not reclassify them or add an action.

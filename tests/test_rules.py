@@ -114,7 +114,9 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(authored["PROMOTIONAL_LANGUAGE"].source, "authored")
 
         preview = self.signal_map(MessageFacts(preview_text="推广联盟"))
-        self.assertEqual(preview["PROMOTIONAL_LANGUAGE"].source, "preview")
+        self.assertEqual(
+            preview["PREVIEW_PROMOTIONAL_LANGUAGE"].source, "preview"
+        )
 
         forwarded_buttons = self.signal_map(
             MessageFacts(
@@ -304,6 +306,104 @@ class RuleTests(unittest.TestCase):
             campaign_candidate(first, detect_evidence_signals(first)),
             campaign_candidate(second, detect_evidence_signals(second)),
         )
+
+    def test_campaign_template_ignores_rotating_domains_and_invite_tokens(self) -> None:
+        def campaign(domain: str, first_invite: str, second_invite: str) -> MessageFacts:
+            quote = (
+                f"888联盟网址 https://{domain}\n"
+                f"888联盟频道 https://t.me/+{first_invite}\n"
+                f"乔治引流代发 https://t.me/+{second_invite}"
+            )
+            return MessageFacts(
+                text="在吗",
+                quote_text=quote,
+                quote_urls=(
+                    f"https://{domain}",
+                    f"https://t.me/+{first_invite}",
+                    f"https://t.me/+{second_invite}",
+                ),
+                quote_domains=(domain, "t.me"),
+                is_forwarded=True,
+            )
+
+        first = campaign("h4226.invalid", "firstToken", "secondToken")
+        second = campaign("h5388.invalid", "thirdToken", "fourthToken")
+        self.assertEqual(
+            campaign_candidate(first, detect_evidence_signals(first)),
+            campaign_candidate(second, detect_evidence_signals(second)),
+        )
+
+    def test_campaign_template_preserves_surrounding_text_and_link_shape(self) -> None:
+        first = MessageFacts(
+            quote_text="联盟推广甲 https://first.invalid https://t.me/+first",
+            quote_urls=("https://first.invalid", "https://t.me/+first"),
+        )
+        different_text = MessageFacts(
+            quote_text="联盟推广乙 https://second.invalid https://t.me/+second",
+            quote_urls=("https://second.invalid", "https://t.me/+second"),
+        )
+        different_shape = MessageFacts(
+            quote_text="联盟推广甲 https://third.invalid https://fourth.invalid",
+            quote_urls=("https://third.invalid", "https://fourth.invalid"),
+        )
+        first_candidate = campaign_candidate(first, detect_evidence_signals(first))
+        self.assertNotEqual(
+            first_candidate,
+            campaign_candidate(different_text, detect_evidence_signals(different_text)),
+        )
+        self.assertNotEqual(
+            first_candidate,
+            campaign_candidate(
+                different_shape, detect_evidence_signals(different_shape)
+            ),
+        )
+
+    def test_campaign_template_normalizes_hidden_entity_targets(self) -> None:
+        first = MessageFacts(
+            quote_text="联盟推广 click join",
+            quote_urls=("https://first.invalid/path", "https://t.me/+first"),
+        )
+        second = MessageFacts(
+            quote_text="联盟推广 click join",
+            quote_urls=("https://second.invalid/other", "https://t.me/+second"),
+        )
+        self.assertEqual(
+            campaign_candidate(first, detect_evidence_signals(first)),
+            campaign_candidate(second, detect_evidence_signals(second)),
+        )
+
+    def test_single_link_promotion_does_not_seed_campaign_detection(self) -> None:
+        facts = MessageFacts(
+            text="联盟推广 https://single.invalid",
+            urls=("https://single.invalid",),
+            domains=("single.invalid",),
+        )
+        self.assertIsNone(campaign_candidate(facts, detect_evidence_signals(facts)))
+
+    def test_richard_preview_scores_strict_without_permanent_suppression(self) -> None:
+        post = "https://t.me/hysqguangfang/917"
+        invite = "https://t.me/+syntheticInvite"
+        facts = MessageFacts(
+            text=post,
+            preview_text=(
+                "Telegram 汇盈俱乐部 七年合约社区交流群: "
+                f"{invite} 免费带单 70%返佣 BTC/ETH 行情分析"
+            ),
+            urls=(post, invite),
+            domains=("t.me",),
+            preview_urls=(post, invite),
+        )
+        decision = self.policy.decide(detect_evidence_signals(facts))
+        self.assertEqual(
+            {signal.code: signal.weight for signal in decision.signals},
+            {
+                "TELEGRAM_INVITE": 10,
+                "MULTIPLE_LINKS": 15,
+                "PREVIEW_PROMOTIONAL_LANGUAGE": 20,
+            },
+        )
+        self.assertEqual(decision.risk_score, 45)
+        self.assertEqual(decision.planned_action, "strict_challenge")
 
     def test_nonpromotional_message_has_no_campaign_candidate(self) -> None:
         facts = MessageFacts(

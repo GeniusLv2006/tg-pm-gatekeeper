@@ -448,13 +448,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         payload = self.review_protector.open(row["envelope"])
         self.assertEqual(payload["schema_version"], 5)
-        self.assertEqual(payload["policy_version"], "adaptive-v1")
+        self.assertEqual(payload["policy_version"], "adaptive-v2")
         self.assertEqual(payload["risk_score"], 30)
         self.assertEqual(payload["challenge_profile"], "strict")
         self.assertEqual(payload["planned_action"], "strict_challenge")
         self.assertEqual(
             {signal["code"] for signal in payload["signals"]},
-            {"TELEGRAM_INVITE", "PROMOTIONAL_LANGUAGE"},
+            {"TELEGRAM_INVITE", "PREVIEW_PROMOTIONAL_LANGUAGE"},
         )
 
     async def test_denied_domain_schedules_silent_permanent_suppression(self) -> None:
@@ -625,22 +625,34 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         self.store.set_mode("protect")
 
-        def campaign(opener: str) -> MessageFacts:
+        def campaign(
+            opener: str,
+            domain: str,
+            first_invite: str,
+            second_invite: str,
+        ) -> MessageFacts:
             return MessageFacts(
                 text=opener,
                 quote_text=(
-                    "联盟推广 https://landing.invalid/offer "
-                    "https://t.me/+syntheticInvite"
+                    f"888联盟网址 https://{domain}\n"
+                    f"888联盟频道 https://t.me/+{first_invite}\n"
+                    f"乔治引流代发 https://t.me/+{second_invite}"
                 ),
                 quote_urls=(
-                    "https://landing.invalid/offer",
-                    "https://t.me/+syntheticInvite",
+                    f"https://{domain}",
+                    f"https://t.me/+{first_invite}",
+                    f"https://t.me/+{second_invite}",
                 ),
-                quote_domains=("landing.invalid", "t.me"),
+                quote_domains=(domain, "t.me"),
                 is_forwarded=True,
             )
 
-        first = campaign("在吗")
+        first = campaign(
+            "在吗",
+            "h4226.invalid",
+            "firstInvite",
+            "secondInvite",
+        )
         self.assertEqual(
             await self.service.handle(
                 self.message(1, first.text, first, sender_id=111_111_111),
@@ -649,7 +661,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             "challenged",
         )
         second_actions = FakeActions()
-        second = campaign("滴滴")
+        second = campaign(
+            "滴滴",
+            "h5388.invalid",
+            "thirdInvite",
+            "fourthInvite",
+        )
         self.assertEqual(
             await self.service.handle(
                 self.message(2, second.text, second, sender_id=222_222_222),
@@ -669,8 +686,89 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             {signal["code"] for signal in payload["signals"]},
         )
         database = self.database_path.read_bytes()
-        self.assertNotIn("联盟推广".encode(), database)
-        self.assertNotIn(b"https://landing.invalid/offer", database)
+        self.assertNotIn("888联盟网址".encode(), database)
+        self.assertNotIn(b"https://h5388.invalid", database)
+
+    async def test_repeated_promotional_preview_crosses_destructive_gate(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
+
+        def preview(post: str, invite: str) -> MessageFacts:
+            preview_text = (
+                "Telegram 汇盈俱乐部 七年合约社区交流群 "
+                f"https://t.me/+{invite} 免费带单 70%返佣"
+            )
+            post_url = f"https://t.me/{post}/917"
+            invite_url = f"https://t.me/+{invite}"
+            return MessageFacts(
+                text=post_url,
+                preview_text=preview_text,
+                urls=(post_url, invite_url),
+                domains=("t.me",),
+                preview_urls=(post_url, invite_url),
+            )
+
+        first = preview("firstChannel", "firstInvite")
+        self.assertEqual(
+            await self.service.handle(
+                self.message(1, first.text, first, sender_id=777_777_771),
+                FakeActions(),
+            ),
+            "challenged",
+        )
+        second = preview("secondChannel", "secondInvite")
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, second.text, second, sender_id=777_777_772),
+                FakeActions(),
+            ),
+            "suppressed",
+        )
+        second_key = self.protector.sender_key(777_777_772)
+        payload = self.review_protector.open(
+            self.store.enforcement_review(second_key, now=self.now).envelope
+        )
+        self.assertEqual(payload["risk_score"], 85)
+        self.assertEqual(
+            payload["decision_basis"], "corroborated_repeated_campaign"
+        )
+        database = self.database_path.read_bytes()
+        self.assertNotIn("汇盈俱乐部".encode(), database)
+        self.assertNotIn(b"https://t.me/secondChannel/917", database)
+
+    async def test_repeated_authored_campaign_without_provenance_stays_strict(
+        self,
+    ) -> None:
+        self.store.set_mode("protect")
+
+        def authored(domain: str, invite: str) -> MessageFacts:
+            text = (
+                f"联盟推广 https://{domain} "
+                f"https://t.me/+{invite}"
+            )
+            return MessageFacts(
+                text=text,
+                urls=(f"https://{domain}", f"https://t.me/+{invite}"),
+                domains=(domain, "t.me"),
+            )
+
+        first = authored("first.invalid", "firstInvite")
+        second = authored("second.invalid", "secondInvite")
+        self.assertEqual(
+            await self.service.handle(
+                self.message(1, first.text, first, sender_id=777_777_773),
+                FakeActions(),
+            ),
+            "challenged",
+        )
+        self.assertEqual(
+            await self.service.handle(
+                self.message(2, second.text, second, sender_id=777_777_774),
+                FakeActions(),
+            ),
+            "challenged",
+        )
 
     async def test_test_sender_does_not_seed_campaign_detection(self) -> None:
         self.store.set_mode("protect")
@@ -717,20 +815,20 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_different_campaign_payloads_do_not_cross_sender_gate(self) -> None:
         self.store.set_mode("protect")
 
-        def campaign(path: str) -> MessageFacts:
+        def campaign(label: str, path: str) -> MessageFacts:
             landing = f"https://landing.invalid/{path}"
             return MessageFacts(
                 text="滴滴",
                 quote_text=(
-                    f"联盟推广 {landing} https://t.me/+syntheticInvite"
+                    f"联盟推广{label} {landing} https://t.me/+syntheticInvite"
                 ),
                 quote_urls=(landing, "https://t.me/+syntheticInvite"),
                 quote_domains=("landing.invalid", "t.me"),
                 is_forwarded=True,
             )
 
-        first = campaign("offer-a")
-        second = campaign("offer-b")
+        first = campaign("甲", "offer-a")
+        second = campaign("乙", "offer-b")
         first_outcome = await self.service.handle(
             self.message(1, first.text, first, sender_id=444_444_444),
             FakeActions(),

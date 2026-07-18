@@ -11,7 +11,12 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from tg_pm_gatekeeper.store import DialogSnapshot, StateStore, StoreMigrationError
+from tg_pm_gatekeeper.store import (
+    CAMPAIGN_WINDOW_SECONDS,
+    DialogSnapshot,
+    StateStore,
+    StoreMigrationError,
+)
 
 
 class StoreTests(unittest.TestCase):
@@ -437,7 +442,7 @@ class StoreTests(unittest.TestCase):
             decision_basis="risk_below_strict_threshold",
             planned_action="standard_challenge",
             actual_action="challenged",
-            policy_version="adaptive-v1",
+            policy_version="adaptive-v2",
             now=100,
         )
         self.store.record_decision(
@@ -464,9 +469,50 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.observe_campaign("digest", "sender-a", now=200), 1)
         self.assertEqual(self.store.observe_campaign("digest", "sender-b", now=300), 2)
         self.assertEqual(
-            self.store.observe_campaign("digest", "sender-c", now=300 + 86401),
+            self.store.observe_campaign(
+                "boundary",
+                "sender-a",
+                now=100,
+            ),
             1,
         )
+        self.assertEqual(
+            self.store.observe_campaign(
+                "boundary",
+                "sender-b",
+                now=100 + CAMPAIGN_WINDOW_SECONDS,
+            ),
+            2,
+        )
+        self.assertEqual(
+            self.store.observe_campaign(
+                "expired",
+                "sender-a",
+                now=100,
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.store.observe_campaign(
+                "expired",
+                "sender-b",
+                now=300 + CAMPAIGN_WINDOW_SECONDS + 1,
+            ),
+            1,
+        )
+
+    def test_prune_uses_campaign_observation_window(self) -> None:
+        self.store.observe_campaign("expired", "sender-a", now=100)
+        self.store.observe_campaign(
+            "retained",
+            "sender-b",
+            now=100 + CAMPAIGN_WINDOW_SECONDS,
+        )
+        self.store.prune(30, now=100 + CAMPAIGN_WINDOW_SECONDS + 1)
+        rows = self.store._connection.execute(
+            "SELECT fingerprint FROM campaign_events ORDER BY fingerprint"
+        ).fetchall()
+        self.assertEqual([row["fingerprint"] for row in rows], ["retained"])
 
     def test_review_reference_expires_at_its_own_deadline(self) -> None:
         self.store.enqueue_review(

@@ -69,8 +69,8 @@ flow, see [Architecture](docs/architecture.md).
   counts. It never persists command, response, case-card, or unrelated Saved Messages text.
 - Raw user IDs, usernames, profile names, and message content are not stored in plaintext.
 - Cross-sender campaign detection stores only a keyed HMAC fingerprint, an already-derived sender
-  key, and a timestamp for at most 24 hours. Canonical text, raw URLs, and reversible hashes must not
-  be persisted or logged, and the dedicated test sender must not contribute an event.
+  key, and a timestamp for at most 7 days. Canonical templates, raw URLs, and reversible hashes must
+  not be persisted or logged, and the dedicated test sender must not contribute an event.
 - The control identity uses keys domain-separated from message-review references. It remains only
   while the restriction remains active and is erased on allowance, revocation, or temporary
   suppression release. Evidence expiry does not erase this operator control path.
@@ -107,10 +107,11 @@ flow, see [Architecture](docs/architecture.md).
 - Arithmetic verification adds interaction friction; it is not a CAPTCHA or proof that a sender is
   human.
 - A score alone must never authorize permanent suppression. The action additionally requires either
-  a non-quoted owner-denied domain or a repeated cross-sender campaign corroborated by forwarding,
-  promotional language, and multiple links. A quoted denylist match alone is non-destructive.
-- `adaptive-v1` weights, thresholds, and destructive gates are code-versioned and must not be
-  silently overridden through deployment environment variables.
+  a non-quoted owner-denied domain or a repeated cross-sender campaign corroborated by promotional
+  language, multiple links, and either Telegram forwarding or a promotional Telegram webpage
+  preview containing campaign links. A quoted denylist match alone is non-destructive.
+- `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned and
+  must not be silently overridden through deployment environment variables.
 - Message handling, challenge timeout, recovery, and review transitions are serialized per derived
   sender identifier.
 - Exhausting the outbound-message limit must not bypass screening.
