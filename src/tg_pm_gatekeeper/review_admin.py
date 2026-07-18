@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 from telethon import functions, types
 
 from .message_facts import facts_from_message
-from .policy import PolicyEngine
+from .policy import EvidenceSignal, PolicyEngine
 from .restriction_actions import RestrictionActions, RestrictionReleaseResult
 from .rules import url_evidence, url_shape
 from .service import GatekeeperService
@@ -817,12 +817,17 @@ class ReviewAdminServer:
             return ""
 
         raw_signals = payload.get("signals", [])
-        signal_codes = {
-            str(item["code"])
+        policy_signals = tuple(
+            EvidenceSignal(
+                str(item["code"]),
+                str(item.get("source", "behavior")),  # type: ignore[arg-type]
+                int(item.get("weight", 0)),
+                str(item.get("explanation", "")),
+            )
             for item in raw_signals
             if isinstance(item, dict) and item.get("code")
-        } if isinstance(raw_signals, list) else set()
-        gate_basis = PolicyEngine.destructive_gate_basis(signal_codes)
+        ) if isinstance(raw_signals, list) else ()
+        gate_basis = PolicyEngine.destructive_gate_basis(policy_signals)
         score_gate_met = risk_score >= PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD
         destructive_gate_met = gate_basis is not None
         planned_action = str(payload.get("planned_action", "not_recorded"))
@@ -833,6 +838,7 @@ class ReviewAdminServer:
             "permanent_suppression": "permanent",
         }.get(planned_action, "unknown")
         plotted_score = min(max(risk_score, 0), 100)
+        policy_version = html.escape(str(payload.get("policy_version", "adaptive-v1")))
 
         if gate_basis == "owner_denied_domain":
             gate_label = "Met · Non-quoted owner-denied domain"
@@ -870,7 +876,7 @@ class ReviewAdminServer:
           <div class="policy-score-head">
             <div><span class="policy-kicker">Risk Score</span>
               <strong>{risk_score}</strong><small>additive points · not a probability</small></div>
-            <span class="policy-version">adaptive-v1</span>
+            <span class="policy-version">{policy_version}</span>
           </div>
           <div class="risk-track" role="img" aria-label="Risk score {risk_score}; strict challenge starts at {PolicyEngine.STRICT_CHALLENGE_THRESHOLD} and permanent score condition starts at {PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}">
             <span class="risk-fill" style="width:{plotted_score}%"></span>

@@ -30,7 +30,7 @@ class ScreeningDecision:
     challenge_profile: ChallengeProfile | None
     planned_action: ScreeningAction
     decision_basis: str
-    policy_version: str = "adaptive-v1"
+    policy_version: str = "adaptive-v2"
 
 
 class PolicyEngine:
@@ -38,7 +38,10 @@ class PolicyEngine:
     PERMANENT_SUPPRESSION_THRESHOLD = 70
 
     @staticmethod
-    def destructive_gate_basis(codes: set[str]) -> str | None:
+    def destructive_gate_basis(
+        signals: tuple[EvidenceSignal, ...],
+    ) -> str | None:
+        codes = {signal.code for signal in signals}
         denied_authored_source = bool(
             codes.intersection(
                 {
@@ -48,15 +51,26 @@ class PolicyEngine:
                 }
             )
         )
-        repeated_campaign_gate = {
+        repeated_campaign_core = {
             "REPEATED_CAMPAIGN",
-            "FORWARDED_PAYLOAD",
         }.issubset(codes) and bool(
             codes.intersection({"MULTIPLE_LINKS", "QUOTED_MULTIPLE_LINKS"})
-        ) and bool(
+        )
+        forwarded_promotion = "FORWARDED_PAYLOAD" in codes and bool(
             codes.intersection(
                 {"PROMOTIONAL_LANGUAGE", "QUOTED_PROMOTIONAL_LANGUAGE"}
             )
+        )
+        preview_promotion = any(
+            signal.code == "PREVIEW_PROMOTIONAL_LANGUAGE"
+            and signal.source == "preview"
+            for signal in signals
+        ) and any(
+            signal.code == "MULTIPLE_LINKS" and signal.source == "preview"
+            for signal in signals
+        )
+        repeated_campaign_gate = repeated_campaign_core and (
+            forwarded_promotion or preview_promotion
         )
         if denied_authored_source:
             return "owner_denied_domain"
@@ -66,8 +80,7 @@ class PolicyEngine:
 
     def decide(self, signals: tuple[EvidenceSignal, ...]) -> ScreeningDecision:
         risk_score = sum(signal.weight for signal in signals)
-        codes = {signal.code for signal in signals}
-        destructive_basis = self.destructive_gate_basis(codes)
+        destructive_basis = self.destructive_gate_basis(signals)
 
         if (
             risk_score >= self.PERMANENT_SUPPRESSION_THRESHOLD

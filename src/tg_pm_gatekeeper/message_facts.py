@@ -61,16 +61,16 @@ def facts_from_message(message: types.Message) -> MessageFacts:
                     button_urls.add(url)
 
     webpage = getattr(getattr(message, "media", None), "webpage", None)
-    webpage_url = getattr(webpage, "url", None)
-    preview_urls: set[str] = set()
-    if webpage_url:
-        urls.add(webpage_url)
-        preview_urls.add(webpage_url)
     preview_text = "\n".join(
         value
         for attribute in ("site_name", "title", "description", "author")
         if isinstance((value := getattr(webpage, attribute, None)), str) and value
     )
+    preview_urls = _urls_from_text_and_entities(preview_text, ())
+    webpage_url = getattr(webpage, "url", None)
+    if webpage_url:
+        preview_urls.add(webpage_url)
+    urls.update(preview_urls)
     domains = tuple(
         sorted({domain for url in urls if (domain := normalized_domain(url))})
     )

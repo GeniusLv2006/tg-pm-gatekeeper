@@ -187,6 +187,35 @@ def telegram_link_kind(url: str) -> str:
     return "public_username"
 
 
+def campaign_link_kind(url: str) -> str:
+    kind = telegram_link_kind(url)
+    return {
+        "invite": "telegram-invite",
+        "public_username": "telegram-public",
+        "internal_message": "telegram-internal",
+        "bot_start": "telegram-bot",
+        "external_web": "external-web",
+    }.get(kind, "unknown-link")
+
+
+def campaign_template_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    templated = URL_RE.sub(
+        lambda match: f"<{campaign_link_kind(match.group(0))}>",
+        normalized,
+    )
+    return " ".join(templated.split())
+
+
+def campaign_link_kinds(urls: tuple[str, ...]) -> tuple[str, ...]:
+    distinct: dict[str, str] = {}
+    for url in urls:
+        key = normalized_url_key(url)
+        if key is not None:
+            distinct.setdefault(key, campaign_link_kind(url))
+    return tuple(sorted(distinct.values()))
+
+
 def url_evidence(
     urls: tuple[str, ...],
     *,
@@ -290,6 +319,11 @@ def detect_evidence_signals(
     authored_url_keys = {
         key for url in facts.urls if (key := normalized_url_key(url)) is not None
     }
+    preview_url_keys = {
+        key
+        for url in facts.preview_urls
+        if (key := normalized_url_key(url)) is not None
+    }
     quote_url_keys = {
         key
         for url in facts.quote_urls
@@ -308,10 +342,17 @@ def detect_evidence_signals(
             )
         )
     if any(kind == "invite" for kind in link_kinds):
+        authored_invite = any(
+            telegram_link_kind(url) == "invite" and url not in facts.preview_urls
+            for url in facts.urls
+        )
+        preview_invite = any(
+            telegram_link_kind(url) == "invite" for url in facts.preview_urls
+        )
         source: SignalSource = (
-            "quoted"
-            if not any(telegram_link_kind(url) == "invite" for url in facts.urls)
-            else "authored"
+            "authored"
+            if authored_invite
+            else "preview" if preview_invite else "quoted"
         )
         signals.append(
             _signal(
@@ -355,9 +396,9 @@ def detect_evidence_signals(
         signals.append(
             _signal(
                 "MULTIPLE_LINKS",
-                "authored",
+                "preview" if len(preview_url_keys) >= 2 else "authored",
                 15,
-                "The authored message contains multiple distinct links.",
+                "The message or webpage preview contains multiple distinct links.",
             )
         )
     if len(quote_url_keys) >= 2 or len(set(facts.quote_domains)) >= 2:
@@ -399,7 +440,7 @@ def detect_evidence_signals(
     elif preview_promotion:
         signals.append(
             _signal(
-                "PROMOTIONAL_LANGUAGE",
+                "PREVIEW_PROMOTIONAL_LANGUAGE",
                 "preview",
                 20,
                 "Telegram webpage preview metadata contains promotional language.",
@@ -477,29 +518,33 @@ def campaign_candidate(
     facts: MessageFacts, signals: tuple[EvidenceSignal, ...]
 ) -> str | None:
     codes = {signal.code for signal in signals}
-    if "QUOTED_PROMOTIONAL_LANGUAGE" in codes and facts.quote_urls:
-        text = normalize_text(facts.quote_text)
-        urls = sorted(
-            key
-            for url in facts.quote_urls
-            if (key := normalized_url_key(url)) is not None
-        )
+    quote_link_kinds = campaign_link_kinds(facts.quote_urls)
+    authored_link_kinds = campaign_link_kinds(facts.urls)
+    preview_link_kinds = campaign_link_kinds(facts.preview_urls)
+    if "QUOTED_PROMOTIONAL_LANGUAGE" in codes and len(quote_link_kinds) >= 2:
+        text = campaign_template_text(facts.quote_text)
+        link_kinds = quote_link_kinds
         source = "quoted"
-    elif "PROMOTIONAL_LANGUAGE" in codes and facts.urls:
-        text = normalize_text(
+    elif (
+        "PREVIEW_PROMOTIONAL_LANGUAGE" in codes
+        and len(preview_link_kinds) >= 2
+    ):
+        text = campaign_template_text(
             "\n".join((facts.text, facts.preview_text, *facts.button_texts))
         )
-        urls = sorted(
-            key
-            for url in facts.urls
-            if (key := normalized_url_key(url)) is not None
+        link_kinds = authored_link_kinds
+        source = "preview"
+    elif "PROMOTIONAL_LANGUAGE" in codes and len(authored_link_kinds) >= 2:
+        text = campaign_template_text(
+            "\n".join((facts.text, facts.preview_text, *facts.button_texts))
         )
+        link_kinds = authored_link_kinds
         source = "authored"
     else:
         return None
-    if not text or not urls:
+    if not text or not link_kinds:
         return None
-    return f"adaptive-v1:{source}:{text}:{'|'.join(urls)}"
+    return f"adaptive-v2:{source}:{text}:{'|'.join(link_kinds)}"
 
 
 def repeated_campaign_signal() -> EvidenceSignal:
@@ -507,5 +552,5 @@ def repeated_campaign_signal() -> EvidenceSignal:
         "REPEATED_CAMPAIGN",
         "behavior",
         40,
-        "The same promotional payload appeared from another sender within 24 hours.",
+        "The same promotional template appeared from another sender within 7 days.",
     )

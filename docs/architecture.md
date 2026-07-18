@@ -16,7 +16,7 @@
 - **Quarantined**: Gatekeeper could not safely complete normal delivery, archive, restore, quota, or
   warning handling. It is an exception state, not a normal risk tier.
 - **Suppressed**: later messages are discarded and whole-dialog deletion may be scheduled until a
-  temporary suppression expires, or indefinitely after an `adaptive-v1` destructive evidence gate.
+  temporary suppression expires, or indefinitely after an `adaptive-v2` destructive evidence gate.
   This is not Telegram block.
 - **Review item**: one sender-level pending decision with a count and one encrypted Telegram reference,
   not a stored conversation transcript.
@@ -29,27 +29,30 @@
 - **Destructive evidence gate**: the additional evidence requirement that must be met before a score
   can authorize permanent suppression.
 
-### adaptive-v1 signal map
+### adaptive-v2 signal map
 
 | Evidence | Source | Weight |
 | --- | --- | ---: |
 | Low-information opener | Authored text | 5 |
-| Telegram invitation or one link button | Authored/quoted link or button | 10 |
+| Telegram invitation or one link button | Authored/preview/quoted link or button | 10 |
 | Forwarding or a repeated link-bearing message | Behavior | 10 |
-| Multiple authored or quoted links | Authored or quoted context | 15 |
+| Multiple message, preview, or quoted links | Authored, preview, or quoted context | 15 |
 | Quoted promotional language | Quoted context | 15 |
 | External landing page plus Telegram invitation | Behavior | 15 |
-| Promotional language | Authored text or preview | 20 |
+| Promotional language | Authored text | 20 |
+| Promotional language | Telegram webpage preview | 20 |
 | Multiple link buttons or forwarded link button | Button | 25 |
 | Owner-denied domain in quoted context | Quoted context | 30 |
-| Same campaign across different senders within 24 hours | Behavior | 40 |
+| Same campaign template across different senders within 7 days | Behavior | 40 |
 | Owner-denied domain in authored text, button, or preview | Owner policy plus non-quoted source | 100 |
 
 Scores below 30 use `standard_challenge`; scores from 30 upward use `strict_challenge`. A score of 70
 or more uses `permanent_suppression` only when a non-quoted owner-denied domain is present, or when a
-cross-sender repeated campaign is also forwarded, promotional, and contains multiple links. Weak
-signals cannot accumulate past this destructive boundary, and a quoted denylist match alone cannot
-delete a dialog. Weights and thresholds are fixed in code under `adaptive-v1`.
+cross-sender repeated campaign is promotional, contains multiple links, and is either forwarded or
+carried by a promotional Telegram webpage preview containing campaign links. Weak signals cannot
+accumulate past this destructive boundary, and a quoted denylist match alone cannot delete a dialog.
+Weights, thresholds, the campaign window, and destructive gates are fixed in code under
+`adaptive-v2`.
 
 ## Sender states
 
@@ -58,7 +61,7 @@ unknown -> challenge_issuing -> challenge_archiving -> challenged
                                                      -> provisional -> allowed
                                                      -> suppressed (timeout or failed attempts)
 
-unknown/provisional -> suppressed (adaptive-v1 destructive evidence gate)
+unknown/provisional -> suppressed (adaptive-v2 destructive evidence gate)
 unknown/provisional/challenged -> quarantined (delivery, archive, restore, warning, or quota exception)
 unknown/provisional/challenged/quarantined -> suppressed (explicit manual spam decision)
 unknown/provisional/challenged/quarantined/suppressed -> allowed (legitimate review)
@@ -76,13 +79,16 @@ state.
 
 1. Accept only incoming private-message events.
 2. Exclude contacts, local allowlist entries, service accounts, bots, and peers with a trusted prior conversation.
-3. Extract structured evidence signals and sum their fixed `adaptive-v1` weights. Authored text,
+3. Extract structured evidence signals and sum their fixed `adaptive-v2` weights. Authored text,
    Telegram-supplied webpage previews, buttons, quoted context, behavior, and owner policy remain
-   separate sources in the decision record.
-4. For promotional payloads containing URLs, create a keyed HMAC campaign fingerprint. Prefer the
-   quoted promotional payload, exclude an outer low-information opener, normalize text and sorted URL
-   keys in memory, and count different derived sender keys seen during the last 24 hours. Store no
-   campaign plaintext, raw URL, or reversible digest. The dedicated test sender never participates.
+   separate sources in the decision record. URLs found inside webpage-preview metadata participate
+   as preview evidence and are deduplicated with the Telegram webpage URL.
+4. For promotional payloads containing at least two distinct URLs, create a keyed HMAC campaign
+   template fingerprint. Prefer quoted promotional content, exclude an outer low-information opener,
+   normalize text in memory, and replace URL domains, paths, queries, and Telegram invitation tokens
+   with link-type placeholders. Count different derived sender keys seen during the last 7 days.
+   Store no campaign template, plaintext, raw URL, or reversible digest. The dedicated test sender
+   never participates.
 5. In monitor mode, record the simulated result for operator review and take no Telegram action,
    except for the explicitly configured dedicated test sender.
 6. In protect mode, permanently suppress only after the score and destructive gate both pass. Use a
@@ -264,9 +270,11 @@ Active Case envelopes. The state database does not store message bodies, quoted 
 identities, or profile data in plaintext.
 
 The `campaign_events` table contains only a keyed HMAC fingerprint, an already-derived sender key,
-and an observation time. A candidate is created only for promotional content that also contains a
-URL. Matching rows are pruned after 24 hours and count distinct senders through a composite primary
-key. The canonical text and URL keys exist only in memory before HMAC derivation.
+and an observation time. A candidate is created only for promotional content containing at least two
+distinct URLs. The canonical template preserves normalized surrounding text and link kinds while
+discarding domains, paths, queries, and invitation tokens. Matching rows are pruned after 7 days and
+count distinct senders through a composite primary key. The canonical template exists only in memory
+before HMAC derivation.
 
 Runtime credentials and state belong in a deployment-specific directory outside the repository. Configuration committed to Git must contain placeholders only.
 

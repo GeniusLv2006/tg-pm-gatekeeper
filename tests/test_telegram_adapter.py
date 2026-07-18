@@ -89,6 +89,33 @@ class TelegramAdapterTests(unittest.TestCase):
         self.assertIn("高返70%", facts.preview_text)
         self.assertIn("交易所返佣", facts.preview_text)
 
+    def test_webpage_preview_text_urls_are_extracted_and_deduplicated(self) -> None:
+        webpage = SimpleNamespace(
+            url="https://t.me/channel/917",
+            site_name="Telegram",
+            title="合约社区",
+            description=(
+                "免费带单返佣 https://t.me/+rotatingInvite "
+                "https://t.me/channel/917"
+            ),
+            author=None,
+        )
+        facts = facts_from_message(
+            self.message(
+                message="https://t.me/channel/917",
+                media=SimpleNamespace(webpage=webpage),
+            )
+        )
+        self.assertEqual(
+            facts.preview_urls,
+            (
+                "https://t.me/+rotatingInvite",
+                "https://t.me/channel/917",
+            ),
+        )
+        self.assertEqual(facts.urls, facts.preview_urls)
+        self.assertEqual(facts.domains, ("t.me",))
+
     def test_quoted_text_and_entities_are_extracted(self) -> None:
         quote = "TRX 服务 click"
         reply_to = SimpleNamespace(
