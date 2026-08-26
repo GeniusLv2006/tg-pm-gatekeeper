@@ -8,12 +8,14 @@ import logging
 import os
 import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from telethon import TelegramClient, events, functions, types
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.sessions import StringSession
+from telethon.tl import TLObject
 
 from .config import ConfigurationError, Settings, read_private_file
 from .message_facts import facts_from_message
@@ -30,6 +32,9 @@ from .service import (
 from .store import DialogSnapshot, StateStore
 
 LOG = logging.getLogger("gatekeeper.telegram")
+SESSION_ENTITY_CACHE_LIMIT = 1024
+TELETHON_ENTITY_CACHE_LIMIT = 512
+RUNTIME_METRICS_INTERVAL_SECONDS = 15 * 60
 SERVICE_USER_IDS = {777000, 42777}
 HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
 PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
@@ -141,6 +146,97 @@ def write_runtime_heartbeat(path: Path, timestamp: int) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(str(timestamp), encoding="ascii")
     os.replace(temporary, path)
+
+
+class BoundedStringSession(StringSession):
+    """StringSession with a bounded, privacy-preserving entity index."""
+
+    def __init__(
+        self,
+        string: str | None = None,
+        *,
+        entity_limit: int = SESSION_ENTITY_CACHE_LIMIT,
+    ):
+        super().__init__(string)
+        if entity_limit < 1:
+            raise ValueError("entity_limit must be positive")
+        self._entity_limit = entity_limit
+        self._entities: OrderedDict[int, tuple[int, str]] = OrderedDict()
+        self._entity_evictions = 0
+
+    @property
+    def entity_count(self) -> int:
+        return len(self._entities)
+
+    @property
+    def entity_evictions(self) -> int:
+        return self._entity_evictions
+
+    def process_entities(self, tlo: TLObject) -> None:
+        values = []
+        if isinstance(tlo, TLObject):
+            for attribute in ("user", "chat", "chats", "users"):
+                value = getattr(tlo, attribute, None)
+                if isinstance(value, (list, tuple)):
+                    values.extend(value)
+                elif value is not None:
+                    values.append(value)
+        elif utils.is_list_like(tlo):
+            values.extend(tlo)
+        for entity in values:
+            try:
+                peer = utils.get_input_peer(entity, allow_self=False)
+                marked_id = utils.get_peer_id(peer)
+            except (TypeError, AttributeError):
+                continue
+            if isinstance(peer, types.InputPeerUser):
+                kind = "user"
+                access_hash = peer.access_hash
+            elif isinstance(peer, types.InputPeerChannel):
+                kind = "channel"
+                access_hash = peer.access_hash
+            elif isinstance(peer, types.InputPeerChat):
+                kind = "chat"
+                access_hash = 0
+            else:
+                continue
+            self._entities[marked_id] = (access_hash, kind)
+            self._entities.move_to_end(marked_id)
+            while len(self._entities) > self._entity_limit:
+                self._entities.popitem(last=False)
+                self._entity_evictions += 1
+
+    def get_input_entity(self, key):
+        try:
+            return utils.get_input_peer(key)
+        except (AttributeError, TypeError):
+            pass
+        if isinstance(key, TLObject):
+            key = utils.get_peer_id(key)
+        if isinstance(key, int):
+            candidates = (key,)
+            if key < 0:
+                candidates = tuple(
+                    utils.get_peer_id(peer)
+                    for peer in (
+                        types.PeerUser(key),
+                        types.PeerChat(key),
+                        types.PeerChannel(key),
+                    )
+                )
+            for marked_id in candidates:
+                cached = self._entities.get(marked_id)
+                if cached is None:
+                    continue
+                access_hash, kind = cached
+                self._entities.move_to_end(marked_id)
+                entity_id, _ = utils.resolve_id(marked_id)
+                if kind == "user":
+                    return types.InputPeerUser(entity_id, access_hash)
+                if kind == "channel":
+                    return types.InputPeerChannel(entity_id, access_hash)
+                return types.InputPeerChat(entity_id)
+        raise ValueError("entity is not available in the bounded session cache")
 
 
 class TelegramActions:
@@ -332,13 +428,15 @@ class TelegramAdapter:
         session = read_private_file(
             settings.session_file, minimum_bytes=64, strip=True
         ).decode("ascii")
+        self.session = BoundedStringSession(session)
         self.client = TelegramClient(
-            StringSession(session),
+            self.session,
             settings.api_id,
             settings.api_hash,
             flood_sleep_threshold=60,
             auto_reconnect=True,
             receive_updates=True,
+            entity_cache_limit=TELETHON_ENTITY_CACHE_LIMIT,
         )
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._maintenance_tasks: set[asyncio.Task] = set()
@@ -349,6 +447,7 @@ class TelegramAdapter:
         self._operator_sync_cursor: int | None = None
         self._operator_handled_message_ids: dict[int, float] = {}
         self._operator_cleanup_wakeup = asyncio.Event()
+        self._next_metrics_at = 0.0
         self._restriction_actions = RestrictionActions(
             store,
             service,
@@ -430,7 +529,35 @@ class TelegramAdapter:
             if now >= next_prune:
                 self.store.prune(self.settings.audit_retention_days, now)
                 next_prune = now + PRUNE_INTERVAL_SECONDS
+            if time.monotonic() >= self._next_metrics_at:
+                self._log_runtime_metrics()
+                self._next_metrics_at = (
+                    time.monotonic() + RUNTIME_METRICS_INTERVAL_SECONDS
+                )
             await asyncio.sleep(60)
+
+    def _log_runtime_metrics(self) -> None:
+        try:
+            with open("/proc/self/status", encoding="ascii") as status_file:
+                rss_kib = next(
+                    int(line.split()[1])
+                    for line in status_file
+                    if line.startswith("VmRSS:")
+                )
+        except (OSError, StopIteration, ValueError):
+            rss_kib = -1
+        telethon_cache = getattr(self.client, "_mb_entity_cache", None)
+        telethon_count = len(telethon_cache) if telethon_cache is not None else -1
+        LOG.info(
+            "runtime_metrics:rss_kib=%d:session_entities=%d:session_evictions=%d:"
+            "telethon_entities=%d:timeout_tasks=%d:maintenance_tasks=%d",
+            rss_kib,
+            self.session.entity_count,
+            self.session.entity_evictions,
+            telethon_count,
+            len(self._timeout_tasks),
+            len(self._maintenance_tasks),
+        )
 
     async def _on_message(self, event) -> None:
         try:
@@ -943,7 +1070,21 @@ class TelegramAdapter:
             return
         if state.status == "quarantined":
             try:
-                peer = await self.client.get_input_entity(sender_id)
+                reference = (
+                    state.restriction_reference
+                    or state.challenge_action_reference
+                )
+                if reference is None:
+                    raise ValueError("test sender reference unavailable")
+                if state.restriction_reference is not None:
+                    user_id, access_hash = (
+                        self.service.protector.open_restriction_reference(reference)
+                    )
+                else:
+                    user_id, access_hash, _ = (
+                        self.service.protector.open_review_reference(reference)
+                    )
+                peer = types.InputPeerUser(user_id=user_id, access_hash=access_hash)
             except Exception:
                 LOG.error("test_sender_resolution_failed")
             else:
