@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from telethon import functions, types
+from telethon.sessions import StringSession
 
 from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
@@ -20,6 +21,7 @@ from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
+    BoundedStringSession,
     OperatorCaseControl,
     TelegramActions,
     TelegramAdapter,
@@ -31,6 +33,47 @@ from tg_pm_gatekeeper.telegram_adapter import (
     reply_to_message_id,
     write_runtime_heartbeat,
 )
+
+
+class BoundedStringSessionTests(unittest.TestCase):
+    def test_entity_cache_is_bounded_and_replaces_existing_peer(self) -> None:
+        session = BoundedStringSession(entity_limit=2)
+        session.process_entities(
+            [
+                types.User(id=1, access_hash=11, first_name="one"),
+                types.User(id=2, access_hash=22, first_name="two"),
+            ]
+        )
+        session.get_input_entity(1)
+        session.process_entities([types.User(id=1, access_hash=111, first_name="changed")])
+        session.process_entities([types.User(id=3, access_hash=33)])
+
+        self.assertEqual(session.entity_count, 2)
+        self.assertEqual(session.entity_evictions, 1)
+        self.assertEqual(session.get_input_entity(1).access_hash, 111)
+        with self.assertRaises(ValueError):
+            session.get_input_entity(2)
+        with self.assertRaises(ValueError):
+            session.get_input_entity("cached-name")
+        self.assertNotIn("one", repr(session._entities))
+
+    def test_string_session_authorization_fields_are_preserved(self) -> None:
+        source = StringSessionTests.make_string_session()
+        session = BoundedStringSession(source)
+        self.assertEqual(session.dc_id, 2)
+        self.assertEqual(session.port, 443)
+        self.assertEqual(session.server_address, "149.154.167.50")
+
+
+class StringSessionTests(unittest.TestCase):
+    @staticmethod
+    def make_string_session() -> str:
+        session = StringSession()
+        session.set_dc(2, "149.154.167.50", 443)
+        from telethon.crypto import AuthKey
+
+        session.auth_key = AuthKey(b"k" * 256)
+        return session.save()
 
 
 class TelegramAdapterTests(unittest.TestCase):

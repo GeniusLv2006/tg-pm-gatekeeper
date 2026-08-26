@@ -302,8 +302,11 @@ not a message ID. They remain for the lifetime of a quarantine or suppression so
 cannot remove the owner's ability to identify and allow the sender. They are erased when the
 restriction ends.
 
-The runtime uses a Telethon StringSession rather than its default SQLite session. This keeps the
-authorization key without persisting Telethon's entity cache of names, usernames, and phone numbers.
+The runtime uses a bounded Telethon StringSession rather than its default SQLite session. The session
+keeps only a bounded LRU of peer IDs, access hashes, and peer types needed for update handling; it
+never persists or caches names, usernames, or phone numbers. The update-layer entity cache is bounded
+separately. Runtime metrics expose only cache counts, eviction counts, task counts, and RSS; they do
+not contain Telegram identities or message content.
 
 Active Case snapshots use AES-256-GCM with a key derived through HKDF from the dedicated owner-only
 `review.key` secret. The runtime reads it through `TG_REVIEW_KEY_FILE`. A snapshot includes the

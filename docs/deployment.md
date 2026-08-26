@@ -125,6 +125,11 @@ Continue when:
 - `heartbeat` is a recent Unix timestamp and is not more than five seconds in the future; and
 - `action_failures` is `0`.
 
+For memory regression checks, inspect the redacted `runtime_metrics` events in the container log.
+They report only current RSS, bounded Session entity count and evictions, Telethon update-cache count,
+and task counts. The Session cache is capped at 1024 entities and the Telethon update cache at 512;
+neither limit contains identity names or message content.
+
 If the container is not healthy, run:
 
 ```shell
