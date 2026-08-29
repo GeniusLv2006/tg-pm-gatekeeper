@@ -23,7 +23,7 @@ from tg_pm_gatekeeper.review_admin import (
     ReviewAdminServer,
 )
 from tg_pm_gatekeeper.service import GatekeeperService
-from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
+from tg_pm_gatekeeper.store import ActiveRestriction, DialogSnapshot, StateStore
 
 
 class FakeTelegramClient:
@@ -152,7 +152,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn(b"Telegram Message Unavailable", response)
-        self.assertIn(b"Resolve and Cancel Pending Jobs", response)
+        self.assertIn(b"Dismiss &amp; cancel jobs", response)
         self.assertIn(b"Telegram and trust state are unchanged", response)
 
         body = urlencode(
@@ -244,14 +244,109 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'<script src="/dashboard.js" defer></script>', response)
         self.assertIn(b"Connected", response)
         self.assertIn(b"Checked ", response)
-        self.assertIn(b"checked quietly while this tab is visible", response)
-        self.assertIn(b"updates in place only when review state changes", response)
+        self.assertIn(b"The list refreshes in place only when review state changes", response)
         self.assertIn(b"class='logout-form' method='post' action='/logout'", response)
         self.assertIn(b">Sign Out</button>", response)
         self.assertIn(b"Test Sender (@testsender)", response)
         self.assertIn(b"ID 123456789", response)
-        self.assertIn(b"Review Reason", response)
+        self.assertIn(b"<th>Review</th>", response)
         self.assertNotIn(b">Simulation<", response)
+
+    async def test_list_pages_use_five_responsive_business_columns(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.suppress(
+            sender_key,
+            "challenge_timeout",
+            until=int(time.time()) + 700,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+
+        cases = await self.server._enforcement_index_page()
+        reviews = await self.server._review_queue_page()
+
+        self.assertIn(
+            b"<th>Sender</th><th>State</th><th>Trigger</th><th>Evidence</th><th>Age</th>",
+            cases,
+        )
+        self.assertNotIn(b"<th>Case</th>", cases)
+        self.assertIn(f"href='/cases/{sender_key}'".encode(), cases)
+        self.assertNotIn(b"<details class='advanced-recovery'>", cases)
+        for label in (b"Sender", b"State", b"Trigger", b"Evidence", b"Age"):
+            self.assertIn(b"data-label='" + label + b"'", cases)
+        self.assertIn(
+            b"<th>Sender</th><th>Review</th><th>Signals</th><th>Messages</th><th>Age</th>",
+            reviews,
+        )
+        for label in (b"Sender", b"Review", b"Signals", b"Messages", b"Age"):
+            self.assertIn(b"data-label='" + label + b"'", reviews)
+
+    async def test_queue_compacts_signals_but_detail_keeps_full_breakdown(self) -> None:
+        self.store._connection.execute(
+            "UPDATE review_queue SET signals=? WHERE id=?",
+            (
+                '[{"code":"HR-01_MULTIPLE_LINK_BUTTONS","source":"rules","weight":12,'
+                '"explanation":"First explanation"},{"code":"AUTHORED_DENIED_DOMAIN",'
+                '"source":"heuristics","weight":70,"explanation":"Second explanation"}]',
+                self.review_id,
+            ),
+        )
+        queue = await self.server._review_queue_page()
+        _, _, detail = await self.server._dispatch(
+            "GET", f"/review/{self.review_id}", b""
+        )
+
+        self.assertIn(b"Multiple Link Buttons ", queue)
+        self.assertIn(b"+1 more", queue)
+        self.assertNotIn(b"First explanation", queue)
+        self.assertIn(b"First explanation", detail)
+        self.assertIn(b"Second explanation", detail)
+
+    async def test_dashboard_css_contracts_cover_density_and_accessibility(self) -> None:
+        page = await self.server._review_queue_page()
+
+        self.assertIn(b"--signal:#c33c1e", page)
+        self.assertIn(b"white-space:nowrap;overflow-wrap:normal", page)
+        self.assertIn(b":focus-visible", page)
+        self.assertIn(b"@media(prefers-reduced-motion:reduce)", page)
+        self.assertIn(b".data-table{display:block;min-width:0}", page)
+        self.assertIn(b"padding:.65rem .8rem", page)
+
+    def test_active_case_state_summaries_cover_release_states(self) -> None:
+        now = int(time.time())
+
+        def restriction(
+            status: str, suppressed_until: int | None
+        ) -> ActiveRestriction:
+            return ActiveRestriction(
+                sender_key="sender",
+                reference=None,
+                status=status,
+                reason="challenge_timeout",
+                suppressed_until=suppressed_until,
+                updated_at=now,
+                envelope=None,
+                evidence_created_at=None,
+                evidence_expires_at=None,
+            )
+
+        self.assertEqual(
+            self.server._restriction_summary(restriction("quarantined", None)),
+            "Review needed",
+        )
+        self.assertEqual(
+            self.server._restriction_summary(restriction("suppressed", None)),
+            "No automatic release",
+        )
+        self.assertEqual(
+            self.server._restriction_summary(restriction("suppressed", now - 1)),
+            "Awaiting next message",
+        )
+        self.assertIn(
+            "remaining",
+            self.server._restriction_summary(restriction("suppressed", now + 700)),
+        )
 
     async def test_masthead_places_page_indicator_before_connection(self) -> None:
         response = await self.server._enforcement_index_page()
@@ -855,7 +950,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Active Cases", index)
         self.assertIn(b"Test Sender (@testsender)", index)
         self.assertIn(b"Reviewable Evidence", index)
-        self.assertIn(b"State Reasons:", index)
+        self.assertIn(b"State reasons:", index)
         self.assertIn(b"Every active restriction currently has reviewable evidence", index)
         self.assertNotIn(b"<dt>Reasons</dt>", index)
         self.assertNotIn(b"enforcement-private-canary", index)
@@ -921,7 +1016,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 200)
         self.assertIn(b"Release pending", detail)
-        self.assertIn(b"Record Without Extending Restriction", detail)
+        self.assertIn(b"Keep restriction", detail)
 
     async def test_expired_evidence_remains_listed_and_restorable(self) -> None:
         user_id = 123456789
@@ -949,7 +1044,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         index = await self.server._enforcement_index_page()
         self.assertIn(b"Test Sender (@testsender)", index)
-        self.assertIn(b"Expired or unavailable", index)
+        self.assertIn(b"Unavailable", index)
         self.assertNotIn(b"expired-private-canary", index)
 
         status, _, detail = await self.server._dispatch_enforcement(
@@ -957,7 +1052,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn(b"Evidence expired or unavailable", detail)
-        self.assertIn(b"Allow Now", detail)
+        self.assertIn(b"Allow sender", detail)
         self.assertNotIn(b"expired-private-canary", detail)
 
         body = urlencode(
@@ -996,7 +1091,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 200)
         self.assertIn(b"failed authentication", detail)
-        self.assertIn(b"Allow Now", detail)
+        self.assertIn(b"Allow sender", detail)
 
     async def test_active_enforcement_disables_allow_without_identity(self) -> None:
         sender_key = self.protector.sender_key(987654321)
@@ -1035,9 +1130,11 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Manual Spam Review 1", page)
         self.assertIn(b"1 restriction has no reviewable evidence", page)
         self.assertIn(b"Identity unavailable", page)
-        self.assertIn(b"Expired or unavailable", page)
+        self.assertIn(b"Unavailable", page)
+        self.assertIn(b"<details class='advanced-recovery'>", page)
+        self.assertNotIn(b"<details class='advanced-recovery' open", page)
         self.assertIn(b"Allow an unidentified restricted sender by Telegram User ID", page)
-        self.assertIn(b"Allow Future Messages Without Restore", page)
+        self.assertIn(b"Allow without restore", page)
         self.assertNotIn(b'http-equiv="refresh" content="10"', page)
 
     async def test_expired_case_can_be_allowed_by_user_id_without_restore(self) -> None:
@@ -1124,7 +1221,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, 409)
-        self.assertIn(b"Use Active Case Allow Now", response)
+        self.assertIn(b"Use Allow sender in Active Cases", response)
         state = self.store.sender(sender_key)
         self.assertEqual(state.status, "quarantined")
         self.assertEqual(state.restriction_reference, restriction_reference)

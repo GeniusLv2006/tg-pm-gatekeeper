@@ -733,29 +733,18 @@ class ReviewAdminServer:
         return ", ".join(str(item) for item in value)
 
     @classmethod
-    def _signal_labels(cls, value: object) -> str:
+    def _signal_summary(cls, value: object) -> str:
         if not isinstance(value, list) or not value:
             return "—"
         labels: list[str] = []
         for item in value:
             code = item.get("code") if isinstance(item, dict) else item
             if code:
-                label = cls._human_label(str(code))
-                if isinstance(item, dict):
-                    source = item.get("source")
-                    weight = item.get("weight")
-                    explanation = item.get("explanation")
-                    details = []
-                    if source:
-                        details.append(cls._human_label(str(source)))
-                    if isinstance(weight, (int, float)):
-                        details.append(f"+{weight:g}")
-                    if details:
-                        label += " · " + " · ".join(details)
-                    if explanation:
-                        label += " — " + str(explanation)
-                labels.append(label)
-        return ", ".join(labels) or "—"
+                labels.append(cls._human_label(str(code)))
+        if not labels:
+            return "—"
+        remaining = len(labels) - 1
+        return labels[0] + (f" · +{remaining} more" if remaining else "")
 
     @classmethod
     def _signal_breakdown(cls, value: object) -> str:
@@ -1015,7 +1004,7 @@ class ReviewAdminServer:
             if state.status not in {"quarantined", "suppressed"}:
                 return 409, {}, self._page("Restricted Sender Not Found")
             if state.restriction_reference is not None:
-                return 409, {}, self._page("Use Active Case Allow Now")
+                return 409, {}, self._page("Use Allow sender in Active Cases")
             self.store.allow(sender_key)
             self.store.clear_dialog_snapshot(sender_key)
             self.cancel_timeout(sender_key)
@@ -1036,15 +1025,17 @@ class ReviewAdminServer:
         identities = await self._live_enforcement_identities(items)
         stats = self.store.enforcement_statistics()
         rows = "".join(
-            f"<tr><td><a href='/cases/{item.sender_key}'>Open</a></td>"
-            f"<td>{self._identity_cell(identities.get(item.sender_key))}</td>"
-            f"<td><span class='badge'>{html.escape(self._human_label(item.status))}</span></td>"
-            f"<td>{html.escape(self._human_label(item.reason))}</td>"
-            f"<td>{html.escape(self._remaining(item))}</td>"
-            f"<td>{'Available' if item.envelope is not None else 'Expired or unavailable'}</td>"
-            f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
+            "<tr>"
+            f"<td data-label='Sender'>{self._identity_cell(identities.get(item.sender_key), href=f'/cases/{item.sender_key}')}</td>"
+            f"<td data-label='State'><span class='badge'>{html.escape(self._human_label(item.status))}</span>"
+            f"<span class='cell-note'>{html.escape(self._restriction_summary(item))}</span></td>"
+            f"<td data-label='Trigger'>{html.escape(self._list_reason_label(item.reason))}</td>"
+            f"<td data-label='Evidence'><span class='availability{' availability-unavailable' if item.envelope is None else ''}'>"
+            f"{'Ready' if item.envelope is not None else 'Unavailable'}</span></td>"
+            f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.updated_at))}</td>"
+            "</tr>"
             for item in items
-        ) or "<tr><td colspan='7'>No active restrictions.</td></tr>"
+        ) or "<tr class='empty-row'><td colspan='5'>No active restrictions.</td></tr>"
         reason_counts = sorted(
             (key.removeprefix("reason:"), value)
             for key, value in stats.items()
@@ -1069,38 +1060,46 @@ class ReviewAdminServer:
             if stats["unidentified"]
             else " Every active restriction has a retained encrypted control identity."
         )
+        recovery = ""
+        if stats["unidentified"]:
+            recovery = (
+                "<details class='advanced-recovery'><summary>Advanced recovery"
+                f" <span>{stats['unidentified']} legacy</span></summary><div class='advanced-recovery-content'>"
+                "<p class='eyebrow'>Legacy Recovery</p>"
+                "<h2>Allow an unidentified restricted sender by Telegram User ID</h2>"
+                "<p>Use this only for a legacy restriction created before encrypted control "
+                "identities were retained. This removes the Gatekeeper restriction and cancels "
+                "pending deletion jobs, but cannot restore saved Telegram folder or notification "
+                "state without a peer reference. The entered ID is used only to derive the "
+                "existing sender key and is not stored.</p>"
+                "<form class='manual-release' method='post' action='/cases/release'>"
+                f"<input type='hidden' name='token' value='{self._csrf_token}'>"
+                "<label for='release-user-id'>Telegram User ID</label>"
+                "<input id='release-user-id' name='user_id' type='text' inputmode='numeric' "
+                "pattern='[0-9]+' autocomplete='off' required>"
+                "<button class='danger' type='submit'>Allow without restore</button>"
+                "</form></div></details>"
+            )
         content = (
             self._masthead(
                 "Active Cases", f"{total} Restrictions", csrf_token=self._csrf_token
             )
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
-            + "<main data-live-region='active-cases'><section class='queue-intro'><p class='eyebrow'>Protect Mode State</p>"
-            + "<h2>Review Active Restrictions</h2>"
-            + "<p>Every restriction remains manageable for its full lifetime. Encrypted evidence is retained separately for short-term review. Telegram block is not used.</p>"
+            + "<main class='list-main' data-live-region='active-cases'><section class='queue-intro compact-intro'><p class='eyebrow'>Protect mode state</p>"
+            + "<p class='lede'>Review every current restriction. Evidence availability is tracked separately; Telegram block is never used.</p>"
             + "<dl class='metric-grid'>"
             + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
             + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
             + f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
-            + f"<p class='refresh-note'><strong>State Reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></section>"
-            + "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Status</th><th>Reason</th><th>Restriction</th><th>Evidence</th><th>Updated</th></tr></thead>"
+            + "<details class='context-note'><summary>Restriction context</summary>"
+            + f"<p><strong>State reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></details></section>"
+            + "<div class='table-shell'><table class='data-table cases-table'><thead><tr><th>Sender</th><th>State</th><th>Trigger</th><th>Evidence</th><th>Age</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div>"
             + self._pagination("/cases", page, total)
             + "</main>"
-            + "<section class='decision-panel' data-live-region='legacy-recovery'><p class='eyebrow'>Legacy Recovery</p>"
-            + "<h2>Allow an unidentified restricted sender by Telegram User ID</h2>"
-            + "<p>Use this only for a legacy restriction created before encrypted control "
-            + "identities were retained. This removes the "
-            + "Gatekeeper restriction and cancels pending deletion jobs, but cannot restore "
-            + "saved Telegram folder or notification state without a peer reference. "
-            + "The entered ID is used only to "
-            + "derive the existing sender key and is not stored.</p>"
-            + "<form class='manual-release' method='post' action='/cases/release'>"
-            + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
-            + "<label for='release-user-id'>Telegram User ID</label>"
-            + "<input id='release-user-id' name='user_id' type='text' inputmode='numeric' "
-            + "pattern='[0-9]+' autocomplete='off' required>"
-            + "<button class='danger' type='submit'>Allow Future Messages Without Restore</button>"
-            + "</form></section>"
+            + "<section class='advanced-recovery-wrap' data-live-region='legacy-recovery'>"
+            + recovery
+            + "</section>"
         )
         return self._page(
             content,
@@ -1207,7 +1206,7 @@ class ReviewAdminServer:
         )
         allow_action = (
             self._action_form(
-                item.sender_key, "allow", "Allow Now", base="cases"
+                item.sender_key, "allow", "Allow sender", base="cases"
             )
             if user_id is not None
             else "<button type='button' disabled>Allow Unavailable</button>"
@@ -1222,16 +1221,7 @@ class ReviewAdminServer:
                 "No saved dialog state is available. Allow moves the conversation to the main "
                 "folder and enables notifications before changing policy."
             )
-        release_pending = (
-            item.status == "suppressed"
-            and item.suppressed_until is not None
-            and item.suppressed_until <= int(time.time())
-        )
-        keep_label = (
-            "Record Without Extending Restriction"
-            if release_pending
-            else "Leave Restriction Unchanged"
-        )
+        keep_label = "Keep restriction"
         content = f"""
         {self._masthead("Active Cases", self._human_label(item.status), csrf_token=self._csrf_token)}
         <p class="back"><a href="/cases">← Active Cases</a></p>
@@ -1366,7 +1356,7 @@ class ReviewAdminServer:
             <section class="decision-panel"><p class="eyebrow">Resolve Local Record</p>
               <h2>Remove this sender's pending review and cancel pending Gatekeeper deletion jobs. Telegram and trust state are unchanged.</h2>
               <div class="actions one">
-                {self._action_form(item.id, "dismiss", "Resolve and Cancel Pending Jobs")}
+                {self._action_form(item.id, "dismiss", "Dismiss & cancel jobs")}
               </div>
             </section>
             """
@@ -1402,9 +1392,9 @@ class ReviewAdminServer:
         <section class="decision-panel"><p class="eyebrow">Sender Decision</p>
           <h2>This decision applies to all pending entries for this sender.</h2>
           <div class="actions">
-            {self._action_form(item.id, "legitimate", "Legitimate · Allow Sender")}
-            {self._action_form(item.id, "spam", "Spam · Permanently Suppress and Delete", danger=True)}
-            {self._action_form(item.id, "dismiss", "Dismiss and Cancel Pending Jobs")}
+            {self._action_form(item.id, "legitimate", "Allow sender")}
+            {self._action_form(item.id, "spam", "Suppress and delete", danger=True)}
+            {self._action_form(item.id, "dismiss", "Dismiss & cancel jobs")}
           </div>
         </section>
         """
@@ -1478,19 +1468,17 @@ class ReviewAdminServer:
             self._masthead(
                 "Operations Dashboard", mode.title(), csrf_token=self._csrf_token
             )
-            + "<main data-live-region='operations'><section class='queue-intro'><p class='eyebrow'>Operator Overview</p>"
-            "<h2>Operations Dashboard</h2>"
-            "<p>Use Active Cases for recovery after a possible false positive. "
-            "Pending Reviews cover monitor-mode simulations and protect-mode exceptions.</p>"
+            + "<main class='list-main' data-live-region='operations'><section class='queue-intro compact-intro'><p class='eyebrow'>Operator overview</p>"
+            "<p class='lede'>Review restrictions, recover false positives, and resolve pending decisions.</p>"
             "<dl class='metric-grid'>"
             f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
             f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
             f"<div><dt>Pending Reviews</dt><dd class='data-value'>{pending_reviews}</dd></div>"
             "</dl></section>"
-            "<div class='table-shell'><table><thead><tr><th>Area</th><th>Purpose</th><th>Open</th></tr></thead><tbody>"
-            "<tr><td>Active Cases</td><td>Review every current restriction; evidence availability is shown separately.</td><td><a href='/cases'>Open</a></td></tr>"
-            "<tr><td>Pending Reviews</td><td>Resolve monitor-mode simulations and protect-mode exception reviews.</td><td><a href='/review'>Open</a></td></tr>"
-            "</tbody></table></div></main>"
+            "<nav class='area-grid' aria-label='Review areas'>"
+            f"<a class='area-card' href='/cases'><span class='eyebrow'>Restrictions</span><strong>Active Cases</strong><span>Review and recover current restrictions.</span><b>{active_restrictions}</b></a>"
+            f"<a class='area-card' href='/review'><span class='eyebrow'>Decisions</span><strong>Pending Reviews</strong><span>Resolve simulations and exception reviews.</span><b>{pending_reviews}</b></a>"
+            "</nav></main>"
         )
         return self._page(
             content,
@@ -1507,32 +1495,32 @@ class ReviewAdminServer:
         )
         identities = await self._live_identities(items)
         rows = "".join(
-            f"<tr><td><a href='/review/{item.id}'>#{item.id}</a></td>"
-            f"<td>{self._identity_cell(identities.get(item.id))}</td>"
-            f"<td>{html.escape(self._human_label(item.classification))}</td>"
-            f"<td>{html.escape(self._signal_labels(json.loads(item.signals)))}</td>"
-            f"<td>{item.message_count}</td>"
-            f"<td>{html.escape(self._relative_age(item.updated_at))}</td></tr>"
+            "<tr>"
+            f"<td data-label='Sender'>{self._identity_cell(identities.get(item.id), href=f'/review/{item.id}')}</td>"
+            f"<td data-label='Review'><span class='badge'>{html.escape(self._human_label(item.classification))}</span>"
+            f"<span class='cell-note'>Review #{item.id}</span></td>"
+            f"<td data-label='Signals'>{html.escape(self._signal_summary(json.loads(item.signals)))}</td>"
+            f"<td data-label='Messages' class='numeric'>{item.message_count}</td>"
+            f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.updated_at))}</td>"
+            "</tr>"
             for item in items
         )
         if not rows:
-            rows = "<tr><td colspan='6'>No pending reviews.</td></tr>"
+            rows = "<tr class='empty-row'><td colspan='5'>No pending reviews.</td></tr>"
         return self._page(
             self._masthead(
                 "Pending Reviews", f"{total} Pending", csrf_token=self._csrf_token
             )
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
-            + "<main data-live-region='pending-reviews'><section class='queue-intro'><p class='eyebrow'>Pending Reviews</p>"
-            "<h2>Review Pending Senders</h2>"
-            "<p>Sender identity is fetched from Telegram and cached briefly in memory. "
-            "Message content is fetched only when a review item is opened.</p>"
-            "<p>Deleting a conversation in Telegram does not remove its local pending review. "
-            "Open the row and resolve it when the referenced message is unavailable.</p>"
-            "<p class='refresh-note'>Connection health is checked quietly while this tab is visible. "
-            "The table updates in place only when review state changes.</p></section>"
-            "<div class='table-shell'><table><thead><tr><th>Case</th><th>Sender</th><th>Review Reason</th>"
-            "<th>Evidence Signals</th><th>Messages</th>"
-            f"<th>Last Seen</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            + "<main class='list-main' data-live-region='pending-reviews'><section class='queue-intro compact-intro'><p class='eyebrow'>Decision queue</p>"
+            "<p class='lede'>Open a sender to fetch message content and make a decision.</p>"
+            "<details class='context-note'><summary>Review and refresh behavior</summary>"
+            "<p>Identity is cached briefly in memory; message content is fetched only on the detail page. "
+            "Deleted Telegram conversations leave their local review available for resolution. "
+            "The list refreshes in place only when review state changes.</p></details></section>"
+            "<div class='table-shell'><table class='data-table reviews-table'><thead><tr><th>Sender</th><th>Review</th>"
+            "<th>Signals</th><th>Messages</th>"
+            f"<th>Age</th></tr></thead><tbody>{rows}</tbody></table></div>"
             + self._pagination("/review", page, total)
             + "</main>",
             raw=True,
@@ -1714,19 +1702,22 @@ class ReviewAdminServer:
         return name, getattr(sender, "username", None)
 
     @staticmethod
-    def _identity_cell(identity: LiveIdentity | None) -> str:
+    def _identity_cell(identity: LiveIdentity | None, *, href: str | None = None) -> str:
         if identity is None:
-            return "<span class='identity-name'>Identity unavailable</span>"
-        if identity.name is None:
-            label = "Name unavailable"
+            label = "Identity unavailable"
+            identity_id = ""
         else:
-            label = identity.name + (
-                f" (@{identity.username})" if identity.username else ""
-            )
-        return (
-            f"<span class='identity-name'>{html.escape(label)}</span>"
-            f"<span class='identity-id'>ID {identity.user_id}</span>"
-        )
+            if identity.name is None:
+                label = "Name unavailable"
+            else:
+                label = identity.name + (
+                    f" (@{identity.username})" if identity.username else ""
+                )
+            identity_id = f"<span class='identity-id'>ID {identity.user_id}</span>"
+        name = html.escape(label)
+        if href is not None:
+            name = f"<a class='identity-link' href='{html.escape(href, quote=True)}'>{name}</a>"
+        return f"<span class='identity-name'>{name}</span>{identity_id}"
 
     @staticmethod
     def _pagination(base: str, page: int, total: int) -> str:
@@ -1824,6 +1815,27 @@ class ReviewAdminServer:
         if seconds < 86400:
             return f"{max(1, seconds // 3600)}h remaining"
         return f"{max(1, seconds // 86400)}d remaining"
+
+    @staticmethod
+    def _restriction_summary(item: ActiveRestriction) -> str:
+        if item.status == "quarantined":
+            return "Review needed"
+        if item.suppressed_until is None:
+            return "No automatic release"
+        if item.suppressed_until <= int(time.time()):
+            return "Awaiting next message"
+        return ReviewAdminServer._remaining(item)
+
+    @staticmethod
+    def _list_reason_label(reason: str) -> str:
+        labels = {
+            "challenge_timeout": "Challenge timed out",
+            "timeout_notice_failed": "Timeout warning failed",
+            "warning_failed": "Failure warning failed",
+            "manual_permanent_suppression": "Manual suppression",
+            "attempts_exhausted": "Attempts exhausted",
+        }
+        return labels.get(reason, ReviewAdminServer._human_label(reason))
 
     @staticmethod
     def _reason_label(reason: str) -> str:
@@ -1948,8 +1960,8 @@ class ReviewAdminServer:
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(document_title)}</title><style>
-:root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--field:#f7f2e7;--line:#c9c3b5;--signal:#d84a28;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}}
-*{{box-sizing:border-box}}body{{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
+:root{{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--field:#f7f2e7;--line:#c9c3b5;--signal:#c33c1e;--signal-deep:#8f2c16;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}}
+*{{box-sizing:border-box}}body{{margin:0;overflow-x:hidden;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}}
 body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}}
 .masthead,main,.back{{position:relative;max-width:1120px;margin-left:auto;margin-right:auto}}
 .masthead{{display:grid;grid-template-columns:1fr auto auto auto;gap:2.5rem;align-items:center;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}}.masthead>div{{min-width:0}}
@@ -1979,5 +1991,15 @@ details{{border-top:1px solid var(--line);padding-top:1rem}}summary{{cursor:poin
 .actions.one{{grid-template-columns:minmax(0,24rem)}}.notice,.empty-state{{margin:1.5rem 0;padding:1.4rem;border:1px solid var(--line);border-left:5px solid var(--signal);background:#f8e9d8}}.empty-state p{{margin:.55rem 0 0;color:var(--muted)}}
 .manual-release{{display:grid;grid-template-columns:minmax(12rem,1fr) minmax(16rem,1.4fr);gap:.75rem;align-items:end;margin-top:1.5rem}}.manual-release label{{grid-column:1/-1;font-size:.68rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}}.manual-release input{{min-height:3.25rem;width:100%;padding:.8rem 1rem;border:1px solid var(--ink);background:var(--panel);color:var(--ink);font:700 .9rem/1.35 var(--font-data)}}
 .error-layout{{display:grid;place-items:center;min-height:calc(100vh - 8rem);padding-top:2rem}}.error-card{{width:min(100%,680px);padding:clamp(1.5rem,5vw,3rem);border:1px solid var(--line);border-top:5px solid var(--signal);background:var(--panel);box-shadow:10px 10px 0 var(--ink)}}.error-content{{width:100%;text-align:left}}.error-card h1{{margin:.65rem 0 1rem;font-size:clamp(2rem,6vw,3.5rem)}}.error-content>p:not(.eyebrow){{color:var(--muted)}}.error-command{{margin:1.5rem 0}}code{{padding:.2rem .4rem;background:#ece7da;font:600 .82rem/1.5 var(--font-data);font-variant-numeric:tabular-nums slashed-zero;font-feature-settings:"tnum" 1,"zero" 1}}.button-link{{margin-top:.5rem;text-decoration:none}}
-@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.logout-form{{grid-column:3;grid-row:1}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:2rem}}.actions,.metric-grid,.manual-release{{grid-template-columns:1fr}}}}
+.masthead,.back{{max-width:1280px}}main.list-main{{max-width:1280px}}.masthead{{gap:1.5rem;padding:1.35rem 1.25rem .85rem}}main{{padding:1.65rem 1.25rem 3.5rem}}
+.queue-intro{{margin-bottom:1.25rem}}.compact-intro .lede{{margin:.45rem 0 0;color:var(--ink);font-size:1rem}}.metric-grid{{gap:.65rem;margin-top:1rem}}.metric-grid>div{{padding:.7rem .85rem}}.metric-grid dd{{margin-top:.15rem}}
+.context-note{{margin-top:.75rem;padding:.65rem .85rem;border:1px solid var(--line);background:rgba(255,253,247,.55)}}.context-note summary{{font-size:.75rem}}.context-note p{{margin:.55rem 0 0;font-size:.75rem}}
+.table-shell{{box-shadow:6px 6px 0 var(--ink)}}.data-table{{table-layout:fixed}}.data-table th,.data-table td{{padding:.65rem .8rem;vertical-align:middle}}.cases-table th:nth-child(1){{width:27%}}.cases-table th:nth-child(2){{width:19%}}.cases-table th:nth-child(3){{width:30%}}.cases-table th:nth-child(4){{width:15%}}.cases-table th:nth-child(5){{width:9%}}.reviews-table th:nth-child(1){{width:28%}}.reviews-table th:nth-child(2){{width:23%}}.reviews-table th:nth-child(3){{width:31%}}.reviews-table th:nth-child(4){{width:10%}}.reviews-table th:nth-child(5){{width:8%}}
+.identity-link{{font-weight:850;color:var(--signal)}}.identity-name,.identity-id,.cell-note{{display:block}}.identity-name{{font-size:.92rem;overflow-wrap:anywhere}}.identity-id,.cell-note{{margin-top:.12rem;color:var(--muted);font:400 .68rem/1.35 var(--font-data);letter-spacing:.02em;font-variant-numeric:tabular-nums}}.cell-note{{line-height:1.2}}.age,.numeric{{font-family:var(--font-data);font-variant-numeric:tabular-nums}}.availability{{font-weight:700}}.availability-unavailable{{color:var(--signal-deep)}}
+.badge{{padding:.08rem .4rem;white-space:nowrap;overflow-wrap:normal;color:var(--signal-deep)}}.message-panel,.case-file,.decision-panel{{padding:clamp(1.1rem,3vw,1.8rem)}}.message-panel h2{{font-size:1.75rem;margin:.4rem 0 1.25rem}}.decision-panel{{margin-bottom:3rem}}.decision-panel h2{{font-size:1.35rem}}
+.advanced-recovery-wrap{{position:relative;width:calc(100% - 2.5rem);max-width:1255px;margin:0 auto 3rem}}.advanced-recovery{{padding:.8rem 1rem;border:1px solid var(--line);background:var(--panel)}}.advanced-recovery summary{{display:flex;justify-content:space-between;gap:1rem}}.advanced-recovery summary span{{color:var(--signal);font:700 .68rem/1.4 var(--font-data)}}.advanced-recovery-content{{padding:1.2rem .25rem .25rem}}.advanced-recovery-content h2{{font-size:1.35rem;margin:.45rem 0 .65rem}}.advanced-recovery-content p:not(.eyebrow){{color:var(--muted)}}
+.area-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}}.area-card{{position:relative;display:grid;gap:.45rem;min-height:10rem;padding:1.25rem 5rem 1.25rem 1.25rem;border:1px solid var(--ink);background:var(--panel);box-shadow:5px 5px 0 var(--ink);text-decoration:none}}.area-card strong{{font-size:1.35rem}}.area-card>span:not(.eyebrow){{color:var(--muted)}}.area-card b{{position:absolute;right:1.25rem;top:1.1rem;font:800 1.5rem/1 var(--font-data);color:var(--signal)}}.area-card:hover{{background:#f8e9d8}}
+button.danger{{border-color:var(--signal-deep)}}a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{{outline:3px solid var(--signal);outline-offset:3px}}
+@media(max-width:760px){{.masthead{{grid-template-columns:1fr auto auto;gap:1rem}}.connection{{grid-column:1/-1;grid-row:2}}.logout-form{{grid-column:3;grid-row:1}}.review-grid{{grid-template-columns:1fr}}.section{{max-width:100%}}main{{padding-top:1.25rem}}.actions,.metric-grid,.manual-release,.area-grid{{grid-template-columns:1fr}}.table-shell{{overflow:visible;border:0;background:transparent;box-shadow:none}}.data-table{{display:block;min-width:0}}.data-table thead{{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}}.data-table tbody{{display:grid;gap:.7rem}}.data-table tr{{display:grid;border:1px solid var(--line);background:var(--panel);box-shadow:4px 4px 0 var(--ink)}}.data-table td{{display:grid;grid-template-columns:minmax(6.25rem,.42fr) minmax(0,1fr);gap:.75rem;padding:.6rem .75rem;border-bottom:1px solid var(--line);overflow-wrap:anywhere}}.data-table td:before{{content:attr(data-label);color:var(--muted);font:700 .63rem/1.4 var(--font-data);letter-spacing:.08em;text-transform:uppercase}}.data-table td:last-child{{border-bottom:0}}.data-table .empty-row td{{display:block}}.data-table .empty-row td:before{{display:none}}.area-card{{min-height:8rem}}}}
+@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{scroll-behavior:auto!important;animation:none!important;transition:none!important}}button:hover,.button-link:hover{{transform:none}}}}
 </style>{dashboard_script}</head><body{live_attributes}>{body}</body></html>""".encode("utf-8")
