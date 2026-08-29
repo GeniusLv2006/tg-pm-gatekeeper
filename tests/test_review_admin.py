@@ -307,12 +307,19 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         page = await self.server._review_queue_page()
 
         self.assertIn(b"--accent-danger:#F87171", page)
+        self.assertIn(b"--accent-primary:#D4D4D4", page)
+        self.assertIn(b"--accent-live:#60A5FA", page)
+        self.assertIn(b"--bg-primary:#181818", page)
+        self.assertIn(b"--bg-secondary:#202020", page)
         self.assertIn(b"white-space:nowrap;overflow-wrap:normal", page)
         self.assertIn(b":focus-visible", page)
         self.assertIn(b"@media(prefers-reduced-motion:reduce)", page)
         self.assertIn(b".data-table{display:block;min-width:0}", page)
         self.assertIn(b"padding:.7rem .8rem", page)
         self.assertIn(b"@import url('https://fonts.googleapis.com/css2", page)
+        self.assertIn(b".data-table .badge{background:var(--surface-elevated);border-color:var(--border);color:var(--text-secondary)}", page)
+        self.assertIn(b".data-table .availability-unavailable{color:var(--text-secondary)}", page)
+        self.assertIn(b".mark{background:var(--surface-elevated);color:var(--text-primary);border:1px solid var(--border)}", page)
 
     def test_active_case_state_summaries_cover_release_states(self) -> None:
         now = int(time.time())
@@ -862,7 +869,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"gate-check unmet", detail)
         self.assertIn(b"Final policy decision", detail)
         self.assertIn(b"<strong>Strict Challenge</strong>", detail)
-        self.assertIn(b"--bg-tertiary:#272F42", detail)
+        self.assertIn(b"--bg-tertiary:#2A2A2A", detail)
         self.assertIn(b"pre.message{min-height:180px", detail)
         self.assertIn(b"background:var(--bg-tertiary);color:var(--text-primary)", detail)
         self.assertIn(b"pre.message.quote{min-height:96px;background:var(--surface-elevated)", detail)
