@@ -306,12 +306,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_css_contracts_cover_density_and_accessibility(self) -> None:
         page = await self.server._review_queue_page()
 
-        self.assertIn(b"--signal:#c33c1e", page)
+        self.assertIn(b"--accent-danger:#F87171", page)
         self.assertIn(b"white-space:nowrap;overflow-wrap:normal", page)
         self.assertIn(b":focus-visible", page)
         self.assertIn(b"@media(prefers-reduced-motion:reduce)", page)
         self.assertIn(b".data-table{display:block;min-width:0}", page)
-        self.assertIn(b"padding:.65rem .8rem", page)
+        self.assertIn(b"padding:.7rem .8rem", page)
+        self.assertIn(b"@import url('https://fonts.googleapis.com/css2", page)
 
     def test_active_case_state_summaries_cover_release_states(self) -> None:
         now = int(time.time())
@@ -861,12 +862,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"gate-check unmet", detail)
         self.assertIn(b"Final policy decision", detail)
         self.assertIn(b"<strong>Strict Challenge</strong>", detail)
-        self.assertIn(b"--field:#f7f2e7", detail)
+        self.assertIn(b"--bg-tertiary:#272F42", detail)
         self.assertIn(b"pre.message{min-height:180px", detail)
-        self.assertIn(b"background:var(--field);color:var(--ink)", detail)
-        self.assertIn(b"pre.message.quote{min-height:96px;background:var(--field)", detail)
-        self.assertIn(b".policy-outcome{margin-top:.75rem", detail)
-        self.assertIn(b"background:var(--field);color:var(--ink)", detail)
+        self.assertIn(b"background:var(--bg-tertiary);color:var(--text-primary)", detail)
+        self.assertIn(b"pre.message.quote{min-height:96px;background:var(--surface-elevated)", detail)
+        self.assertIn(b".policy-outcome{margin-top:.8rem", detail)
+        self.assertIn(b"background:var(--bg-tertiary)", detail)
         self.assertNotIn(b"background:var(--ink);color:#f7f1df", detail)
         self.assertIn(b"<ol class='signal-list' aria-label='Evidence signals'>", detail)
         self.assertIn(b"<strong>Preview Promotional Language</strong>", detail)

@@ -46,6 +46,12 @@ build/
 dist/
 *.egg-info/
 
+# Development documentation (internal use only)
+.dev-docs/
+
+# Local Claude tooling and workspace-specific settings
+.claude/
+
 # Editors and operating systems
 .DS_Store
 .idea/
