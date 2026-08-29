@@ -61,7 +61,7 @@ The operator dashboard has been redesigned with a dark, professional theme optim
 --bg-secondary: #1B2336    /* Card background */
 --text-primary: #F8FAFC    /* Primary text */
 --accent-primary: #22C55E  /* Success/active */
---accent-danger: #EF4444   /* Error/danger */
+--accent-danger: #F87171   /* Error/danger */
 --accent-warning: #F59E0B  /* Warning */
 ```
 

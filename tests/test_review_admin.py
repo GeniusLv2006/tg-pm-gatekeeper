@@ -306,12 +306,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_css_contracts_cover_density_and_accessibility(self) -> None:
         page = await self.server._review_queue_page()
 
-        self.assertIn(b"--signal:#c33c1e", page)
+        self.assertIn(b"--accent-danger:#F87171", page)
         self.assertIn(b"white-space:nowrap;overflow-wrap:normal", page)
         self.assertIn(b":focus-visible", page)
         self.assertIn(b"@media(prefers-reduced-motion:reduce)", page)
         self.assertIn(b".data-table{display:block;min-width:0}", page)
-        self.assertIn(b"padding:.65rem .8rem", page)
+        self.assertIn(b"padding:.7rem .8rem", page)
+        self.assertIn(b"@import url('https://fonts.googleapis.com/css2", page)
 
     def test_active_case_state_summaries_cover_release_states(self) -> None:
         now = int(time.time())

@@ -32,7 +32,7 @@
 | Muted | `#272F42` | `--color-muted` |
 | Muted Foreground | `#94A3B8` | `--color-muted-foreground` |
 | Border | `#475569` | `--color-border` |
-| Destructive | `#EF4444` | `--color-destructive` |
+| Destructive | `#F87171` | `--color-destructive` |
 | On Destructive | `#000000` | `--color-on-destructive` |
 | Ring | `#FFFFFF` | `--color-ring` |
 
