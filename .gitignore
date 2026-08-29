@@ -32,6 +32,12 @@ deny-domains.txt
 *.sqlite3
 *.sqlite3-*
 
+# Development documentation (internal use only)
+.dev-docs/
+
+# Local Claude tooling and workspace-specific settings
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -45,12 +51,6 @@ htmlcov/
 build/
 dist/
 *.egg-info/
-
-# Development documentation (internal use only)
-.dev-docs/
-
-# Local Claude tooling and workspace-specific settings
-.claude/
 
 # Editors and operating systems
 .DS_Store
