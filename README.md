@@ -139,10 +139,9 @@ deletes processed commands and all replies or case cards they create after 15 mi
 persisted and resumes after a service restart; Telegram deletion failures are retried automatically.
 
 One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
-referenced Telegram message. **Legitimate · Allow Sender** allows the sender, **Spam · Permanently
-Suppress and Delete** records an explicit owner decision and schedules deletion, and **Dismiss and
-Cancel Pending Jobs** closes the review and cancels pending Gatekeeper deletion jobs without changing
-the current trust decision.
+referenced Telegram message. **Allow sender** allows the sender, **Suppress and delete** records an
+explicit owner decision and schedules deletion, and **Dismiss & cancel jobs** closes the review and
+cancels pending Gatekeeper deletion jobs without changing the current trust decision.
 
 See [Dashboard and daily operation](docs/deployment.md#dashboard-and-daily-operation) for the detailed
 behavior and tunnel options.
@@ -187,8 +186,8 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual
 spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active
 challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use
-**Legitimate · Allow Sender** or **Allow Now** in the dashboard instead. If Active Case evidence has
-expired, the restriction remains listed and **Allow Now** continues to work through a separate
+**Allow sender** in the dashboard instead. If Active Case evidence has expired, the restriction
+remains listed and **Allow sender** continues to work through a separate
 encrypted control identity. A manual User ID form remains only for legacy restrictions that predate
 that identity record. The entered ID is used only to derive the existing sender key and is not
 stored. A raw user ID supplied on the command line may remain in shell history.
