@@ -8,7 +8,7 @@
 
 **Project:** TG PM Gatekeeper
 **Generated:** 2026-08-29 19:26:02
-**Category:** Smart Home/IoT Dashboard
+**Category:** Telegram moderation operations dashboard
 **Design Dials:** Variance 3/10 (Centered / Minimal) | Motion 3/10 (Subtle) | Density 8/10 (Dense / Dashboard)
 
 ---
@@ -23,20 +23,20 @@
 | On Primary | `#FFFFFF` | `--color-on-primary` |
 | Secondary | `#334155` | `--color-secondary` |
 | On Secondary | `#FFFFFF` | `--color-on-secondary` |
-| Accent/CTA | `#22C55E` | `--color-accent` |
-| On Accent/CTA | `#0F172A` | `--color-on-accent` |
-| Background | `#0F172A` | `--color-background` |
+| Accent/CTA | `#D4D4D4` | `--color-accent` |
+| On Accent/CTA | `#181818` | `--color-on-accent` |
+| Background | `#181818` | `--color-background` |
 | Foreground | `#F8FAFC` | `--color-foreground` |
-| Card | `#1B2336` | `--color-card` |
+| Card | `#202020` | `--color-card` |
 | Card Foreground | `#F8FAFC` | `--color-card-foreground` |
-| Muted | `#272F42` | `--color-muted` |
-| Muted Foreground | `#94A3B8` | `--color-muted-foreground` |
-| Border | `#475569` | `--color-border` |
+| Muted | `#2A2A2A` | `--color-muted` |
+| Muted Foreground | `#8A8A8A` | `--color-muted-foreground` |
+| Border | `#4A4A4A` | `--color-border` |
 | Destructive | `#F87171` | `--color-destructive` |
 | On Destructive | `#000000` | `--color-on-destructive` |
 | Ring | `#FFFFFF` | `--color-ring` |
 
-**Color Notes:** Dark tech + status green
+**Color Notes:** Neutral black-gray surfaces with restrained blue, amber, and red semantic accents
 
 ### Typography
 
@@ -82,8 +82,8 @@
 ```css
 /* Primary Button */
 .btn-primary {
-  background: #22C55E;
-  color: white;
+  background: #D4D4D4;
+  color: #181818;
   padding: 12px 24px;
   border-radius: 8px;
   font-weight: 600;
@@ -99,8 +99,8 @@
 /* Secondary Button */
 .btn-secondary {
   background: transparent;
-  color: #1E293B;
-  border: 2px solid #1E293B;
+  color: #D4D4D4;
+  border: 2px solid #4A4A4A;
   padding: 12px 24px;
   border-radius: 8px;
   font-weight: 600;
@@ -113,8 +113,8 @@
 
 ```css
 .card {
-  background: #0F172A;
-  border-radius: 12px;
+  background: #202020;
+  border-radius: 8px;
   padding: 24px;
   box-shadow: var(--shadow-md);
   transition: all 200ms ease;

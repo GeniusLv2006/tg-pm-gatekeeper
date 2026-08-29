@@ -21,11 +21,11 @@ The operator dashboard has been redesigned with a dark, professional theme optim
 ### Visual Updates
 
 **Colors:**
-- Background: Deep navy (#0F172A)
-- Cards: Slate blue (#1B2336)
-- Text: High contrast white (#F8FAFC)
-- Accent: Tech green (#22C55E)
-- Semantic colors for status (green/red/amber/blue)
+- Background: Neutral black (#181818)
+- Cards: Charcoal gray (#202020)
+- Text: Soft white (#F2F2F2)
+- Accent: Neutral light gray (#D4D4D4)
+- Semantic colors for status only (red/amber/blue)
 
 **Typography:**
 - UI Font: Fira Sans
@@ -57,10 +57,11 @@ The operator dashboard has been redesigned with a dark, professional theme optim
 ### CSS Variables
 
 ```css
---bg-primary: #0F172A      /* Main background */
---bg-secondary: #1B2336    /* Card background */
---text-primary: #F8FAFC    /* Primary text */
---accent-primary: #22C55E  /* Success/active */
+--bg-primary: #181818      /* Main background */
+--bg-secondary: #202020    /* Card background */
+--text-primary: #F2F2F2    /* Primary text */
+--accent-primary: #D4D4D4  /* Neutral action/focus accent */
+--accent-live: #60A5FA     /* Connected/live state */
 --accent-danger: #F87171   /* Error/danger */
 --accent-warning: #F59E0B  /* Warning */
 ```
