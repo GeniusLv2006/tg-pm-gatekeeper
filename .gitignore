@@ -46,6 +46,9 @@ build/
 dist/
 *.egg-info/
 
+# Development documentation (internal use only)
+.dev-docs/
+
 # Editors and operating systems
 .DS_Store
 .idea/
