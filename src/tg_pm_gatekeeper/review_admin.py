@@ -21,9 +21,10 @@ from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from telethon import functions, types
 
+from .dashboard_backend import DashboardBackendError, InProcessDashboardBackend
 from .message_facts import facts_from_message
 from .policy import EvidenceSignal, PolicyEngine
-from .restriction_actions import RestrictionActions, RestrictionReleaseResult
+from .restriction_actions import RestrictionActions
 from .rules import url_evidence, url_shape
 from .service import GatekeeperService
 from .store import ActiveRestriction, DialogSnapshot, ReviewItem, StateStore
@@ -202,6 +203,15 @@ class ReviewAdminServer:
             service,
             telegram_client,
             cancel_timeout=cancel_timeout,
+        )
+        self.backend = InProcessDashboardBackend(
+            store,
+            service,
+            telegram_client,
+            mute_days=mute_days,
+            cancel_timeout=cancel_timeout,
+            schedule_dialog_deletion=schedule_dialog_deletion,
+            restriction_actions=self.restriction_actions,
         )
         self._server: asyncio.AbstractServer | None = None
         self._csrf_token = secrets.token_urlsafe(32)
@@ -452,69 +462,33 @@ class ReviewAdminServer:
         action = values.get("action", [""])[0]
         if not secrets.compare_digest(token, self._csrf_token):
             return 400, {}, self._page("Invalid Action Token")
-        async with self.service.sender_lock(item.sender_key):
-            item = self.store.review_item(review_id)
-            if item is None or item.status != "pending" or item.reference is None:
-                return 409, {}, self._page("This Item Has Already Been Reviewed")
-            state = self.store.sender(item.sender_key)
-            if action == "legitimate":
-                if state.status in {"challenged", "quarantined", "suppressed"}:
-                    peer = self._peer_from_item(item)
-                    if not await self._restore(peer, item.sender_key):
-                        return (
-                            500,
-                            {},
-                            self._page("Telegram Action Failed; Item Was Not Changed"),
-                        )
-                self.store.allow(item.sender_key)
-                self.cancel_timeout(item.sender_key)
-                self.store.decide_sender_reviews(item.sender_key, "legitimate")
-            elif action == "spam":
-                peer = self._peer_from_item(item)
-                if state.status != "suppressed":
-                    await self._capture_manual_enforcement(item, peer)
-                if state.status not in {"challenged", "quarantined", "suppressed"}:
-                    if not await self._archive_and_mute(peer, item.sender_key):
-                        self.store.delete_enforcement_review(item.sender_key)
-                        return (
-                            500,
-                            {},
-                            self._page("Telegram Action Failed; Item Was Not Changed"),
-                        )
-                self.store.decide_sender_reviews(item.sender_key, "spam")
-                suppressed = self.store.suppress(
-                    item.sender_key,
-                    "manual_permanent_suppression",
-                    until=None,
-                    reference=item.reference,
-                    restriction_reference=self.service.restriction_reference(
-                        item.reference
-                    ),
-                )
-                self.store.activate_enforcement_review(
-                    item.sender_key,
-                    "manual_permanent_suppression",
-                    int(time.time())
-                    + self.service.active_case_retention_days * 86400,
-                )
-                now = int(time.time())
-                action_id = self.store.schedule_action(
-                    item.sender_key,
-                    reason="manual_permanent_suppression",
-                    reference=item.reference,
-                    execute_at=now,
-                    expected_revision=suppressed.revision,
-                    mode_independent=True,
-                    now=now,
-                )
-                self.schedule_dialog_deletion(action_id, now)
-                self.cancel_timeout(item.sender_key)
-            elif action == "dismiss":
-                self.store.decide_sender_reviews(item.sender_key, "dismissed")
-            else:
-                return 400, {}, self._page("Unknown Action")
-            self._identity_cache.pop(item.sender_key, None)
+        try:
+            await self.backend.request(
+                "reviews.decide", {"review_id": review_id, "action": action}
+            )
+        except DashboardBackendError as exc:
+            return self._backend_error(exc.code)
+        self._identity_cache.pop(item.sender_key, None)
         return 303, {"Location": "/review"}, b""
+
+    def _backend_error(self, code: str) -> tuple[int, dict[str, str], bytes]:
+        status, title = {
+            "unknown_action": (400, "Unknown Action"),
+            "invalid_request": (400, "Invalid Request"),
+            "review_not_found": (404, "Review Item Not Found"),
+            "review_already_decided": (409, "This Item Has Already Been Reviewed"),
+            "case_not_found": (404, "Active Case Not Found"),
+            "case_not_active": (409, "This Restriction Is No Longer Active"),
+            "identity_unavailable": (409, "Telegram Identity Is Unavailable"),
+            "restricted_sender_not_found": (409, "Restricted Sender Not Found"),
+            "use_active_case": (409, "Use Allow sender in Active Cases"),
+            "telegram_action_failed": (
+                500,
+                "Telegram Action Failed; Item Was Not Changed",
+            ),
+            "restriction_release_failed": (500, "Restriction Release Failed"),
+        }.get(code, (500, "Request Failed"))
+        return status, {}, self._page(title)
 
     def _logical_path(self, path: str) -> str | None:
         parts = path.split("/", 2)
@@ -967,20 +941,12 @@ class ReviewAdminServer:
         if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
             return 400, {}, self._page("Invalid Action Token")
         action = values.get("action", [""])[0]
-        if action == "keep":
-            self.store.audit(sender_key, "OPERATOR_KEEP", "kept", int(time.time()))
-            return 303, {"Location": "/cases"}, b""
-        if action != "allow":
-            return 400, {}, self._page("Unknown Action")
-        result = await self.restriction_actions.allow(sender_key)
-        if result == RestrictionReleaseResult.NOT_ACTIVE:
-            return 409, {}, self._page("This Restriction Is No Longer Active")
-        if result == RestrictionReleaseResult.IDENTITY_UNAVAILABLE:
-            return 409, {}, self._page("Telegram Identity Is Unavailable")
-        if result == RestrictionReleaseResult.TELEGRAM_ACTION_FAILED:
-            return 500, {}, self._page("Telegram Action Failed; Item Was Not Changed")
-        if result != RestrictionReleaseResult.ALLOWED:
-            return 500, {}, self._page("Restriction Release Failed")
+        try:
+            await self.backend.request(
+                "cases.decide", {"sender_key": sender_key, "action": action}
+            )
+        except DashboardBackendError as exc:
+            return self._backend_error(exc.code)
         self._identity_cache.pop(sender_key, None)
         return 303, {"Location": "/cases"}, b""
 
@@ -998,23 +964,10 @@ class ReviewAdminServer:
         user_id = int(user_id_text)
         if user_id <= 0 or user_id > (2**63 - 1):
             return 400, {}, self._page("Invalid Telegram User ID")
-        sender_key = self.protector.sender_key(user_id)
-        async with self.service.sender_lock(sender_key):
-            state = self.store.sender(sender_key)
-            if state.status not in {"quarantined", "suppressed"}:
-                return 409, {}, self._page("Restricted Sender Not Found")
-            if state.restriction_reference is not None:
-                return 409, {}, self._page("Use Allow sender in Active Cases")
-            self.store.allow(sender_key)
-            self.store.clear_dialog_snapshot(sender_key)
-            self.cancel_timeout(sender_key)
-            self._identity_cache.pop(sender_key, None)
-            self.store.audit(
-                sender_key,
-                "OPERATOR_ALLOW_WITHOUT_RESTORE",
-                "allowed",
-                int(time.time()),
-            )
+        try:
+            await self.backend.request("cases.release_legacy", {"user_id": user_id})
+        except DashboardBackendError as exc:
+            return self._backend_error(exc.code)
         return 303, {"Location": "/cases"}, b""
 
     async def _enforcement_index_page(self, *, page: int = 1) -> bytes:
