@@ -43,8 +43,8 @@ class DashboardRpcServer:
     async def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         info = self.path.parent.stat()
-        if info.st_mode & 0o077:
-            raise RuntimeError("dashboard runtime directory permissions are too broad")
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise RuntimeError("dashboard runtime directory is not owner-only")
         try:
             socket_info = self.path.lstat()
         except FileNotFoundError:

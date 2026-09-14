@@ -139,6 +139,12 @@ class DashboardRpcTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(DashboardBackendError, "core_unavailable"):
                 await client.request("reviews.decide", {})
 
+    async def test_broker_rejects_runtime_directory_with_group_access(self) -> None:
+        await self.server.stop()
+        self.runtime.chmod(0o750)
+        with self.assertRaisesRegex(RuntimeError, "not owner-only"):
+            await self.server.start()
+
 
 if __name__ == "__main__":
     unittest.main()

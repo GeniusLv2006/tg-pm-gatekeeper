@@ -73,6 +73,9 @@ class DashboardHttpServer:
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_info = self.socket_path.parent.stat()
+        if parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o077:
+            raise RuntimeError("dashboard runtime directory is not owner-only")
         try:
             info = self.socket_path.lstat()
         except FileNotFoundError:
