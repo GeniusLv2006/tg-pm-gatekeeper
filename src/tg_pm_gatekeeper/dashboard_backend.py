@@ -10,11 +10,11 @@ import logging
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
 from urllib.parse import urlsplit
 
 from telethon import functions, types
 
+from .dashboard_protocol import DashboardBackendError
 from .message_facts import facts_from_message
 from .restriction_actions import RestrictionActions, RestrictionReleaseResult
 from .rules import url_evidence, url_shape
@@ -27,18 +27,6 @@ IDENTITY_CACHE_LIMIT = 256
 IDENTITY_CACHE_SECONDS = 5 * 60
 IDENTITY_FAILURE_CACHE_SECONDS = 30
 IDENTITY_BATCH_SIZE = 100
-
-
-class DashboardBackend(Protocol):
-    async def request(
-        self, method: str, params: dict[str, object]
-    ) -> dict[str, object]: ...
-
-
-class DashboardBackendError(RuntimeError):
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
 
 
 class InProcessDashboardBackend:

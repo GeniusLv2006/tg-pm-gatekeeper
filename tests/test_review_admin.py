@@ -304,7 +304,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Second explanation", detail)
 
     async def test_dashboard_css_contracts_cover_density_and_accessibility(self) -> None:
-        page = await self.server._review_queue_page()
+        status, headers, page = await self.server._dispatch("GET", "/dashboard.css", b"")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/css; charset=utf-8")
 
         self.assertIn(b"--signal:#c33c1e", page)
         self.assertIn(b"white-space:nowrap;overflow-wrap:normal", page)
@@ -426,32 +428,34 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "GET", f"/review/{self.review_id}", b""
         )
         self.assertEqual(status, 200)
+        _, _, stylesheet = await self.server._dispatch("GET", "/dashboard.css", b"")
         self.assertIn(
             b".decision-panel{position:relative;width:calc(100% - 2.5rem);"
             b"max-width:1080px",
-            response,
+            stylesheet,
         )
-        self.assertNotIn(b".decision-panel h2{max-width:", response)
+        self.assertNotIn(b".decision-panel h2{max-width:", stylesheet)
         self.assertIn(
             b".actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))",
-            response,
+            stylesheet,
         )
-        self.assertIn(b"button{width:100%}", response)
+        self.assertIn(b"button{width:100%}", stylesheet)
 
     async def test_error_page_uses_dashboard_layout_and_actionable_copy(self) -> None:
         response = self.server._page("Invalid Access Token")
+        _, _, stylesheet = await self.server._dispatch("GET", "/dashboard.css", b"")
         self.assertIn(b"class='masthead'", response)
         self.assertIn(b"class='error-card'", response)
         self.assertIn(b"has already been used", response)
         self.assertIn(b"scripts/dashboard-tunnel.sh SSH_TARGET", response)
         self.assertNotIn(b"Return to Dashboard", response)
-        self.assertIn(b"width:min(100%,680px)", response)
+        self.assertIn(b"width:min(100%,680px)", stylesheet)
         self.assertIn(b"class='error-content'", response)
-        self.assertIn(b".error-content{width:100%;text-align:left", response)
-        self.assertNotIn(b".error-content{max-width:", response)
+        self.assertIn(b".error-content{width:100%;text-align:left", stylesheet)
+        self.assertNotIn(b".error-content{max-width:", stylesheet)
         self.assertNotIn(
             b".error-content{max-width:46ch;margin:0 auto;text-align:center",
-            response,
+            stylesheet,
         )
         self.assertNotIn(b"<body><h1>", response)
 
@@ -478,11 +482,15 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
             self.assertIn(b"Content-Type: text/javascript; charset=utf-8", response)
             self.assertIn(b"script-src 'self'; connect-src 'self'", response)
+            self.assertIn(b"style-src 'self'", response)
+            self.assertNotIn(b"'unsafe-inline'", response)
             self.assertIn(b"Cache-Control: no-store", response)
             self.assertIn(b"Referrer-Policy: no-referrer", response)
             self.assertNotIn(b"Set-Cookie:", response)
         finally:
             await self.server.stop()
+        self.assertFalse(self.server.socket_path.exists())
+        self.assertFalse(self.server.access_token_path.exists())
 
     async def test_production_dispatch_requires_capability_path(self) -> None:
         status, _, response = await self.server._dispatch(
@@ -493,6 +501,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"Return to Dashboard", response)
         for protected_path in (
             "/dashboard.js",
+            "/dashboard.css",
             "/dashboard/status?path=%2Freview",
         ):
             protected_status, _, _ = await self.server._dispatch(
@@ -727,18 +736,16 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                     user_id, -987654321
                 ),
             )
-        items = self.store.active_restrictions()
-
-        identities = await self.server._live_enforcement_identities(items)
-        self.assertEqual(len(identities), 3)
+        first = await self.server.backend.request("cases.list", {"page": 1})
+        self.assertEqual(len(first["items"]), 3)
         self.assertEqual(self.client.entity_requests, 1)
 
-        self.server._identity_cache.clear()
+        self.server.backend._identity_cache.clear()
         self.client.fail_entity_requests = True
-        failed = await self.server._live_enforcement_identities(items)
-        repeated = await self.server._live_enforcement_identities(items)
-        self.assertEqual(len(failed), 3)
-        self.assertEqual(len(repeated), 3)
+        failed = await self.server.backend.request("cases.list", {"page": 1})
+        repeated = await self.server.backend.request("cases.list", {"page": 1})
+        self.assertEqual(len(failed["items"]), 3)
+        self.assertEqual(len(repeated["items"]), 3)
         self.assertEqual(self.client.entity_requests, 2)
 
     async def test_legacy_enforcement_routes_redirect(self) -> None:
@@ -861,13 +868,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"gate-check unmet", detail)
         self.assertIn(b"Final policy decision", detail)
         self.assertIn(b"<strong>Strict Challenge</strong>", detail)
-        self.assertIn(b"--field:#f7f2e7", detail)
-        self.assertIn(b"pre.message{min-height:180px", detail)
-        self.assertIn(b"background:var(--field);color:var(--ink)", detail)
-        self.assertIn(b"pre.message.quote{min-height:96px;background:var(--field)", detail)
-        self.assertIn(b".policy-outcome{margin-top:.75rem", detail)
-        self.assertIn(b"background:var(--field);color:var(--ink)", detail)
-        self.assertNotIn(b"background:var(--ink);color:#f7f1df", detail)
+        _, _, stylesheet = await self.server._dispatch("GET", "/dashboard.css", b"")
+        self.assertIn(b"--field:#f7f2e7", stylesheet)
+        self.assertIn(b"pre.message{min-height:180px", stylesheet)
+        self.assertIn(b"background:var(--field);color:var(--ink)", stylesheet)
+        self.assertIn(b"pre.message.quote{min-height:96px;background:var(--field)", stylesheet)
+        self.assertIn(b".policy-outcome{margin-top:.75rem", stylesheet)
+        self.assertNotIn(b"background:var(--ink);color:#f7f1df", stylesheet)
         self.assertIn(b"<ol class='signal-list' aria-label='Evidence signals'>", detail)
         self.assertIn(b"<strong>Preview Promotional Language</strong>", detail)
         self.assertIn(b"<span class='signal-source'>Preview</span>", detail)
@@ -1263,7 +1270,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender("sender").status, "allowed")
         self.assertEqual(self.cancelled, ["sender"])
         self.assertIsNone(self.store.review_item(self.review_id).reference)
-        self.assertNotIn("sender", self.server._identity_cache)
+        self.assertNotIn("sender", self.server.backend._identity_cache)
 
     async def test_spam_decision_performs_explicit_telegram_actions(self) -> None:
         self.client.message = SimpleNamespace(

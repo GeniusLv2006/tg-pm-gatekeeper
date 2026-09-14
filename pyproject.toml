@@ -33,3 +33,6 @@ tg-pm-gatekeeper-cli = "tg_pm_gatekeeper.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+tg_pm_gatekeeper = ["assets/*.css", "assets/*.js"]
