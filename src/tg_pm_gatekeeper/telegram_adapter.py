@@ -18,9 +18,10 @@ from telethon.sessions import StringSession
 from telethon.tl import TLObject
 
 from .config import ConfigurationError, Settings, read_private_file
+from .dashboard_backend import InProcessDashboardBackend
+from .dashboard_rpc import DashboardRpcServer
 from .message_facts import facts_from_message
 from .restriction_actions import RestrictionActions, RestrictionReleaseResult
-from .review_admin import ReviewAdminServer
 from .rules import normalized_domain
 from .service import (
     TEST_MESSAGE_DELETE_DELAY_SECONDS,
@@ -441,8 +442,7 @@ class TelegramAdapter:
             self.client,
             cancel_timeout=self.cancel_timeout,
         )
-        self._review_admin = ReviewAdminServer(
-            settings.review_socket_path,
+        dashboard_backend = InProcessDashboardBackend(
             store,
             service,
             self.client,
@@ -450,6 +450,9 @@ class TelegramAdapter:
             cancel_timeout=self.cancel_timeout,
             schedule_dialog_deletion=self.schedule_dialog_deletion,
             restriction_actions=self._restriction_actions,
+        )
+        self._dashboard_rpc = DashboardRpcServer(
+            settings.dashboard_rpc_socket_path, dashboard_backend
         )
 
     async def run(self) -> None:
@@ -464,7 +467,7 @@ class TelegramAdapter:
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
         await self._recover_pending_actions()
-        await self._review_admin.start()
+        await self._dashboard_rpc.start()
         self.client.add_event_handler(
             self._on_message, events.NewMessage(incoming=True)
         )
@@ -504,7 +507,7 @@ class TelegramAdapter:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            await self._review_admin.stop()
+            await self._dashboard_rpc.stop()
             await self.client.disconnect()
 
     async def _heartbeat_loop(self) -> None:

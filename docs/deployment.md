@@ -127,7 +127,7 @@ Continue when:
 
 For memory regression checks, inspect the redacted `runtime_metrics` events in the container log.
 They report only current RSS, bounded Session entity count and evictions, Telethon update-cache count,
-and task counts. The Session cache is capped at 1024 entities and the Telethon update cache at 512;
+and task counts. The Session cache is capped at 256 user entities and the Telethon update cache at 128;
 neither limit contains identity names or message content.
 
 If the container is not healthy, run:
@@ -151,7 +151,8 @@ open it immediately. Login creates a browser-bound session protected by a random
 a path-scoped HttpOnly cookie. Copying the address into another browser does not transfer access.
 Each successful login rotates both credentials and invalidates the previous session. Use **Sign Out**
 to revoke the session explicitly. Sessions expire after 30 minutes without a dashboard request or
-eight hours in total. `Ctrl+C` closes the tunnel but does not replace **Sign Out** as revocation.
+eight hours in total. The sidecar exits after 10 minutes without authenticated activity. **Sign Out**
+and `Ctrl+C` both stop the sidecar, erase its process-local credentials, and leave the core running.
 
 ### 3. Send a safe test
 
@@ -184,8 +185,11 @@ destructive jobs. Explicit manual spam decisions and dedicated-test cleanup rema
 
 ## Dashboard and daily operation
 
-The dashboard has no public TCP listener. The tunnel helper connects local port `8765` to the
-owner-only Unix socket on the server and reads a one-time access token. Login rotates that token and
+The dashboard has no public TCP listener. The tunnel helper starts a hardened, network-disabled
+sidecar, connects local port `8765` to its owner-only Unix socket, and reads a fresh one-time access
+token. The sidecar has no database, Telegram session, HMAC key, review key, denylist, or `config.env`
+mount; it can request only a bounded whitelist of operations from the core over a second owner-only
+Unix socket. Login rotates the token and
 redirects to a process-local 256-bit capability path while setting a host-only, path-scoped HttpOnly
 cookie with `SameSite=Strict`. The cookie is intentionally not marked `Secure` because the supported
 transport is loopback HTTP inside the SSH tunnel, not direct HTTPS; the remote service remains an
@@ -296,13 +300,15 @@ control identity.
 ### Tunnel options
 
 The SSH target can be an alias or `user@host`. Run `scripts/dashboard-tunnel.sh -h` for every option.
+The remote project defaults to `/opt/tg-pm-gatekeeper`; use `-d` or
+`TG_DASHBOARD_PROJECT_DIR` for another validated absolute path.
 Common workstation settings are:
 
 ```shell
 TG_DASHBOARD_HOST=root@gatekeeper.example
 TG_DASHBOARD_PORT=18765
-TG_DASHBOARD_SOCKET=/srv/gatekeeper/review.sock
-TG_DASHBOARD_TOKEN=/srv/gatekeeper/review.access-token
+TG_DASHBOARD_SOCKET=/run/tg-pm-gatekeeper/dashboard.sock
+TG_DASHBOARD_TOKEN=/run/tg-pm-gatekeeper/dashboard.access-token
 TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf"
 ```
 
@@ -458,7 +464,6 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 | `TG_REVIEW_KEY_FILE` | `/run/secrets/review_key` | Active Case snapshot encryption key |
 | `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED` | `false` | Enable owner commands in Telegram Saved Messages |
 | `TG_TEST_SENDER_ID` | empty | Dedicated arithmetic-flow test account |
-| `TG_DASHBOARD_SOCKET_PATH` | `/var/lib/tg-pm-gatekeeper/review.sock` | Owner-only dashboard Unix socket |
 
 Invalid bounded values stop startup instead of silently changing behavior.
 
@@ -493,7 +498,7 @@ attempts. Remove the value after testing.
 | `startup_database_migration_failed` | Keep the database and any pre-migration backup intact; verify the current schema and follow the schema-update procedure. |
 | `startup_telegram_session_failed` | Confirm the Telegram session is still authorized from an official client and reprovision it if revoked. |
 | `startup_runtime_failed` | Inspect the immediately preceding privacy-safe events and container state; a supervised heartbeat or pruning failure intentionally exits for restart. |
-| Dashboard token or socket is missing | Confirm the container is healthy, then inspect `/var/lib/tg-pm-gatekeeper/review.sock` and `review.access-token`. |
+| Dashboard token or socket is missing | Run the tunnel helper, then inspect the `dashboard` service logs and `/run/tg-pm-gatekeeper/dashboard.sock`. |
 | Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
 | Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Dismiss & cancel jobs** if the sender decision no longer needs the message. |
 | Active Case says evidence is unavailable | The evidence retention window ended; the restriction remains listed and **Allow sender** still uses its encrypted control identity. |
@@ -513,7 +518,7 @@ read its private files.
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh "$DEPLOY_HOST" 'ss -lnt'
 ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/review.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
-ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /var/lib/tg-pm-gatekeeper/review.sock /var/lib/tg-pm-gatekeeper/review.access-token'
+ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /run/tg-pm-gatekeeper/core.sock'
 ```
 
 Everything is correct when:
@@ -524,7 +529,8 @@ Everything is correct when:
 - session and key files are mode `600`;
 - `config.env` and the denylist are mode `640` and owned by `root:10001`;
 - the state directory is mode `700` and owned by `10001:10001`; and
-- the review socket and access token are mode `600` and owned by `10001:10001`.
+- the core socket is mode `600` and owned by `10001:10001`; while the sidecar is active, its socket
+  and access token have the same ownership and mode.
 
 Stop and correct any mismatch before enabling `protect`. The dashboard access token is replaced on
 every service start.

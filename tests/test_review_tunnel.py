@@ -62,13 +62,17 @@ class ReviewTunnelTests(unittest.TestCase):
             root = Path(directory)
             pid_file = root / "ssh.pid"
             opened_file = root / "opened.url"
+            ssh_log = root / "ssh.log"
             fake_ssh = root / "ssh"
             fake_curl = root / "curl"
             fake_open = root / "open"
             fake_ssh.write_text(
                 "#!/bin/sh\n"
-                'case "$*" in *"cat /var/lib/tg-pm-gatekeeper/review.access-token"*) '
-                "echo test-access-token; exit 0;; esac\n"
+                'printf "%s\\n" "$*" >> "$FAKE_SSH_LOG"\n'
+                'case "$*" in *"dashboard-remote.sh start"*) '
+                "exit 0;; "
+                '*"cat /run/tg-pm-gatekeeper/dashboard.access-token"*) echo test-access-token; exit 0;; '
+                '*"dashboard-remote.sh stop"*) exit 0;; esac\n'
                 'echo $$ > "$FAKE_SSH_PID"\n'
                 "sleep 1\n",
                 encoding="utf-8",
@@ -93,6 +97,7 @@ class ReviewTunnelTests(unittest.TestCase):
                     "PATH": f"{root}:{environment['PATH']}",
                     "FAKE_SSH_PID": str(pid_file),
                     "FAKE_OPENED_URL": str(opened_file),
+                    "FAKE_SSH_LOG": str(ssh_log),
                 }
             )
             result = subprocess.run(
@@ -109,6 +114,19 @@ class ReviewTunnelTests(unittest.TestCase):
             self.assertEqual(
                 opened_file.read_text(encoding="utf-8"),
                 "http://127.0.0.1:8765/login?token=test-access-token",
+            )
+            commands = ssh_log.read_text(encoding="utf-8")
+            self.assertIn(
+                "/opt/tg-pm-gatekeeper/scripts/dashboard-remote.sh start",
+                commands,
+            )
+            self.assertIn(
+                "127.0.0.1:8765:/run/tg-pm-gatekeeper/dashboard.sock",
+                commands,
+            )
+            self.assertIn(
+                "/opt/tg-pm-gatekeeper/scripts/dashboard-remote.sh stop",
+                commands,
             )
 
     def test_ssh_target_is_required(self) -> None:
@@ -135,8 +153,10 @@ class ReviewTunnelTests(unittest.TestCase):
             fake_curl = root / "curl"
             fake_ssh.write_text(
                 "#!/bin/sh\n"
-                'case "$*" in *"cat /var/lib/tg-pm-gatekeeper/review.access-token"*) '
-                "echo test-access-token; exit 0;; esac\n"
+                'case "$*" in *"dashboard-remote.sh start"*) '
+                "exit 0;; "
+                '*"cat /run/tg-pm-gatekeeper/dashboard.access-token"*) echo test-access-token; exit 0;; '
+                '*"dashboard-remote.sh stop"*) echo yes > "$FAKE_REMOTE_STOPPED"; exit 0;; esac\n'
                 'echo $$ > "$FAKE_SSH_PID"\n'
                 "trap 'echo yes > \"$FAKE_SSH_TERMINATED\"; exit 0' TERM INT\n"
                 "while :; do sleep 0.1; done\n",
@@ -157,6 +177,7 @@ class ReviewTunnelTests(unittest.TestCase):
                     "PATH": f"{root}:{environment['PATH']}",
                     "FAKE_SSH_PID": str(pid_file),
                     "FAKE_SSH_TERMINATED": str(terminated_file),
+                    "FAKE_REMOTE_STOPPED": str(root / "remote.stopped"),
                 }
             )
             process = subprocess.Popen(
@@ -183,10 +204,23 @@ class ReviewTunnelTests(unittest.TestCase):
             output = "".join(output_lines) + stdout
 
             self.assertEqual(process.returncode, 130, stderr)
-            self.assertIn("Tunnel closed.", output)
+            self.assertIn("Connected:", output)
             self.assertTrue(terminated_file.exists())
+            self.assertTrue((root / "remote.stopped").exists())
             with self.assertRaises(ProcessLookupError):
                 os.kill(ssh_pid, 0)
+
+    def test_project_directory_rejects_shell_injection(self) -> None:
+        result = self.run_script(
+            "-d", "/opt/gatekeeper;touch-pwned", "user@server.example"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsafe path", result.stderr)
+
+    def test_project_directory_must_be_absolute(self) -> None:
+        result = self.run_script("-d", "relative/project", "user@server.example")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("absolute path", result.stderr)
 
 
 if __name__ == "__main__":

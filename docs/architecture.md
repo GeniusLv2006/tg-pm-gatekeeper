@@ -141,16 +141,18 @@ destructive jobs but not explicit manual spam decisions or dedicated-test cleanu
 
 ## Post-event review
 
-The running process serves a small Operations Dashboard on an owner-only Unix socket. The socket is not
-published by Docker and is intended to be reached only through SSH local forwarding. This keeps the
-live Telethon client as the only Telegram connection and avoids exposing an administrative TCP
-service.
+The core process exposes a small, versioned JSON broker on an owner-only Unix socket. An on-demand
+Dashboard sidecar owns HTTP authentication and presentation, has networking disabled, and receives
+no database or secret mounts. It can call only a fixed operation whitelist over the broker. The
+Dashboard socket is not published by Docker and is reached only through SSH local forwarding. This
+keeps the live core as the only Telegram connection and avoids an administrative TCP service.
 
 The queue stores one pending row per sender: the simulated decision, evidence signals, non-content
 structural features, a consolidated message count, and one authenticated encrypted reference
 containing peer access data and a message ID. It is not a conversation archive. When an operator
-opens an item, the running client decrypts that single reference and fetches the referenced message
-and sender from Telegram. Those values are rendered in the response but are not persisted or logged.
+opens an item, the core decrypts that single reference and fetches the referenced message and sender
+from Telegram. Those values cross the Unix broker only in memory for the authenticated detail
+request; neither process persists or logs them.
 
 The Pending Reviews and Active Cases pages decrypt their respective references to display Telegram
 IDs and resolve names and usernames from Telegram in bounded batches. Both lists use stable
@@ -164,7 +166,9 @@ The one-time login rotates the access token, a random 256-bit capability path, a
 256-bit browser session token. The session token is stored only in process memory and a host-only,
 path-scoped HttpOnly cookie with `SameSite=Strict`; the capability remains in the URL. Both credentials
 are required, so copying the URL into another browser does not transfer access. A new login or
-CSRF-protected logout immediately invalidates both credentials. The server also rejects a session
+CSRF-protected logout immediately invalidates both credentials and stops the sidecar after returning
+the response. The sidecar also exits after 10 minutes without authenticated activity; invalid login
+traffic does not extend its lifetime. The server rejects a browser session
 after 30 minutes without a dashboard request or eight hours from login. Missing, incorrect, expired,
 or superseded credentials receive the same 404 response. Every internal link, form, script, page
 refresh, and status request remains beneath the capability path.

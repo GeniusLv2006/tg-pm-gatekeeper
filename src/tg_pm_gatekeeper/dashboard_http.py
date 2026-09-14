@@ -105,6 +105,7 @@ class DashboardHttpServer:
         except FileNotFoundError:
             pass
         self.access_token_path.unlink(missing_ok=True)
+        self.access_token_path.with_suffix(".access-token.tmp").unlink(missing_ok=True)
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

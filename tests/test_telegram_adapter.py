@@ -905,7 +905,7 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         adapter._recover_pending_actions = AsyncMock()
         adapter._reconcile_operator_artifacts = AsyncMock()
         adapter._operator_artifact_cleanup_loop = AsyncMock()
-        adapter._review_admin = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
+        adapter._dashboard_rpc = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
         adapter._timeout_tasks = {}
         adapter._maintenance_tasks = set()
         adapter._heartbeat_task = None
@@ -930,7 +930,7 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "heartbeat write failed"):
             await adapter.run()
 
-        adapter._review_admin.stop.assert_awaited_once()
+        adapter._dashboard_rpc.stop.assert_awaited_once()
         adapter.client.disconnect.assert_awaited_once()
 
     async def test_normal_disconnect_cancels_and_awaits_heartbeat(self) -> None:
@@ -944,7 +944,7 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         await adapter.run()
 
         self.assertTrue(adapter._heartbeat_task.done())
-        adapter._review_admin.stop.assert_awaited_once()
+        adapter._dashboard_rpc.stop.assert_awaited_once()
         adapter.client.disconnect.assert_awaited_once()
 
     async def test_operator_handler_registration_is_opt_in(self) -> None:
