@@ -443,21 +443,71 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_error_page_uses_dashboard_layout_and_actionable_copy(self) -> None:
         response = self.server._page("Invalid Access Token")
-        _, _, stylesheet = await self.server._dispatch("GET", "/dashboard.css", b"")
+        self.assertIn(b'href="/dashboard-error.css"', response)
+        status, headers, stylesheet = await self.server._dispatch(
+            "GET",
+            "/dashboard-error.css",
+            b"",
+            request_headers={"host": "127.0.0.1:8765"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/css; charset=utf-8")
         self.assertIn(b"class='masthead'", response)
         self.assertIn(b"class='error-card'", response)
         self.assertIn(b"has already been used", response)
         self.assertIn(b"scripts/dashboard-tunnel.sh SSH_TARGET", response)
         self.assertNotIn(b"Return to Dashboard", response)
-        self.assertIn(b"width:min(100%,680px)", stylesheet)
+        self.assertIn(b"width:min(100%,44rem)", stylesheet)
         self.assertIn(b"class='error-content'", response)
-        self.assertIn(b".error-content{width:100%;text-align:left", stylesheet)
-        self.assertNotIn(b".error-content{max-width:", stylesheet)
-        self.assertNotIn(
-            b".error-content{max-width:46ch;margin:0 auto;text-align:center",
-            stylesheet,
-        )
         self.assertNotIn(b"<body><h1>", response)
+
+    async def test_partial_request_does_not_block_shutdown(self) -> None:
+        await self.server.start()
+        _, writer = await asyncio.open_unix_connection(self.server.socket_path)
+        writer.write(b"GET / HTTP/1.1\r\n")
+        await writer.drain()
+        for _ in range(100):
+            if self.server._connection_tasks:
+                break
+            await asyncio.sleep(0)
+        self.assertTrue(self.server._connection_tasks)
+
+        await asyncio.wait_for(self.server.stop(), timeout=1)
+
+        writer.close()
+        await writer.wait_closed()
+        self.assertFalse(self.server.socket_path.exists())
+
+    async def test_disconnected_writer_is_closed_and_untracked(self) -> None:
+        class Reader:
+            async def readuntil(self, _separator: bytes) -> bytes:
+                return b"GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n"
+
+            async def readexactly(self, _length: int) -> bytes:
+                return b""
+
+        class Writer:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                raise ConnectionResetError
+
+            def close(self) -> None:
+                self.closed = True
+
+            async def wait_closed(self) -> None:
+                pass
+
+        writer = Writer()
+        await self.server._handle_connection(Reader(), writer)
+
+        self.assertTrue(writer.closed)
+        self.assertFalse(self.server._connection_tasks)
+        self.assertFalse(self.server._reading_tasks)
 
     async def test_admin_server_uses_owner_only_unix_socket(self) -> None:
         await self.server.start()

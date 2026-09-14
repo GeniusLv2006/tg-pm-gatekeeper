@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+/* Copyright (c) 2026 GeniusLv2006 and contributors */
 :root{--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--field:#f7f2e7;--line:#c9c3b5;--signal:#c33c1e;--signal-deep:#8f2c16;--safe:#1e6b52;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}
 *{box-sizing:border-box}body{margin:0;overflow-x:hidden;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}
 body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:repeating-linear-gradient(90deg,transparent 0 47px,#8f8878 48px),repeating-linear-gradient(0deg,transparent 0 47px,#8f8878 48px)}

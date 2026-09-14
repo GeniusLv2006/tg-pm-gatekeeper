@@ -1,0 +1,7 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+/* Copyright (c) 2026 GeniusLv2006 and contributors */
+:root{color-scheme:light;--ink:#17211d;--muted:#68726c;--paper:#f3efe5;--panel:#fffdf7;--line:#c9c3b5;--signal:#c33c1e;--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--font-data:SFMono-Regular,Consolas,"Liberation Mono",Menlo,monospace}
+*{box-sizing:border-box}body{margin:0;color:var(--ink);background:var(--paper);font:15px/1.55 var(--font-ui)}
+.masthead,main{position:relative;max-width:1120px;margin-inline:auto}.masthead{display:flex;align-items:center;gap:.8rem;padding:2rem 1.25rem 1.1rem;border-bottom:2px solid var(--ink)}
+.mark{display:inline-grid;place-items:center;width:2.5rem;height:2.5rem;color:var(--paper);background:var(--ink);font-weight:800}.product{font-size:1.15rem;font-weight:750}.section{margin-left:auto;text-transform:uppercase;font:700 .72rem/1.4 var(--font-data);letter-spacing:.08em}.section span{display:block;color:var(--signal)}
+main{padding:3rem 1.25rem 5rem}.error-layout{display:grid;place-items:center}.error-card{width:min(100%,44rem);padding:2rem;border:1px solid var(--line);background:var(--panel)}.eyebrow{color:var(--signal);font:700 .75rem/1.4 var(--font-data);text-transform:uppercase;letter-spacing:.08em}.error-command{overflow-wrap:anywhere;color:var(--muted)}.button-link{display:inline-block;margin-top:1rem;color:var(--ink);font-weight:700}

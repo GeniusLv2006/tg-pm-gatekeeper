@@ -26,6 +26,7 @@ from .policy import EvidenceSignal, PolicyEngine
 LOG = logging.getLogger("gatekeeper.dashboard_http")
 MAX_HEADER_BYTES = 16 * 1024
 MAX_BODY_BYTES = 4 * 1024
+REQUEST_READ_TIMEOUT_SECONDS = 5
 IDENTITY_CACHE_SECONDS = 5 * 60
 IDENTITY_FAILURE_CACHE_SECONDS = 30
 IDENTITY_BATCH_SIZE = 100
@@ -61,6 +62,7 @@ class DashboardHttpServer:
         self._on_logout = on_logout
         self._server: asyncio.AbstractServer | None = None
         self._connection_tasks: set[asyncio.Task[object]] = set()
+        self._reading_tasks: set[asyncio.Task[object]] = set()
         self._csrf_token = secrets.token_urlsafe(32)
         self._access_token = secrets.token_urlsafe(32)
         self._capability_token = secrets.token_urlsafe(32)
@@ -88,6 +90,10 @@ class DashboardHttpServer:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+            current = asyncio.current_task()
+            for task in self._reading_tasks:
+                if task is not current:
+                    task.cancel()
             await self._server.wait_closed()
             self._server = None
         current = asyncio.current_task()
@@ -107,50 +113,60 @@ class DashboardHttpServer:
         if task is not None:
             self._connection_tasks.add(task)
         try:
-            method, target, body, request_headers = await self._read_request(reader)
-            status, headers, response = await self._dispatch(
-                method, target, body, request_headers=request_headers
+            try:
+                if task is not None:
+                    self._reading_tasks.add(task)
+                try:
+                    method, target, body, request_headers = await asyncio.wait_for(
+                        self._read_request(reader), timeout=REQUEST_READ_TIMEOUT_SECONDS
+                    )
+                finally:
+                    if task is not None:
+                        self._reading_tasks.discard(task)
+                status, headers, response = await self._dispatch(
+                    method, target, body, request_headers=request_headers
+                )
+            except (ValueError, asyncio.IncompleteReadError, TimeoutError):
+                status, headers, response = 400, {}, self._page("Invalid Request")
+            except Exception:
+                LOG.error("review_request_failed")
+                status, headers, response = 500, {}, self._page("Request Failed")
+            reason = {
+                200: "OK",
+                303: "See Other",
+                400: "Bad Request",
+                404: "Not Found",
+                405: "Method Not Allowed",
+                409: "Conflict",
+                503: "Service Unavailable",
+            }.get(status, "Internal Server Error")
+            response_headers = {
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Length": str(len(response)),
+                "Connection": "close",
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": (
+                    "default-src 'none'; style-src 'self'; script-src 'self'; "
+                    "connect-src 'self'; "
+                    "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+                ),
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                **headers,
+            }
+            head = f"HTTP/1.1 {status} {reason}\r\n" + "".join(
+                f"{name}: {value}\r\n" for name, value in response_headers.items()
             )
-        except (ValueError, asyncio.IncompleteReadError):
-            status, headers, response = 400, {}, self._page("Invalid Request")
-        except Exception:
-            LOG.error("review_request_failed")
-            status, headers, response = 500, {}, self._page("Request Failed")
-        reason = {
-            200: "OK",
-            303: "See Other",
-            400: "Bad Request",
-            404: "Not Found",
-            405: "Method Not Allowed",
-            409: "Conflict",
-            503: "Service Unavailable",
-        }.get(status, "Internal Server Error")
-        response_headers = {
-            "Content-Type": "text/html; charset=utf-8",
-            "Content-Length": str(len(response)),
-            "Connection": "close",
-            "Cache-Control": "no-store",
-            "Content-Security-Policy": (
-                "default-src 'none'; style-src 'self'; script-src 'self'; "
-                "connect-src 'self'; "
-                "form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-            ),
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-            **headers,
-        }
-        head = f"HTTP/1.1 {status} {reason}\r\n" + "".join(
-            f"{name}: {value}\r\n" for name, value in response_headers.items()
-        )
-        writer.write(head.encode("ascii") + b"\r\n" + response)
-        await writer.drain()
-        try:
+            writer.write(head.encode("ascii") + b"\r\n" + response)
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
             writer.close()
             try:
                 await writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
-        finally:
             if task is not None:
                 self._connection_tasks.discard(task)
 
@@ -199,6 +215,8 @@ class DashboardHttpServer:
         host = request_headers.get("host", "")
         if not (host.startswith("127.0.0.1:") or host.startswith("localhost:")):
             return 400, {}, self._page("Invalid Host")
+        if parsed.path == "/dashboard-error.css":
+            return await self._dispatch_routes(method, target, body)
         if parsed.path == "/logged-out":
             if method != "GET":
                 return 405, {"Allow": "GET"}, b""
@@ -257,7 +275,7 @@ class DashboardHttpServer:
     ) -> tuple[int, dict[str, str], bytes]:
         parsed = urlsplit(target)
         path = parsed.path
-        if path in {"/dashboard.js", "/dashboard.css"}:
+        if path in {"/dashboard.js", "/dashboard.css", "/dashboard-error.css"}:
             if method != "GET":
                 return 405, {"Allow": "GET"}, b""
             asset_name = path.removeprefix("/")
@@ -1434,8 +1452,9 @@ class DashboardHttpServer:
         dashboard_script = (
             '<script src="/dashboard.js" defer></script>' if live_attributes else ""
         )
+        stylesheet = "/dashboard.css" if raw else "/dashboard-error.css"
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(document_title)}</title>
-<link rel="stylesheet" href="/dashboard.css">
+<link rel="stylesheet" href="{stylesheet}">
 {dashboard_script}</head><body{live_attributes}>{body}</body></html>""".encode("utf-8")

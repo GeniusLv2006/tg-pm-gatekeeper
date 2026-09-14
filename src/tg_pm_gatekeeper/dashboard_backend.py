@@ -151,16 +151,20 @@ class InProcessDashboardBackend:
 
     async def _review_decide(self, params: dict[str, object]) -> dict[str, object]:
         review_id = self._positive_int(params, "review_id")
-        action = params.get("action")
-        if action not in {"legitimate", "spam", "dismiss"}:
-            raise DashboardBackendError("unknown_action")
         item = self.store.review_item(review_id)
-        if item is None:
+        if item is None or (
+            item.status == "pending" and item.expires_at <= int(time.time())
+        ):
             raise DashboardBackendError("review_not_found")
         async with self.service.sender_lock(item.sender_key):
             item = self.store.review_item(review_id)
             if item is None or item.status != "pending" or item.reference is None:
                 raise DashboardBackendError("review_already_decided")
+            if item.expires_at <= int(time.time()):
+                raise DashboardBackendError("review_not_found")
+            action = params.get("action")
+            if action not in {"legitimate", "spam", "dismiss"}:
+                raise DashboardBackendError("unknown_action")
             state = self.store.sender(item.sender_key)
             if action == "legitimate":
                 if state.status in {"challenged", "quarantined", "suppressed"}:
@@ -270,11 +274,14 @@ class InProcessDashboardBackend:
 
     async def _case_decide(self, params: dict[str, object]) -> dict[str, object]:
         sender_key = self._sender_key(params)
+        if self.store.active_restriction(sender_key) is None:
+            raise DashboardBackendError("case_not_found")
         action = params.get("action")
         if action == "keep":
-            if self.store.active_restriction(sender_key) is None:
-                raise DashboardBackendError("case_not_found")
-            self.store.audit(sender_key, "OPERATOR_KEEP", "kept", int(time.time()))
+            async with self.service.sender_lock(sender_key):
+                if self.store.active_restriction(sender_key) is None:
+                    raise DashboardBackendError("case_not_found")
+                self.store.audit(sender_key, "OPERATOR_KEEP", "kept", int(time.time()))
             return {"outcome": "kept"}
         if action != "allow":
             raise DashboardBackendError("unknown_action")

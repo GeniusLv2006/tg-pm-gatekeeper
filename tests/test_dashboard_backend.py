@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import time
@@ -92,6 +93,46 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
                 "reviews.decide",
                 {"review_id": self.review_id, "action": "dismiss"},
             )
+
+    async def test_expired_review_decision_is_hidden_before_action_validation(self) -> None:
+        expired_id = self.store.enqueue_review(
+            "b" * 64,
+            self.protector.seal_review_reference(234567890, 876543210, 43),
+            "would_quarantine",
+            "[]",
+            "{}",
+            int(time.time()) - 1,
+            int(time.time()) - 10,
+        )
+
+        with self.assertRaisesRegex(DashboardBackendError, "review_not_found"):
+            await self.backend.request(
+                "reviews.decide", {"review_id": expired_id, "action": "invalid"}
+            )
+
+        self.assertEqual(self.store.review_item(expired_id).status, "pending")
+
+    async def test_case_decision_hides_missing_case_before_action_validation(self) -> None:
+        with self.assertRaisesRegex(DashboardBackendError, "case_not_found"):
+            await self.backend.request(
+                "cases.decide", {"sender_key": "c" * 64, "action": "invalid"}
+            )
+
+    async def test_keep_case_waits_for_sender_lock(self) -> None:
+        sender_key = "d" * 64
+        self.store.quarantine(sender_key)
+        lock = self.service.sender_lock(sender_key)
+        await lock.acquire()
+        decision = asyncio.create_task(
+            self.backend.request(
+                "cases.decide", {"sender_key": sender_key, "action": "keep"}
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(decision.done())
+
+        lock.release()
+        self.assertEqual(await decision, {"outcome": "kept"})
 
     async def test_unknown_method_and_invalid_identifiers_fail_closed(self) -> None:
         with self.assertRaisesRegex(DashboardBackendError, "unknown_method"):
