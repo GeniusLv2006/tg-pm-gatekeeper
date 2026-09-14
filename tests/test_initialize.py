@@ -74,6 +74,18 @@ class InitializeTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "must be true or false"):
                 Settings.from_environment(require_telegram=False)
 
+    def test_core_rpc_uses_fixed_runtime_default_and_ignores_old_dashboard_path(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"TG_DASHBOARD_SOCKET_PATH": "/tmp/legacy-dashboard.sock"},
+            clear=True,
+        ):
+            settings = Settings.from_environment(require_telegram=False)
+        self.assertEqual(
+            settings.dashboard_rpc_socket_path,
+            Path("/run/tg-pm-gatekeeper/core.sock"),
+        )
+
     def test_review_key_must_be_cryptographically_separate(self) -> None:
         with patch.dict(
             os.environ,

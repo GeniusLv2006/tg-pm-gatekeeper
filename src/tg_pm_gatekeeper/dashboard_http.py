@@ -73,6 +73,9 @@ class DashboardHttpServer:
 
     async def start(self) -> None:
         self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_info = self.socket_path.parent.stat()
+        if parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o077:
+            raise RuntimeError("dashboard runtime directory is not owner-only")
         try:
             info = self.socket_path.lstat()
         except FileNotFoundError:
@@ -105,6 +108,7 @@ class DashboardHttpServer:
         except FileNotFoundError:
             pass
         self.access_token_path.unlink(missing_ok=True)
+        self.access_token_path.with_suffix(".access-token.tmp").unlink(missing_ok=True)
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -263,6 +267,9 @@ class DashboardHttpServer:
         status, headers, response = await self._dispatch_routes(
             method, logical_target, body
         )
+        if status < 400:
+            self._session_last_seen_at = time.monotonic()
+            self._on_authenticated_activity()
         return status, self._capability_headers(headers), self._capability_html(
             response, headers
         )
@@ -421,8 +428,6 @@ class DashboardHttpServer:
             or now - self._session_started_at >= DASHBOARD_SESSION_ABSOLUTE_SECONDS
         ):
             return False
-        self._session_last_seen_at = now
-        self._on_authenticated_activity()
         return True
 
     @staticmethod

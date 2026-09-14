@@ -23,5 +23,9 @@ fi
 install -d -o root -g root -m 0755 /opt/tg-pm-gatekeeper
 install -d -o root -g "$SERVICE_USER" -m 0750 /etc/tg-pm-gatekeeper
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 /var/lib/tg-pm-gatekeeper
+install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 /run/tg-pm-gatekeeper
+printf '%s\n' 'd /run/tg-pm-gatekeeper 0700 10001 10001 -' \
+  > /etc/tmpfiles.d/tg-pm-gatekeeper.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/tg-pm-gatekeeper.conf
 
 echo "Directories and service account are ready. No credentials were created."

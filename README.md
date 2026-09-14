@@ -109,7 +109,8 @@ explains what to do when a check fails.
 
 ## Operations Dashboard
 
-The dashboard is available only through an SSH tunnel; Docker publishes no Gatekeeper port:
+The dashboard runs as an on-demand, network-disabled sidecar and is available only through an SSH
+tunnel; Docker publishes no Gatekeeper port:
 
 ```shell
 scripts/dashboard-tunnel.sh root@server.example
@@ -118,7 +119,9 @@ scripts/dashboard-tunnel.sh root@server.example
 The one-time login creates a browser-bound session protected by both a random, process-local
 capability path and a path-scoped HttpOnly cookie. Copying the resulting address into another browser
 does not transfer access. A new login or **Sign Out** immediately invalidates the previous session;
-sessions also expire after 30 minutes without a dashboard request or eight hours in total.
+sessions also expire after 30 minutes without a dashboard request or eight hours in total. The
+sidecar itself exits after 10 minutes without authenticated activity. Signing out or closing the
+tunnel helper stops it immediately without interrupting the Telegram core.
 
 It has two main areas:
 

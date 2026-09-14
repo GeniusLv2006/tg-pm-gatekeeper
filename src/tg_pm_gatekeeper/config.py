@@ -112,7 +112,7 @@ class Settings:
     audit_retention_days: int
     pending_review_retention_days: int
     active_case_retention_days: int
-    review_socket_path: Path
+    dashboard_rpc_socket_path: Path
     mute_days: int
     outbound_limit_per_hour: int
     outbound_notice_reserve_per_hour: int
@@ -157,13 +157,10 @@ class Settings:
             active_case_retention_days=_bounded_int(
                 "TG_ACTIVE_CASE_RETENTION_DAYS", 30, 1, 30
             ),
-            review_socket_path=Path(
+            dashboard_rpc_socket_path=Path(
                 os.environ.get(
-                    "TG_DASHBOARD_SOCKET_PATH",
-                    os.environ.get(
-                        "TG_REVIEW_SOCKET_PATH",
-                        "/var/lib/tg-pm-gatekeeper/review.sock",
-                    ),
+                    "TG_DASHBOARD_RPC_SOCKET_PATH",
+                    "/run/tg-pm-gatekeeper/core.sock",
                 )
             ),
             mute_days=_positive_int("TG_MUTE_DAYS", 3650),
