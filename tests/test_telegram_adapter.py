@@ -21,6 +21,8 @@ from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
+    SESSION_ENTITY_CACHE_LIMIT,
+    TELETHON_ENTITY_CACHE_LIMIT,
     BoundedStringSession,
     OperatorCaseControl,
     TelegramActions,
@@ -36,6 +38,10 @@ from tg_pm_gatekeeper.telegram_adapter import (
 
 
 class BoundedStringSessionTests(unittest.TestCase):
+    def test_production_entity_limits_are_small_and_bounded(self) -> None:
+        self.assertEqual(SESSION_ENTITY_CACHE_LIMIT, 256)
+        self.assertEqual(TELETHON_ENTITY_CACHE_LIMIT, 128)
+
     def test_entity_cache_is_bounded_and_replaces_existing_peer(self) -> None:
         session = BoundedStringSession(entity_limit=2)
         session.process_entities(
@@ -56,6 +62,17 @@ class BoundedStringSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             session.get_input_entity("cached-name")
         self.assertNotIn("one", repr(session._entities))
+
+    def test_non_user_entities_are_not_cached(self) -> None:
+        session = BoundedStringSession(entity_limit=2)
+        session.process_entities(
+            [
+                types.InputPeerChat(chat_id=10),
+                types.InputPeerChannel(channel_id=20, access_hash=22),
+            ]
+        )
+
+        self.assertEqual(session.entity_count, 0)
 
     def test_string_session_authorization_fields_are_preserved(self) -> None:
         source = StringSessionTests.make_string_session()
