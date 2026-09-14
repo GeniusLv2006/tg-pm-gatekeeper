@@ -20,7 +20,7 @@ compose() {
 }
 
 stop_dashboard() {
-    compose --profile dashboard stop -t 30 dashboard >/dev/null 2>&1 || true
+    compose --profile dashboard stop -t 30 dashboard >/dev/null 2>&1
 }
 
 case "${1:-}" in

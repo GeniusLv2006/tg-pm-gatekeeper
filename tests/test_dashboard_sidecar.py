@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -72,6 +73,7 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 404)
         self.assertEqual(sidecar._last_authenticated_activity, started)
+
         self.assertEqual(await sidecar.run(), "idle_timeout")
 
     async def test_authenticated_page_extends_idle_lifetime(self) -> None:
@@ -88,6 +90,47 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertGreaterEqual(sidecar._last_authenticated_activity, before)
+
+    async def test_recent_activity_prevents_stale_idle_deadline(self) -> None:
+        sidecar = self.make_sidecar(idle_seconds=0.05)
+        task = asyncio.create_task(sidecar.run())
+        await asyncio.sleep(0.04)
+        sidecar.note_authenticated_activity()
+        await asyncio.sleep(0.02)
+        self.assertFalse(task.done())
+
+        sidecar.request_shutdown("test_complete")
+        self.assertEqual(await task, "test_complete")
+
+    async def test_invalid_authenticated_requests_do_not_extend_idle_lifetime(
+        self,
+    ) -> None:
+        sidecar = self.make_sidecar(idle_seconds=1)
+        sidecar.server._activate_session()
+        started = sidecar._last_authenticated_activity
+        headers = {
+            "host": "127.0.0.1:8765",
+            "cookie": f"tg_pm_gatekeeper_session={sidecar.server._session_token}",
+        }
+
+        status, _, _ = await sidecar.server._dispatch(
+            "GET",
+            f"/{sidecar.server._capability_token}/missing",
+            b"",
+            request_headers=headers,
+        )
+
+        self.assertEqual(status, 404)
+        self.assertEqual(sidecar._last_authenticated_activity, started)
+
+        status, _, _ = await sidecar.server._dispatch(
+            "POST",
+            f"/{sidecar.server._capability_token}/logout",
+            b"token=invalid",
+            request_headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(sidecar._last_authenticated_activity, started)
 
     async def test_logout_requests_shutdown_after_response(self) -> None:
         sidecar = self.make_sidecar(idle_seconds=1)

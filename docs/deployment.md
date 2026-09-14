@@ -307,13 +307,13 @@ Common workstation settings are:
 ```shell
 TG_DASHBOARD_HOST=root@gatekeeper.example
 TG_DASHBOARD_PORT=18765
-TG_DASHBOARD_SOCKET=/run/tg-pm-gatekeeper/dashboard.sock
-TG_DASHBOARD_TOKEN=/run/tg-pm-gatekeeper/dashboard.access-token
 TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf"
 ```
 
-`TG_REVIEW_*` remains a deprecated alias. Never publish the Unix socket through Docker or a reverse
-proxy.
+The Dashboard socket and access-token paths are fixed under `/run/tg-pm-gatekeeper`; this keeps the
+remote helper and the isolated Compose service on one security boundary. `TG_REVIEW_HOST`,
+`TG_REVIEW_PORT`, and `TG_REVIEW_SSH_CONFIG` remain deprecated aliases. Never publish the Unix socket
+through Docker or a reverse proxy.
 
 ## Common commands
 

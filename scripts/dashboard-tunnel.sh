@@ -19,8 +19,6 @@ Options:
                          TG_DASHBOARD_PROJECT_DIR or /opt/tg-pm-gatekeeper)
   -o                     Open the dashboard in the default browser
   -p PORT                Local TCP port (default: 8765)
-  -s REMOTE_SOCKET       Remote Dashboard Unix socket
-  -t REMOTE_TOKEN        Remote access-token path
   -F SSH_CONFIG          Alternate OpenSSH config file
   -h                     Show this help
 
@@ -29,23 +27,21 @@ EOF
 }
 
 deprecated_alias_used=false
-[ -n "${TG_REVIEW_HOST:-}${TG_REVIEW_PORT:-}${TG_REVIEW_SOCKET:-}${TG_REVIEW_TOKEN:-}${TG_REVIEW_SSH_CONFIG:-}" ] && deprecated_alias_used=true
+[ -n "${TG_REVIEW_HOST:-}${TG_REVIEW_PORT:-}${TG_REVIEW_SSH_CONFIG:-}" ] && deprecated_alias_used=true
 
 port="${TG_DASHBOARD_PORT:-${TG_REVIEW_PORT:-8765}}"
-remote_socket="${TG_DASHBOARD_SOCKET:-${TG_REVIEW_SOCKET:-/run/tg-pm-gatekeeper/dashboard.sock}}"
-remote_token="${TG_DASHBOARD_TOKEN:-${TG_REVIEW_TOKEN:-/run/tg-pm-gatekeeper/dashboard.access-token}}"
+remote_socket=/run/tg-pm-gatekeeper/dashboard.sock
+remote_token=/run/tg-pm-gatekeeper/dashboard.access-token
 ssh_config="${TG_DASHBOARD_SSH_CONFIG:-${TG_REVIEW_SSH_CONFIG:-}}"
 project_dir="${TG_DASHBOARD_PROJECT_DIR:-/opt/tg-pm-gatekeeper}"
 open_on_connect=false
 
-while getopts "hd:op:s:t:F:" option; do
+while getopts "hd:op:F:" option; do
     case "$option" in
         h) usage; exit 0 ;;
         d) project_dir="$OPTARG" ;;
         o) open_on_connect=true ;;
         p) port="$OPTARG" ;;
-        s) remote_socket="$OPTARG" ;;
-        t) remote_token="$OPTARG" ;;
         F) ssh_config="$OPTARG" ;;
         *) usage >&2; exit 2 ;;
     esac
@@ -75,8 +71,6 @@ validate_absolute_path() {
 }
 
 validate_absolute_path "Remote project directory" "$project_dir"
-validate_absolute_path "Remote socket" "$remote_socket"
-validate_absolute_path "Remote token" "$remote_token"
 [ -z "$ssh_config" ] || [ -r "$ssh_config" ] || { echo "SSH config is not readable: $ssh_config" >&2; exit 2; }
 
 for dependency in ssh curl; do
@@ -161,8 +155,8 @@ open_dashboard() {
 }
 
 echo "Starting the on-demand Dashboard sidecar on ${host}..."
-ssh_remote start >/dev/null || { echo "Could not start the remote Dashboard sidecar." >&2; exit 1; }
 sidecar_started=true
+ssh_remote start >/dev/null || { echo "Could not start the remote Dashboard sidecar." >&2; exit 1; }
 access_token=$(read_access_token) || { echo "Could not read the remote Dashboard access token." >&2; exit 1; }
 case "$access_token" in ''|*[!A-Za-z0-9_-]*) echo "Remote Dashboard access token is invalid." >&2; exit 1 ;; esac
 

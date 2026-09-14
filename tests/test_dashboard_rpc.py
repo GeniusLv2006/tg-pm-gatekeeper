@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -95,10 +96,13 @@ class DashboardRpcTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_accepted_write_completes_after_client_disconnects(self) -> None:
         completed = asyncio.Event()
+        started = asyncio.Event()
+        release = asyncio.Event()
 
         async def request(method: str, params: dict[str, object]) -> dict[str, object]:
             self.assertEqual(method, "reviews.decide")
-            await asyncio.sleep(0.01)
+            started.set()
+            await release.wait()
             completed.set()
             return {"outcome": "completed"}
 
@@ -118,7 +122,56 @@ class DashboardRpcTests(unittest.IsolatedAsyncioTestCase):
         await writer.drain()
         writer.close()
         await writer.wait_closed()
+        await asyncio.wait_for(started.wait(), timeout=1)
+        stop_task = asyncio.create_task(self.server.stop())
+        await asyncio.sleep(0)
+        self.assertFalse(stop_task.done())
+        release.set()
+        await stop_task
         await asyncio.wait_for(completed.wait(), timeout=1)
+
+    async def test_partial_request_cannot_block_rpc_shutdown(self) -> None:
+        with patch(
+            "tg_pm_gatekeeper.dashboard_rpc.RPC_REQUEST_READ_TIMEOUT_SECONDS", 0.01
+        ):
+            _, writer = await asyncio.open_unix_connection(self.path)
+            writer.write(b'{"version":1')
+            await writer.drain()
+            for _ in range(100):
+                if self.server._connection_tasks:
+                    break
+                await asyncio.sleep(0)
+            self.assertTrue(self.server._connection_tasks)
+            await asyncio.wait_for(self.server.stop(), timeout=1)
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_incomplete_response_is_a_retryable_disconnect(self) -> None:
+        client = DashboardRpcClient(self.path)
+
+        class Reader:
+            async def readuntil(self, _separator: bytes) -> bytes:
+                raise asyncio.IncompleteReadError(b"", 1)
+
+        class Writer:
+            def write(self, _data: bytes) -> None:
+                pass
+
+            async def drain(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+            async def wait_closed(self) -> None:
+                pass
+
+        with patch(
+            "tg_pm_gatekeeper.dashboard_rpc.asyncio.open_unix_connection",
+            AsyncMock(return_value=(Reader(), Writer())),
+        ):
+            with self.assertRaises(ConnectionError):
+                await client._request_once("overview", {})
 
     async def test_read_retries_once_but_write_never_retries(self) -> None:
         client = DashboardRpcClient(self.path)

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 GeniusLv2006 and contributors
 
 from __future__ import annotations
 
@@ -70,6 +71,13 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.assertIn("mem_limit: 192m", gatekeeper)
         self.assertNotIn("ports:", gatekeeper)
         self.assertIn("TG_DASHBOARD_RPC_SOCKET_PATH", gatekeeper)
+
+    def test_remote_stop_failure_is_reported(self) -> None:
+        helper = (ROOT / "scripts" / "dashboard-remote.sh").read_text(
+            encoding="utf-8"
+        )
+        stop_function = helper.split("stop_dashboard() {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("|| true", stop_function)
 
 
 if __name__ == "__main__":

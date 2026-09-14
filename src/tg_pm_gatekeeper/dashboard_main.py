@@ -65,7 +65,11 @@ class DashboardSidecar:
                 try:
                     await asyncio.wait_for(self._shutdown.wait(), timeout=remaining)
                 except TimeoutError:
-                    self.request_shutdown("idle_timeout")
+                    if (
+                        time.monotonic() - self._last_authenticated_activity
+                        >= self.idle_seconds
+                    ):
+                        self.request_shutdown("idle_timeout")
         finally:
             await self.server.stop()
         LOG.info("dashboard_sidecar_stopped", extra={"reason": self.shutdown_reason})

@@ -18,6 +18,7 @@ PROTOCOL_VERSION = 1
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 RPC_TIMEOUT_SECONDS = 10
+RPC_REQUEST_READ_TIMEOUT_SECONDS = 5
 READ_ONLY_METHODS = {
     "overview",
     "page_version",
@@ -39,6 +40,7 @@ class DashboardRpcServer:
         self.path = path
         self.backend = backend
         self._server: asyncio.AbstractServer | None = None
+        self._connection_tasks: set[asyncio.Task[object]] = set()
 
     async def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -66,15 +68,24 @@ class DashboardRpcServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        current = asyncio.current_task()
+        pending = [task for task in self._connection_tasks if task is not current]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         self.path.unlink(missing_ok=True)
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._connection_tasks.add(task)
         response: dict[str, object]
         request_id = ""
         try:
-            raw = await reader.readuntil(b"\n")
+            raw = await asyncio.wait_for(
+                reader.readuntil(b"\n"), timeout=RPC_REQUEST_READ_TIMEOUT_SECONDS
+            )
             if len(raw) > MAX_REQUEST_BYTES:
                 raise ValueError("request too large")
             request = json.loads(raw)
@@ -105,7 +116,7 @@ class DashboardRpcServer:
             response = self._error(request_id, exc.code)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             response = self._error(request_id, "invalid_request")
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
             response = self._error(request_id, "invalid_request")
         except Exception:
             LOG.error("dashboard_rpc_request_failed")
@@ -129,6 +140,8 @@ class DashboardRpcServer:
                 await writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
+            if task is not None:
+                self._connection_tasks.discard(task)
 
     @staticmethod
     def _error(request_id: str, code: str) -> dict[str, object]:
@@ -183,7 +196,9 @@ class DashboardRpcClient:
             raw = await reader.readuntil(b"\n")
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise DashboardBackendError("response_too_large")
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+        except asyncio.IncompleteReadError as exc:
+            raise ConnectionError("core disconnected before completing response") from exc
+        except asyncio.LimitOverrunError as exc:
             raise DashboardBackendError("invalid_response") from exc
         finally:
             writer.close()

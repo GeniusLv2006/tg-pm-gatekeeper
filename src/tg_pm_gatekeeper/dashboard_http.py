@@ -267,6 +267,9 @@ class DashboardHttpServer:
         status, headers, response = await self._dispatch_routes(
             method, logical_target, body
         )
+        if status < 400:
+            self._session_last_seen_at = time.monotonic()
+            self._on_authenticated_activity()
         return status, self._capability_headers(headers), self._capability_html(
             response, headers
         )
@@ -425,8 +428,6 @@ class DashboardHttpServer:
             or now - self._session_started_at >= DASHBOARD_SESSION_ABSOLUTE_SECONDS
         ):
             return False
-        self._session_last_seen_at = now
-        self._on_authenticated_activity()
         return True
 
     @staticmethod
