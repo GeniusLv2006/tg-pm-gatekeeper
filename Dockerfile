@@ -10,7 +10,9 @@ RUN python -m pip install --require-hashes --no-deps -r requirements-build.txt &
 
 FROM python:3.14.6-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+ENV MALLOC_ARENA_MAX=2 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONNODEBUGRANGES=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \

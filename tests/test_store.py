@@ -28,6 +28,12 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_connection_uses_bounded_page_cache(self) -> None:
+        self.assertEqual(
+            self.store._connection.execute("PRAGMA cache_size").fetchone()[0],
+            -512,
+        )
+
     def test_default_mode_is_monitor(self) -> None:
         self.assertEqual(self.store.get_mode(), "monitor")
         self.store.set_mode("protect")

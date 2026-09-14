@@ -276,6 +276,7 @@ class StateStore:
                 self._connection.execute("PRAGMA journal_mode=WAL")
                 self._connection.execute("PRAGMA synchronous=FULL")
                 self._connection.execute("PRAGMA foreign_keys=ON")
+                self._connection.execute("PRAGMA cache_size=-512")
                 self._initialize_schema()
                 self._connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value) "

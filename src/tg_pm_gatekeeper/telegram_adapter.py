@@ -32,8 +32,8 @@ from .service import (
 from .store import DialogSnapshot, StateStore
 
 LOG = logging.getLogger("gatekeeper.telegram")
-SESSION_ENTITY_CACHE_LIMIT = 1024
-TELETHON_ENTITY_CACHE_LIMIT = 512
+SESSION_ENTITY_CACHE_LIMIT = 256
+TELETHON_ENTITY_CACHE_LIMIT = 128
 RUNTIME_METRICS_INTERVAL_SECONDS = 15 * 60
 SERVICE_USER_IDS = {777000, 42777}
 HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
@@ -161,7 +161,7 @@ class BoundedStringSession(StringSession):
         if entity_limit < 1:
             raise ValueError("entity_limit must be positive")
         self._entity_limit = entity_limit
-        self._entities: OrderedDict[int, tuple[int, str]] = OrderedDict()
+        self._entities: OrderedDict[int, int] = OrderedDict()
         self._entity_evictions = 0
 
     @property
@@ -189,18 +189,9 @@ class BoundedStringSession(StringSession):
                 marked_id = utils.get_peer_id(peer)
             except (TypeError, AttributeError):
                 continue
-            if isinstance(peer, types.InputPeerUser):
-                kind = "user"
-                access_hash = peer.access_hash
-            elif isinstance(peer, types.InputPeerChannel):
-                kind = "channel"
-                access_hash = peer.access_hash
-            elif isinstance(peer, types.InputPeerChat):
-                kind = "chat"
-                access_hash = 0
-            else:
+            if not isinstance(peer, types.InputPeerUser):
                 continue
-            self._entities[marked_id] = (access_hash, kind)
+            self._entities[marked_id] = peer.access_hash
             self._entities.move_to_end(marked_id)
             while len(self._entities) > self._entity_limit:
                 self._entities.popitem(last=False)
@@ -228,14 +219,10 @@ class BoundedStringSession(StringSession):
                 cached = self._entities.get(marked_id)
                 if cached is None:
                     continue
-                access_hash, kind = cached
+                access_hash = cached
                 self._entities.move_to_end(marked_id)
                 entity_id, _ = utils.resolve_id(marked_id)
-                if kind == "user":
-                    return types.InputPeerUser(entity_id, access_hash)
-                if kind == "channel":
-                    return types.InputPeerChannel(entity_id, access_hash)
-                return types.InputPeerChat(entity_id)
+                return types.InputPeerUser(entity_id, access_hash)
         raise ValueError("entity is not available in the bounded session cache")
 
 
