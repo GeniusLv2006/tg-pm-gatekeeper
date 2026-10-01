@@ -12,6 +12,16 @@ from .config import ConfigurationError, Settings, read_private_file
 from .crypto import IdentifierProtector
 from .store import StateStore, StoreMigrationError
 
+DASHBOARD_ONLY_STATUSES = frozenset(
+    {
+        "challenge_issuing",
+        "challenge_archiving",
+        "challenged",
+        "quarantined",
+        "suppressed",
+    }
+)
+
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="tg-pm-gatekeeper-cli")
@@ -54,17 +64,11 @@ def run(argv: list[str] | None = None) -> int:
             return 0
         key = read_private_file(settings.hmac_key_file, minimum_bytes=32)
         sender_key = IdentifierProtector(key).sender_key(args.user_id)
+        if store.sender(sender_key).status in DASHBOARD_ONLY_STATUSES:
+            raise ValueError(
+                "sender requires dashboard review to restore Telegram state"
+            )
         if args.command == "allow":
-            if store.sender(sender_key).status in {
-                "challenge_issuing",
-                "challenge_archiving",
-                "challenged",
-                "quarantined",
-                "suppressed",
-            }:
-                raise ValueError(
-                    "sender requires dashboard review to restore Telegram state"
-                )
             store.allow(sender_key)
             print("sender=allowed")
         else:

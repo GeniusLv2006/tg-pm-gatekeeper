@@ -6,12 +6,17 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
 from tg_pm_gatekeeper.cli import run
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.store import StateStore
+
+USER_ID = 123456789
+KEY = b"k" * 32
+SENDER_KEY = IdentifierProtector(KEY).sender_key(USER_ID)
 
 
 class CliTests(unittest.TestCase):
@@ -25,65 +30,64 @@ class CliTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     run(["resume"])
 
-    def test_allow_refuses_incomplete_challenge_without_telegram_restore(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            database = root / "state.sqlite3"
-            key_file = root / "hmac_key"
-            key = b"k" * 32
-            key_file.write_bytes(key)
-            key_file.chmod(0o600)
-            sender_key = IdentifierProtector(key).sender_key(123456789)
-            store = StateStore(database)
-            store.begin_challenge_issue(
-                sender_key,
-                "challenge",
-                "digest",
-                700,
-                "prompt",
-                b"reference",
-                100,
-            )
-            store.close()
+    def sender_environment(
+        self, directory: str, prepare: Callable[[StateStore], object]
+    ) -> tuple[Path, dict[str, str]]:
+        root = Path(directory)
+        database = root / "state.sqlite3"
+        key_file = root / "hmac_key"
+        key_file.write_bytes(KEY)
+        key_file.chmod(0o600)
+        store = StateStore(database)
+        prepare(store)
+        store.close()
+        return database, {
+            "TG_DB_PATH": str(database),
+            "TG_HMAC_KEY_FILE": str(key_file),
+        }
 
-            environment = {
-                "TG_DB_PATH": str(database),
-                "TG_HMAC_KEY_FILE": str(key_file),
-            }
-            with patch.dict(os.environ, environment, clear=True):
-                with self.assertRaisesRegex(ValueError, "dashboard review"):
-                    run(["allow", "123456789"])
-
-            store = StateStore(database)
-            self.assertEqual(store.sender(sender_key).status, "challenge_issuing")
-            store.close()
-
-    def test_allow_refuses_suppressed_sender_without_telegram_restore(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            database = root / "state.sqlite3"
-            key_file = root / "hmac_key"
-            key = b"k" * 32
-            key_file.write_bytes(key)
-            key_file.chmod(0o600)
-            sender_key = IdentifierProtector(key).sender_key(123456789)
-            store = StateStore(database)
-            store.suppress(
-                sender_key,
+    def test_sender_commands_refuse_states_that_need_telegram_restore(self) -> None:
+        cases: dict[str, Callable[[StateStore], object]] = {
+            "challenge_issuing": lambda store: store.begin_challenge_issue(
+                SENDER_KEY, "challenge", "digest", 700, "prompt", b"reference", 100
+            ),
+            "quarantined": lambda store: store.quarantine(
+                SENDER_KEY, restriction_reference=b"control"
+            ),
+            "suppressed": lambda store: store.suppress(
+                SENDER_KEY,
                 "critical_rule",
                 until=None,
                 reference=b"reference",
-            )
-            store.close()
+                restriction_reference=b"control",
+            ),
+        }
+        for command in ("allow", "revoke"):
+            for status, prepare in cases.items():
+                with (
+                    self.subTest(command=command, status=status),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    database, environment = self.sender_environment(directory, prepare)
+                    with patch.dict(os.environ, environment, clear=True):
+                        with self.assertRaisesRegex(ValueError, "dashboard review"):
+                            run([command, str(USER_ID)])
 
-            environment = {
-                "TG_DB_PATH": str(database),
-                "TG_HMAC_KEY_FILE": str(key_file),
-            }
+                    store = StateStore(database)
+                    state = store.sender(SENDER_KEY)
+                    store.close()
+                    self.assertEqual(state.status, status)
+                    if status != "challenge_issuing":
+                        self.assertEqual(state.restriction_reference, b"control")
+
+    def test_revoke_returns_allowed_sender_to_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database, environment = self.sender_environment(
+                directory, lambda store: store.allow(SENDER_KEY)
+            )
             with patch.dict(os.environ, environment, clear=True):
-                with self.assertRaisesRegex(ValueError, "dashboard review"):
-                    run(["allow", "123456789"])
+                self.assertEqual(run(["revoke", str(USER_ID)]), 0)
 
             store = StateStore(database)
-            self.assertEqual(store.sender(sender_key).status, "suppressed")
+            self.assertEqual(store.sender(SENDER_KEY).status, "unknown")
             store.close()
