@@ -40,6 +40,10 @@ If a secret is committed, deleting it in a later commit is not enough. Revoke or
 
 Exact operator commands are in [Emergency session revocation](docs/deployment.md#emergency-session-revocation).
 
+## If the Telegram API ID or hash may have leaked
+
+The API ID and hash identify the Gatekeeper application, not the Telegram account. Without the account's login code and two-step verification password they cannot sign in or read messages, and the existing session is not affected, so this is not a session leak. The risk is that someone runs their own clients with these values: Telegram may attribute that activity to your application and restrict it. If that happens, obtain new API credentials through Telegram's developer tools, update `config.env`, and recreate the container; provision a new session if Telegram rejects the existing one.
+
 ## Technical security model
 
 This section documents guarantees that contributors must preserve. For the full state and decision flow, see [Architecture](docs/architecture.md).
@@ -47,6 +51,7 @@ This section documents guarantees that contributors must preserve. For the full 
 ### Credentials and identities
 
 - The Telegram StringSession is a mode `0600` file owned by the service UID.
+- The Telegram API ID and hash reach the container as environment variables from `config.env`, so anyone who can inspect containers through the Docker API, including a read-only monitoring socket proxy, can read them. Container inspection shows only the paths of the mounted session file, HMAC key, and review key, not their contents; full Docker API access is equivalent to root and exposes everything.
 - The runtime uses a Telethon StringSession instead of its SQLite session, so names, usernames, and phone numbers are not retained in a Telethon entity cache.
 - Sender state uses an HMAC-derived identifier rather than a raw Telegram user ID.
 - The runtime database may store Telegram message IDs, generated challenge text while delivery is incomplete, authenticated encrypted short-lived references needed for message review, and a separate encrypted control identity containing only Telegram user ID and access hash for each active quarantine or suppression.
