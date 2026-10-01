@@ -110,12 +110,16 @@ Comments, notices, and metadata-only edits in those files do not require a rebui
 For every live update:
 
 1. Confirm the server checkout is clean; record its commit, container health, and current mode.
-2. Create a temporary remote-only backup only for migrations or persistent-state changes.
+2. Create a private server-local backup for migrations or persistent-state changes.
 3. Fast-forward the server to the reviewed `main` commit.
 4. Rebuild and recreate the container only when required above.
 5. Verify the deployed commit, health, restart count, mode, redacted status, logs, private-file
    permissions, dashboard socket, and absence of unexpected port mappings.
-6. Remove temporary backups and tunnels after successful verification.
+6. Remove temporary tunnels after successful verification. Remove an ordinary operational backup
+   only after its checks pass. For a schema-incompatible update, retain the private pre-migration
+   backup until the operator explicitly closes the rollback window; successful startup checks alone
+   do not authorize its deletion. Follow the backup and rollback rules in
+   [deployment.md](deployment.md).
 
 If verification fails, preserve the failed state needed for diagnosis before considering a rollback.
 Do not use destructive Git or Docker commands on user data. The operator commands and security checks

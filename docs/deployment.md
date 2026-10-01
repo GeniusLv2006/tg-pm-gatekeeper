@@ -412,7 +412,9 @@ state-database migration.
 
 1. Switch to `monitor`.
 2. Confirm `challenged`, `challenge_issuing`, and `challenge_archiving` are all zero.
-3. Create a temporary backup on the server with SQLite's online backup API.
+3. Stop the core writer and create a private pre-migration backup on the server with SQLite's
+   backup API. Do this before pulling or rebuilding the new version; keep the core stopped until
+   the updated version starts. Never overwrite an existing pre-migration backup.
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -421,21 +423,27 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 
-ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -' <<'PYTHON'
+ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose down && docker compose run --rm --no-deps --entrypoint python gatekeeper -' <<'PYTHON'
 import os
 import sqlite3
 
+path = "/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3"
+assert not os.path.exists(path), "pre-migration backup already exists"
+os.umask(0o077)
 source = sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3")
-backup = sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3")
+backup = sqlite3.connect(path)
 source.backup(backup)
+assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 backup.close()
 source.close()
-os.chmod("/var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3", 0o600)
 PYTHON
 ```
 
-After rebuilding, verify the schema version, state counts, and logs. Delete the temporary backup only
-after every check passes. Preserve the failed database for diagnosis if migration fails.
+Next run the normal update commands above to fast-forward the checkout and rebuild/start the
+service. After rebuilding, verify the schema version, state counts, and logs. Keep the private
+pre-migration backup after these checks: it is the database needed for the documented
+pre-schema-8 code rollback. Successful startup validation alone does not authorize deleting it.
+Preserve the failed database for diagnosis if migration fails.
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -454,6 +462,13 @@ queue, which stores only Telegram message IDs, deletion deadlines, and retry cou
 challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table.
 Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not
 recalculated and do not schedule a new action.
+
+This backup is a point-in-time copy. Restoring it discards every database change made after the
+backup, so the procedure is not a lossless rollback once writes resume. Before considering it,
+stop writers and make an explicit decision about that data loss. An old migration-source host,
+Docker image, or cutover snapshot is not a substitute for this installation's pre-migration
+backup. If that backup has already been removed, do not run the restore commands below; diagnose
+the current database and pursue a compatible fix-forward or a separately reviewed recovery plan.
 
 Schema 8 is not writable by pre-schema-8 code. A code rollback to an earlier commit therefore also
 requires the pre-migration database. Record the earlier commit before updating. If startup or live
@@ -485,6 +500,11 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 Do not substitute the schema 8 database into an older image or delete the failed database before
 diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt;
 do not merge the incompatible database files.
+
+Once the operator explicitly closes the rollback window, confirm current health and an
+independent recovery backup, then make a separate decision to remove the private pre-migration
+backup. Record that pre-schema-8 rollback will no longer be available through this procedure.
+Do not treat successful deployment verification or an elapsed date as automatic cleanup approval.
 
 ## Configuration
 
