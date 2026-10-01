@@ -138,7 +138,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli allow USER_ID
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 ```
 
-Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use **Allow Sender** in the dashboard instead. If Active Case evidence has expired, the restriction remains listed and **Allow Sender** continues to work through a separate encrypted control identity. A manual User ID form remains only for legacy restrictions that predate that identity record. The entered ID is used only to derive the existing sender key and is not stored. A raw user ID supplied on the command line may remain in shell history.
+Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` and `revoke` for active challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use **Allow Sender** in the dashboard instead. If Active Case evidence has expired, the restriction remains listed and **Allow Sender** continues to work through a separate encrypted control identity. A manual User ID form remains only for legacy restrictions that predate that identity record. The entered ID is used only to derive the existing sender key and is not stored. A raw user ID supplied on the command line may remain in shell history.
 
 ## Optional features
 

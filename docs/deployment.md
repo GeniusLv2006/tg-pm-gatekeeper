@@ -244,7 +244,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 docker compose logs --tail=100 gatekeeper
 ```
 
-Use the dashboard rather than CLI `allow` for active challenges, quarantines, or suppressions because the CLI cannot restore their Telegram dialog state.
+The CLI refuses `allow` and `revoke` for active challenges, quarantines, and suppressions because it cannot restore their Telegram dialog state; use the dashboard for those senders. `revoke` returns an allowed or provisional sender to normal screening.
 
 ### Compact the SQLite database offline
 
