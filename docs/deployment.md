@@ -200,12 +200,19 @@ The indicator changes between
 Use the adjacent refresh control to check immediately.
 
 Overview and list pages update their marked regions in place only when the service reports a changed
-state fingerprint. Current form input and focus are preserved during those updates. Detail pages do
-not replace evidence or decision controls in the background: if the underlying review or restriction
+state fingerprint. Current form input, focus, expanded context, and table scroll position are
+preserved during those updates. Detail pages do not replace evidence or decision controls in the
+background: if the underlying review or restriction
 changes, the dashboard disables the stale actions and asks the operator to load the current state.
 Losing the SSH tunnel leaves the current page visible while the connection indicator reports the
 failure. List pages retain their current page during refresh and show 50 rows per page in stable
 most-recently-updated order.
+
+Dashboard links update the page content in place while retaining the masthead, background, and
+stylesheet. Pagination, filters, confirmation pages, and browser Back/Forward use the same navigation
+path; superseded requests are cancelled. If the session expires or navigation fails, the browser
+falls back to normal navigation. Decision forms still submit through the existing authenticated POST
+and confirmation flow.
 
 ### Telegram operator controls
 
@@ -251,7 +258,7 @@ templates. This removes artifacts orphaned by older process-local cleanup withou
 Saved Messages or storing fetched text.
 
 Legacy restrictions without an encrypted control identity cannot be released this way. Use the
-dashboard's collapsed **Advanced recovery** path for those cases. Pending Review decisions and
+dashboard's collapsed **Advanced Recovery** path for those cases. Pending Review decisions and
 detailed evidence inspection also remain dashboard-only.
 
 Set `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false` and recreate the service to disable command
@@ -263,13 +270,13 @@ One row represents one sender. The row contains a consolidated message count and
 reference, not a stored conversation history. Opening it fetches one referenced message and the
 sender from Telegram.
 
-- **Allow sender** restores a Gatekeeper-managed archive when needed and allows the sender.
-- **Suppress and delete** records an explicit manual permanent suppression and schedules
+- **Allow Sender** restores a Gatekeeper-managed archive when needed and allows the sender.
+- **Suppress and Delete** records an explicit manual permanent suppression and schedules
   whole-dialog deletion.
-- **Dismiss & cancel jobs** records no classification, performs no immediate Telegram
+- **Dismiss & Cancel Jobs** records no classification, performs no immediate Telegram
   action, and cancels pending or failed Gatekeeper deletion jobs for that sender.
 
-If the referenced Telegram message has been deleted, use **Dismiss & cancel jobs**. This
+If the referenced Telegram message has been deleted, use **Dismiss & Cancel Jobs**. This
 clears the local review without changing the current sender trust or restriction state.
 
 ### Active Cases and archived restrictions
@@ -279,11 +286,11 @@ suppressions, and restrictions with pending or failed deletion work. **Archived 
 contains confirmed permanent suppressions after their deletion work finishes. Archiving changes only
 the dashboard grouping and does not release the sender. A separate encrypted control identity
 keeps each restriction identifiable and reversible for its full lifetime, even after its evidence
-expires. **Allow sender** restores saved dialog settings when available; cases with no saved settings
-are moved to the main folder and notifications are enabled. **Keep and archive** is available only
+expires. **Allow Sender** restores saved dialog settings when available; cases with no saved settings
+are moved to the main folder and notifications are enabled. **Keep and Archive** is available only
 for permanent suppression. Archived items can be returned to Needs Attention.
 
-**Release and forget** is available only for archived permanent restrictions with no pending or
+**Release and Forget** is available only for archived permanent restrictions with no pending or
 failed deletion work. It erases all sender-linked local state after confirmation but does not restore,
 move, unmute, or delete the Telegram conversation. A later message is treated as coming from an
 unknown sender. The archive page can preview and apply the same action to eligible items older than
@@ -296,12 +303,12 @@ not reclassify them or add an action.
 
 Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance
 removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but
-does not remove the row, identity, or **Allow sender** action. The minimal encrypted control identity is
+does not remove the row, identity, or **Allow Sender** action. The minimal encrypted control identity is
 removed only when the restriction ends. A temporary suppression is released when that sender next
 messages after expiry or by the next twelve-hour maintenance pass. Background release changes only
 local state and does not restore Telegram folder or mute settings.
 
-**Advanced recovery** appears only for restrictions created before control identities were retained and
+**Advanced Recovery** appears only for restrictions created before control identities were retained and
 which cannot be backfilled from an older encrypted reference. Entering a numeric Telegram User ID
 HMAC-derives the existing sender key without storing the ID. A matching quarantine or suppression is
 allowed and pending deletion jobs are cancelled, but Telegram settings cannot be restored without a
@@ -562,9 +569,9 @@ attempts. Remove the value after testing.
 | `startup_runtime_failed` | Inspect the immediately preceding privacy-safe events and container state; a supervised heartbeat or pruning failure intentionally exits for restart. |
 | Dashboard token or socket is missing | Run the tunnel helper, then inspect the `dashboard` service logs and `/run/tg-pm-gatekeeper/dashboard.sock`. |
 | Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
-| Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Dismiss & cancel jobs** if the sender decision no longer needs the message. |
-| Active Case says evidence is unavailable | The evidence retention window ended; the restriction remains listed and **Allow sender** still uses its encrypted control identity. |
-| Active Case says identity is unavailable | Open **Advanced recovery** and enter the numeric Telegram User ID; only pre-control-identity states should need this. |
+| Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Dismiss & Cancel Jobs** if the sender decision no longer needs the message. |
+| Active Case says evidence is unavailable | The evidence retention window ended; the restriction remains listed and **Allow Sender** still uses its encrypted control identity. |
+| Active Case says identity is unavailable | Open **Advanced Recovery** and enter the numeric Telegram User ID; only pre-control-identity states should need this. |
 | Mode is still `monitor` after an update | This is expected; mode is stored in the database. Switch explicitly only after checking status. |
 
 If the problem involves a sender action, preserve the current status and logs before changing policy

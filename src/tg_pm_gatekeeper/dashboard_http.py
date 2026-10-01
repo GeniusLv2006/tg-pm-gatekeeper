@@ -405,7 +405,7 @@ class DashboardHttpServer:
             "case_not_active": (409, "This Restriction Is No Longer Active"),
             "identity_unavailable": (409, "Telegram Identity Is Unavailable"),
             "restricted_sender_not_found": (409, "Restricted Sender Not Found"),
-            "use_active_case": (409, "Use Allow sender in Active Cases"),
+            "use_active_case": (409, "Use Allow Sender in Active Cases"),
             "telegram_action_failed": (
                 500,
                 "Telegram Action Failed; Item Was Not Changed",
@@ -668,7 +668,7 @@ class DashboardHttpServer:
         elif score_gate_met and not destructive_gate_met:
             outcome_copy = (
                 "The score reached 70, but permanent suppression also requires destructive "
-                f"evidence. The recorded decision was {action_label}."
+                f"evidence. The recorded decision was {action_label.lower()}."
             )
         elif planned_action == "strict_challenge":
             outcome_copy = (
@@ -686,29 +686,29 @@ class DashboardHttpServer:
         <section class="policy-map" aria-label="Policy decision explanation">
           <div class="policy-score-head">
             <div><span class="policy-kicker">Risk Score</span>
-              <strong>{risk_score}</strong><small>additive points · not a probability</small></div>
+              <strong>{risk_score}</strong><small>Additive points · not a probability</small></div>
             <span class="policy-version">{policy_version}</span>
           </div>
           <div class="risk-track" role="img" aria-label="Risk score {risk_score}; strict challenge starts at {PolicyEngine.STRICT_CHALLENGE_THRESHOLD} and permanent score condition starts at {PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}">
             <meter class="risk-meter" min="0" max="100" value="{plotted_score}">{plotted_score}%</meter>
             <span class="risk-mark strict-mark"><i>{PolicyEngine.STRICT_CHALLENGE_THRESHOLD}</i><b>Strict</b></span>
-            <span class="risk-mark permanent-mark"><i>{PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}</i><b>Permanent score</b></span>
+            <span class="risk-mark permanent-mark"><i>{PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}</i><b>Permanent Score</b></span>
           </div>
           <p class="gate-formula">Permanent suppression requires <strong>both</strong> conditions:</p>
           <div class="gate-check {score_state}">
             <span class="gate-symbol" aria-hidden="true">{score_symbol}</span>
-            <div><small>1 · Score condition</small>
+            <div><small>1 · Score Condition</small>
               <strong>{risk_score} ≥ {PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD}</strong>
               <p>Risk score reaches the permanent-suppression score threshold.</p></div>
           </div>
           <div class="gate-check {gate_state}">
             <span class="gate-symbol" aria-hidden="true">{gate_symbol}</span>
-            <div><small>2 · Destructive evidence</small>
+            <div><small>2 · Destructive Evidence</small>
               <strong>{html.escape(gate_label)}</strong>
               <p>Requires a non-quoted denied domain, or a corroborated repeated campaign.</p></div>
           </div>
           <div class="policy-outcome {action_class}">
-            <small>Final policy decision</small><strong>{html.escape(action_label)}</strong>
+            <small>Final Policy Decision</small><strong>{html.escape(action_label)}</strong>
             <p>{html.escape(outcome_copy)}</p>
           </div>
         </section>"""
@@ -743,7 +743,7 @@ class DashboardHttpServer:
         )
         if structural_only:
             sections += (
-                "<div class='notice'><strong>Limited Textual Evidence.</strong> "
+                "<div class='notice'><strong>Limited Textual Evidence</strong> "
                 "No message text, quoted text, or webpage-preview text was retained. "
                 "Review any available URLs, button text, evidence signals, and structural "
                 "metadata before deciding whether to allow the sender or leave the "
@@ -836,14 +836,14 @@ class DashboardHttpServer:
             content = (
                 self._masthead("Forget Restriction", "Confirmation", csrf_token=self._csrf_token)
                 + "<main class='list-main'><section class='queue-intro'>"
-                + "<p class='eyebrow'>Destructive local action</p>"
-                + "<h2>Release and forget this archived restriction?</h2>"
+                + "<p class='eyebrow'>Destructive Local Action</p>"
+                + "<h2>Release and Forget This Archived Restriction?</h2>"
                 + "<p>This removes all local policy, evidence, identity, snapshot, and history data. "
                 + "It does not restore, move, unmute, or delete the Telegram conversation. "
                 + "A future message will be handled as an unknown sender.</p>"
                 + f"<form method='post' action='/cases/{sender_key}/forget'>"
                 + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
-                + "<button class='danger' type='submit'>Release and forget</button></form>"
+                + "<button class='danger' type='submit'>Release and Forget</button></form>"
                 + "<p><a href='/cases/archive'>Cancel</a></p></section></main>"
             )
             return 200, {}, self._page(content, raw=True, page_title="Forget Restriction")
@@ -883,13 +883,13 @@ class DashboardHttpServer:
             content = (
                 self._masthead("Archive Restriction", "Confirmation", csrf_token=self._csrf_token)
                 + "<main class='list-main'><section class='queue-intro'>"
-                + "<h2>Keep this restriction and move it to the archive?</h2>"
+                + "<h2>Keep This Restriction and Move It to the Archive?</h2>"
                 + "<p>The permanent suppression remains in force. The sender will remain "
                 + "blocked by local policy, while its reviewable evidence keeps the existing "
                 + "expiry. You can move the restriction back to Needs Attention later.</p>"
                 + f"<form method='post' action='/cases/{sender_key}/archive'>"
                 + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
-                + "<button type='submit'>Keep and archive</button></form>"
+                + "<button type='submit'>Keep and Archive</button></form>"
                 + f"<p><a href='/cases/{sender_key}'>Cancel</a></p></section></main>"
             )
             return 200, {}, self._page(content, raw=True, page_title="Archive Restriction")
@@ -922,13 +922,13 @@ class DashboardHttpServer:
             content = (
                 self._masthead("Bulk Forget", f"{count} Eligible", csrf_token=self._csrf_token)
                 + "<main class='list-main'><section class='queue-intro'>"
-                + f"<h2>Release and forget {count} archived restriction{'s' if count != 1 else ''}?</h2>"
+                + f"<h2>Release and Forget {count} Archived Restriction{'s' if count != 1 else ''}?</h2>"
                 + f"<p>Only permanent restrictions archived for at least {days} days and with no pending or failed work are eligible. "
                 + "Telegram conversations are not changed.</p>"
                 + "<form method='post' action='/cases/archive/forget'>"
                 + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
                 + f"<input type='hidden' name='days' value='{days}'>"
-                + "<button class='danger' type='submit'>Confirm bulk forget</button></form>"
+                + "<button class='danger' type='submit'>Confirm Bulk Forget</button></form>"
                 + "<p><a href='/cases/archive'>Cancel</a></p></section></main>"
             )
             return 200, {}, self._page(content, raw=True, page_title="Bulk Forget")
@@ -957,7 +957,7 @@ class DashboardHttpServer:
             if archived:
                 return (
                     f"<a class='identity-link' href='/cases/{item.sender_key}'>"
-                    "Archived sender</a>"
+                    "Archived Sender</a>"
                 )
             return self._identity_cell(
                 self._identity_from_value(item.identity),
@@ -1003,10 +1003,10 @@ class DashboardHttpServer:
         recovery = ""
         if stats["unidentified"]:
             recovery = (
-                "<details class='advanced-recovery'><summary>Advanced recovery"
+                "<details class='advanced-recovery'><summary>Advanced Recovery"
                 f" <span>{stats['unidentified']} legacy</span></summary><div class='advanced-recovery-content'>"
                 "<p class='eyebrow'>Legacy Recovery</p>"
-                "<h2>Allow an unidentified restricted sender by Telegram User ID</h2>"
+                "<h2>Allow an Unidentified Restricted Sender by Telegram User ID</h2>"
                 "<p>Use this only for a legacy restriction created before encrypted control "
                 "identities were retained. This removes the Gatekeeper restriction and cancels "
                 "pending deletion jobs, but cannot restore saved Telegram folder or notification "
@@ -1017,7 +1017,7 @@ class DashboardHttpServer:
                 "<label for='release-user-id'>Telegram User ID</label>"
                 "<input id='release-user-id' name='user_id' type='text' inputmode='numeric' "
                 "pattern='[0-9]+' autocomplete='off' required>"
-                "<button class='danger' type='submit'>Allow without restore</button>"
+                "<button class='danger' type='submit'>Allow Without Restore</button>"
                 "</form></div></details>"
             )
         base = "/cases/archive" if archived else "/cases"
@@ -1035,7 +1035,7 @@ class DashboardHttpServer:
                 for item_reason, _ in reason_counts
             ) or "No reasons"
             archive_tools = (
-                "<section class='queue-intro compact-intro'><p class='eyebrow'>Local cleanup</p>"
+                "<section class='queue-intro compact-intro archive-tools'><p class='eyebrow'>Local Cleanup</p>"
                 f"<p>Filter by reason: <a href='/cases/archive'>All</a> · {reason_links}</p>"
                 "<p>Minimum archive age: "
                 + " · ".join(
@@ -1058,19 +1058,19 @@ class DashboardHttpServer:
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · "
             + ("<a href='/cases'>Needs Attention</a>" if archived else "<a href='/cases/archive'>Archived Restrictions</a>")
             + " · <a href='/review'>Pending Reviews</a></p>"
-            + "<main class='list-main' data-live-region='active-cases'><section class='queue-intro compact-intro'><p class='eyebrow'>Protect mode state</p>"
+            + "<main class='list-main' data-live-region='active-cases'><section class='queue-intro compact-intro'><p class='eyebrow'>Protect Mode State</p>"
             + "<p class='lede'>Review every current restriction. Evidence availability is tracked separately; Telegram block is never used.</p>"
             + "<dl class='metric-grid'>"
             + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
             + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
             + f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
-            + "<details class='context-note'><summary>Restriction context</summary>"
+            + "<details class='context-note'><summary>Restriction Context</summary>"
             + f"<p><strong>State reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></details></section>"
             + "<div class='table-shell'><table class='data-table cases-table'><thead><tr><th>Sender</th><th>State</th><th>Trigger</th><th>Evidence</th><th>Age</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div>"
             + self._pagination(filtered_base, page, total)
-            + "</main>"
             + archive_tools
+            + "</main>"
             + "<section class='advanced-recovery-wrap' data-live-region='legacy-recovery'>"
             + recovery
             + "</section>"
@@ -1109,17 +1109,17 @@ class DashboardHttpServer:
             "Encrypted evidence cannot be opened by this runtime.",
         )
         identity_value = self._identity_from_value(result.get("identity"))
-        identity = "Identity unavailable"
+        identity = "Identity Unavailable"
         telegram_link = ""
         user_id: int | None = None
         if identity_value is not None:
             user_id = identity_value.user_id
-            identity = identity_value.name or "Name unavailable"
+            identity = identity_value.name or "Name Unavailable"
             if identity_value.username:
                 identity += f" (@{identity_value.username})"
             telegram_link = (
                 f"<a class='telegram-link' href='tg://user?id={user_id}'>"
-                "Open this conversation in Telegram ↗</a>"
+                "Open This Conversation in Telegram ↗</a>"
             )
         legacy_payload = self._is_legacy_payload(payload)
         if legacy_payload:
@@ -1134,7 +1134,7 @@ class DashboardHttpServer:
             )
             policy_panel = ""
             legacy_notice = (
-                "<div class='notice'><strong>Legacy HR Decision.</strong> "
+                "<div class='notice'><strong>Legacy HR Decision</strong> "
                 "Recorded under rules-v2; not recalculated and no new action was added.</div>"
             )
         else:
@@ -1175,7 +1175,7 @@ class DashboardHttpServer:
         )
         allow_action = (
             self._action_form(
-                item.sender_key, "allow", "Allow sender", base="cases"
+                item.sender_key, "allow", "Allow Sender", base="cases"
             )
             if user_id is not None
             else "<button type='button' disabled>Allow Unavailable</button>"
@@ -1192,17 +1192,17 @@ class DashboardHttpServer:
         archived = item.archived_at is not None
         if archived:
             secondary_action = self._action_form(
-                item.sender_key, "unarchive", "Move to needs attention", base="cases"
+                item.sender_key, "unarchive", "Move to Needs Attention", base="cases"
             )
             if not item.has_open_actions:
                 secondary_action += (
                     f"<a class='danger button-link' href='/cases/{item.sender_key}/forget'>"
-                    "Release and forget…</a>"
+                    "Release and Forget…</a>"
                 )
         elif item.status == "suppressed" and item.suppressed_until is None:
             secondary_action = (
                 f"<a class='button-link' href='/cases/{item.sender_key}/archive'>"
-                "Keep and archive…</a>"
+                "Keep and Archive…</a>"
             )
         else:
             secondary_action = ""
@@ -1230,7 +1230,8 @@ class DashboardHttpServer:
           <dt>Evidence Expires</dt><dd>{evidence_expiry}</dd></dl>
           <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
         </aside></main><section class="decision-panel"><p class="eyebrow">Operator Action</p>
-          <h2>{html.escape(allow_guidance)}</h2>
+          <h2>Allow Sender</h2>
+          <p>{html.escape(allow_guidance)}</p>
           <div class="actions two">
             {allow_action}
             {secondary_action}
@@ -1252,11 +1253,11 @@ class DashboardHttpServer:
         )
         item = SimpleNamespace(**result)
         identity_value = self._identity_from_value(result.get("identity"))
-        identity = "Identity unavailable"
+        identity = "Identity Unavailable"
         user_id: int | None = None
         if identity_value is not None:
             user_id = identity_value.user_id
-            identity = identity_value.name or "Name unavailable"
+            identity = identity_value.name or "Name Unavailable"
             if identity_value.username:
                 identity += f" (@{identity_value.username})"
         signals = self._signal_breakdown(json.loads(item.signals))
@@ -1287,9 +1288,10 @@ class DashboardHttpServer:
               </aside>
             </main>
             <section class="decision-panel"><p class="eyebrow">Resolve Local Record</p>
-              <h2>Remove this sender's pending review and cancel pending Gatekeeper deletion jobs. Telegram and trust state are unchanged.</h2>
+              <h2>Dismiss Pending Reviews</h2>
+              <p>Remove this sender's pending review and cancel pending Gatekeeper deletion jobs. Telegram and trust state are unchanged.</p>
               <div class="actions one">
-                {self._action_form(item.id, "dismiss", "Dismiss & cancel jobs")}
+                {self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")}
               </div>
             </section>
             """
@@ -1310,7 +1312,7 @@ class DashboardHttpServer:
             <p class="eyebrow">Fetched from Telegram · Not Stored Locally</p>
             <h2>{html.escape(identity)}</h2>
             <pre class="message">{html.escape(text)}</pre>
-            <a class="telegram-link" href="tg://user?id={user_id}">Open this conversation in Telegram ↗</a>
+            <a class="telegram-link" href="tg://user?id={user_id}">Open This Conversation in Telegram ↗</a>
           </section>
           <aside class="case-file">
             <p class="eyebrow">Review Details</p>
@@ -1323,11 +1325,12 @@ class DashboardHttpServer:
           </aside>
         </main>
         <section class="decision-panel"><p class="eyebrow">Sender Decision</p>
-          <h2>This decision applies to all pending entries for this sender.</h2>
+          <h2>Resolve Pending Reviews</h2>
+          <p>This decision applies to all pending entries for this sender.</p>
           <div class="actions">
-            {self._action_form(item.id, "legitimate", "Allow sender")}
-            {self._action_form(item.id, "spam", "Suppress and delete", danger=True)}
-            {self._action_form(item.id, "dismiss", "Dismiss & cancel jobs")}
+            {self._action_form(item.id, "legitimate", "Allow Sender")}
+            {self._action_form(item.id, "spam", "Suppress and Delete", danger=True)}
+            {self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")}
           </div>
         </section>
         """
@@ -1363,13 +1366,13 @@ class DashboardHttpServer:
             self._masthead(
                 "Operations Dashboard", mode.title(), csrf_token=self._csrf_token
             )
-            + "<main class='list-main' data-live-region='operations'><section class='queue-intro compact-intro'><p class='eyebrow'>Operator overview</p>"
+            + "<main class='list-main' data-live-region='operations'><section class='queue-intro compact-intro'><p class='eyebrow'>Operator Overview</p>"
             "<p class='lede'>Review restrictions, recover false positives, and resolve pending decisions.</p>"
             "<dl class='metric-grid'>"
             f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
             f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
             f"<div><dt>Pending Reviews</dt><dd class='data-value'>{pending_reviews}</dd></div>"
-            "</dl><details class='context-note'><summary>Storage and maintenance</summary>"
+            "</dl><details class='context-note'><summary>Storage and Maintenance</summary>"
             f"<p>Needs attention: {storage_stats['attention_cases']} · "
             f"Archived: {storage_stats['archived_restrictions']} · "
             f"Database: {storage_stats['database_logical_bytes']} bytes "
@@ -1383,7 +1386,7 @@ class DashboardHttpServer:
             "</details></section>"
             "<nav class='area-grid' aria-label='Review areas'>"
             f"<a class='area-card' href='/cases'><span class='eyebrow'>Restrictions</span><strong>Active Cases · Needs Attention</strong><span>Review unresolved restrictions and failures.</span><b>{storage_stats['attention_cases']}</b></a>"
-            f"<a class='area-card' href='/cases/archive'><span class='eyebrow'>Retained policy</span><strong>Archived Restrictions</strong><span>Review or forget confirmed permanent restrictions.</span><b>{storage_stats['archived_restrictions']}</b></a>"
+            f"<a class='area-card' href='/cases/archive'><span class='eyebrow'>Retained Policy</span><strong>Archived Restrictions</strong><span>Review or forget confirmed permanent restrictions.</span><b>{storage_stats['archived_restrictions']}</b></a>"
             f"<a class='area-card' href='/review'><span class='eyebrow'>Decisions</span><strong>Pending Reviews</strong><span>Resolve simulations and exception reviews.</span><b>{pending_reviews}</b></a>"
             "</nav></main>"
         )
@@ -1417,9 +1420,9 @@ class DashboardHttpServer:
                 "Pending Reviews", f"{total} Pending", csrf_token=self._csrf_token
             )
             + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
-            + "<main class='list-main' data-live-region='pending-reviews'><section class='queue-intro compact-intro'><p class='eyebrow'>Decision queue</p>"
+            + "<main class='list-main' data-live-region='pending-reviews'><section class='queue-intro compact-intro'><p class='eyebrow'>Decision Queue</p>"
             "<p class='lede'>Open a sender to fetch message content and make a decision.</p>"
-            "<details class='context-note'><summary>Review and refresh behavior</summary>"
+            "<details class='context-note'><summary>Review and Refresh Behavior</summary>"
             "<p>Identity is cached briefly in memory; message content is fetched only on the detail page. "
             "Deleted Telegram conversations leave their local review available for resolution. "
             "The list refreshes in place only when review state changes.</p></details></section>"
@@ -1439,11 +1442,11 @@ class DashboardHttpServer:
     @staticmethod
     def _identity_cell(identity: LiveIdentity | None, *, href: str | None = None) -> str:
         if identity is None:
-            label = "Identity unavailable"
+            label = "Identity Unavailable"
             identity_id = ""
         else:
             if identity.name is None:
-                label = "Name unavailable"
+                label = "Name Unavailable"
             else:
                 label = identity.name + (
                     f" (@{identity.username})" if identity.username else ""
@@ -1513,7 +1516,7 @@ class DashboardHttpServer:
             "<div><span class='live'><i></i><span data-connection-label>Connected</span></span>"
             f"<small data-checked-at>Checked {checked_at}</small></div>"
             "<button class='refresh-control' type='button' data-dashboard-refresh "
-            "aria-label='Check now' title='Check now'>↻</button></div>"
+            "aria-label='Check Now' title='Check Now'>↻</button></div>"
             + logout
             + "</header>"
         )
@@ -1652,7 +1655,13 @@ class DashboardHttpServer:
         page_version: str | None = None,
     ) -> bytes:
         if raw:
-            body = content
+            # Keep the masthead mounted while navigating between dashboard pages.
+            header, separator, page_content = content.partition("</header>")
+            body = (
+                header + separator
+                + "<div data-dashboard-content>" + page_content + "</div>"
+                if separator else content
+            )
         else:
             guidance = {
                 "Invalid Access Token": (
@@ -1707,11 +1716,11 @@ class DashboardHttpServer:
             else ""
         )
         dashboard_script = (
-            '<script src="/dashboard.js" defer></script>' if live_attributes else ""
+            '<script src="/dashboard.js" defer></script>' if raw else ""
         )
         stylesheet = "/dashboard.css" if raw else "/dashboard-error.css"
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(document_title)}</title>
 <link rel="stylesheet" href="{stylesheet}">
-{dashboard_script}</head><body{live_attributes}>{body}</body></html>""".encode("utf-8")
+{dashboard_script}</head><body{' data-dashboard-page' if raw else ''}{live_attributes}>{body}</body></html>""".encode("utf-8")
