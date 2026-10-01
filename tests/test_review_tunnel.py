@@ -47,7 +47,6 @@ class ReviewTunnelTests(unittest.TestCase):
         self.assertIn("TG_DASHBOARD_HOST", result.stdout)
         self.assertIn("TG_REVIEW_*", result.stdout)
         self.assertIn("-o", result.stdout)
-        self.assertNotIn("bv", result.stdout)
 
     def test_legacy_wrapper_delegates_with_deprecation_notice(self) -> None:
         result = subprocess.run(

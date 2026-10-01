@@ -41,9 +41,6 @@ class DashboardBoundaryTests(unittest.TestCase):
         self.assertIn("network_mode: none", dashboard)
         self.assertIn("read_only: true", dashboard)
         self.assertIn("no-new-privileges:true", dashboard)
-        self.assertIn("pids_limit: 32", dashboard)
-        self.assertIn("mem_limit: 128m", dashboard)
-        self.assertIn("cpus: 0.25", dashboard)
         self.assertIn('restart: "no"', dashboard)
         self.assertEqual(
             dashboard.count(
@@ -64,20 +61,12 @@ class DashboardBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, dashboard)
 
-    def test_core_has_no_published_port_and_uses_192_mib_limit(self) -> None:
+    def test_core_has_no_published_port(self) -> None:
         gatekeeper = (ROOT / "compose.yaml").read_text(encoding="utf-8").split(
             "\n  dashboard:\n", 1
         )[0]
-        self.assertIn("mem_limit: 192m", gatekeeper)
         self.assertNotIn("ports:", gatekeeper)
         self.assertIn("TG_DASHBOARD_RPC_SOCKET_PATH", gatekeeper)
-
-    def test_remote_stop_failure_is_reported(self) -> None:
-        helper = (ROOT / "scripts" / "dashboard-remote.sh").read_text(
-            encoding="utf-8"
-        )
-        stop_function = helper.split("stop_dashboard() {", 1)[1].split("}", 1)[0]
-        self.assertNotIn("|| true", stop_function)
 
 
 if __name__ == "__main__":

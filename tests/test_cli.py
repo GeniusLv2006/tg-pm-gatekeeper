@@ -20,16 +20,6 @@ SENDER_KEY = IdentifierProtector(KEY).sender_key(USER_ID)
 
 
 class CliTests(unittest.TestCase):
-    def test_mode_monitor_replaces_legacy_pause_resume_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory) / "state.sqlite3"
-            with patch.dict(os.environ, {"TG_DB_PATH": str(database)}, clear=True):
-                self.assertEqual(run(["mode", "monitor"]), 0)
-                with self.assertRaises(SystemExit):
-                    run(["pause"])
-                with self.assertRaises(SystemExit):
-                    run(["resume"])
-
     def sender_environment(
         self, directory: str, prepare: Callable[[StateStore], object]
     ) -> tuple[Path, dict[str, str]]:

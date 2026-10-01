@@ -310,9 +310,9 @@ class RuleTests(unittest.TestCase):
     def test_campaign_template_ignores_rotating_domains_and_invite_tokens(self) -> None:
         def campaign(domain: str, first_invite: str, second_invite: str) -> MessageFacts:
             quote = (
-                f"888联盟网址 https://{domain}\n"
-                f"888联盟频道 https://t.me/+{first_invite}\n"
-                f"乔治引流代发 https://t.me/+{second_invite}"
+                f"示例联盟网址 https://{domain}\n"
+                f"示例联盟频道 https://t.me/+{first_invite}\n"
+                f"示例引流代发 https://t.me/+{second_invite}"
             )
             return MessageFacts(
                 text="在吗",
@@ -326,8 +326,8 @@ class RuleTests(unittest.TestCase):
                 is_forwarded=True,
             )
 
-        first = campaign("h4226.invalid", "firstToken", "secondToken")
-        second = campaign("h5388.invalid", "thirdToken", "fourthToken")
+        first = campaign("campaign-one.invalid", "firstToken", "secondToken")
+        second = campaign("campaign-two.invalid", "thirdToken", "fourthToken")
         self.assertEqual(
             campaign_candidate(first, detect_evidence_signals(first)),
             campaign_candidate(second, detect_evidence_signals(second)),
@@ -380,13 +380,13 @@ class RuleTests(unittest.TestCase):
         )
         self.assertIsNone(campaign_candidate(facts, detect_evidence_signals(facts)))
 
-    def test_richard_preview_scores_strict_without_permanent_suppression(self) -> None:
-        post = "https://t.me/hysqguangfang/917"
+    def test_promotional_preview_scores_strict_without_permanent_suppression(self) -> None:
+        post = "https://t.me/syntheticChannel/917"
         invite = "https://t.me/+syntheticInvite"
         facts = MessageFacts(
             text=post,
             preview_text=(
-                "Telegram 汇盈俱乐部 七年合约社区交流群: "
+                "Telegram 示例俱乐部 合约社区交流群: "
                 f"{invite} 免费带单 70%返佣 BTC/ETH 行情分析"
             ),
             urls=(post, invite),
@@ -421,7 +421,7 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(signals["LINK_BURST"].weight, 10)
         self.assertEqual(signals["LINK_BURST"].source, "behavior")
 
-    def test_normalization_and_domain_do_not_fetch(self) -> None:
+    def test_text_and_domain_normalization(self) -> None:
         self.assertEqual(normalize_text("  ＶＰＮ  Subscription "), "vpn subscription")
         self.assertEqual(
             normalized_domain("https://例子.测试/path"), "xn--fsqu00a.xn--0zwm56d"
