@@ -239,7 +239,8 @@ cannot execute a command twice. The cursor is never persisted, preventing pre-st
 replaying after a restart.
 
 Each processed command and every reply or case card created for it are collected as one artifact set.
-Schema 7 persists only the Telegram message IDs, deletion deadlines, and retry counts. A maintenance
+Since schema 7, only the Telegram message IDs, deletion deadlines, and retry counts are persisted for
+operator artifacts. A maintenance
 loop deletes due batches after 15 minutes, removes rows only after Telegram confirms deletion, and
 uses capped exponential backoff after failures. Restarting the service recovers the queue. To repair
 artifacts left by the older process-local implementation, startup performs a seven-day bounded search

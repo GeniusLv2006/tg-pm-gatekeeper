@@ -40,6 +40,7 @@ class InProcessDashboardBackend:
         *,
         mute_days: int,
         cancel_timeout=lambda _sender_key: None,
+        on_sender_forgotten=lambda _sender_key: None,
         schedule_dialog_deletion=lambda _action_id, _delete_at: None,
         restriction_actions: RestrictionActions | None = None,
     ) -> None:
@@ -48,6 +49,7 @@ class InProcessDashboardBackend:
         self.telegram_client = telegram_client
         self.mute_days = mute_days
         self.cancel_timeout = cancel_timeout
+        self.on_sender_forgotten = on_sender_forgotten
         self.schedule_dialog_deletion = schedule_dialog_deletion
         self.restriction_actions = restriction_actions or RestrictionActions(
             store,
@@ -208,7 +210,6 @@ class InProcessDashboardBackend:
                         item.reference
                     ),
                 )
-                self.store.archive_restriction(item.sender_key, now)
                 self.store.activate_enforcement_review(
                     item.sender_key,
                     "manual_permanent_suppression",
@@ -223,6 +224,7 @@ class InProcessDashboardBackend:
                     mode_independent=True,
                     now=now,
                 )
+                self.store.archive_restriction(item.sender_key, now)
                 self.schedule_dialog_deletion(action_id, now)
                 self.cancel_timeout(item.sender_key)
             else:
@@ -329,6 +331,7 @@ class InProcessDashboardBackend:
                     raise DashboardBackendError("case_not_forgettable")
                 self.cancel_timeout(sender_key)
                 self._identity_cache.pop(sender_key, None)
+                self.on_sender_forgotten(sender_key)
             LOG.info("archived_restrictions_forgotten:count=1")
             return {"outcome": "forgotten"}
         if action != "allow":
@@ -366,6 +369,7 @@ class InProcessDashboardBackend:
                 ):
                     self.cancel_timeout(sender_key)
                     self._identity_cache.pop(sender_key, None)
+                    self.on_sender_forgotten(sender_key)
                     count += 1
         LOG.info("archived_restrictions_forgotten:count=%d", count)
         return {"outcome": "forgotten", "count": count}

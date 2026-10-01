@@ -137,6 +137,8 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_forget_is_local_and_requires_archived_permanent_case(self) -> None:
         sender_key = "e" * 64
+        forgotten: list[str] = []
+        self.backend.on_sender_forgotten = forgotten.append
         self.store.suppress(sender_key, "critical_rule", until=None)
         with self.assertRaisesRegex(DashboardBackendError, "case_not_forgettable"):
             await self.backend.request(
@@ -150,6 +152,7 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"outcome": "forgotten"})
         self.assertEqual(self.store.sender(sender_key).status, "unknown")
+        self.assertEqual(forgotten, [sender_key])
 
     async def test_bulk_forget_rechecks_eligibility_after_sender_lock(self) -> None:
         sender_key = "f" * 64

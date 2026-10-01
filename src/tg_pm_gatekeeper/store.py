@@ -940,12 +940,16 @@ class StateStore:
             )
             if cursor.rowcount == 1:
                 self._connection.execute(
-                    "UPDATE pending_actions SET status='cancelled',finished_at=? "
+                    "UPDATE pending_actions SET status='cancelled',finished_at=?,"
+                    "reference=X'' "
                     "WHERE sender_key=? AND status IN ('pending','failed')",
                     (timestamp, sender_key),
                 )
                 self._connection.execute(
                     "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
+                )
+                self._connection.execute(
+                    "DELETE FROM review_queue WHERE sender_key=?", (sender_key,)
                 )
                 self._connection.execute(
                     "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
@@ -1718,7 +1722,18 @@ class StateStore:
             ).fetchall()
         return [PendingAction(**dict(row)) for row in rows]
 
-    def claim_action(self, action_id: int) -> PendingAction | None:
+    def pending_action_sender_key(self, action_id: int) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT sender_key FROM pending_actions WHERE id=? AND status='pending'",
+                (action_id,),
+            ).fetchone()
+        return str(row["sender_key"]) if row is not None else None
+
+    def claim_action(
+        self, action_id: int, now: int | None = None
+    ) -> PendingAction | None:
+        timestamp = int(time.time()) if now is None else now
         with self._lock:
             row = self._connection.execute(
                 "SELECT id,sender_key,action,reason,reference,execute_at,"
@@ -1736,6 +1751,12 @@ class StateStore:
                 "suppressed",
                 "quarantined",
             } or state.revision != int(row["expected_revision"]):
+                return None
+            if (
+                state.status == "suppressed"
+                and state.suppressed_until is not None
+                and state.suppressed_until <= timestamp
+            ):
                 return None
         return PendingAction(**dict(row))
 
@@ -2164,7 +2185,8 @@ class StateStore:
             ]
             for sender_key in expired:
                 self._connection.execute(
-                    "UPDATE pending_actions SET status='cancelled',finished_at=? "
+                    "UPDATE pending_actions SET status='cancelled',finished_at=?,"
+                    "reference=X'' "
                     "WHERE sender_key=? AND status IN ('pending','failed')",
                     (timestamp, sender_key),
                 )
@@ -2177,6 +2199,9 @@ class StateStore:
                 )
                 self._connection.execute(
                     "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
+                )
+                self._connection.execute(
+                    "DELETE FROM review_queue WHERE sender_key=?", (sender_key,)
                 )
                 self._connection.execute(
                     "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)

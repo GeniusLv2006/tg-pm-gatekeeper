@@ -289,7 +289,7 @@ class StoreTests(unittest.TestCase):
             now=100,
         )
         self.store.set_mode("protect")
-        self.assertIsNotNone(self.store.claim_action(action_id))
+        self.assertIsNotNone(self.store.claim_action(action_id, now=100))
         self.store.set_mode("monitor")
         self.assertEqual(self.store.pending_actions(), [])
         self.assertEqual(self.store.statistics(now=100)["pending_reviews"], 1)
@@ -603,9 +603,17 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(count, 0, table)
 
     def test_prune_releases_expired_temporary_and_forgets_old_archive(self) -> None:
-        self.store.suppress(
+        temporary_state = self.store.suppress(
             "temporary", "challenge_timeout", until=200,
             restriction_reference=b"identity", now=100,
+        )
+        self.store.enqueue_review(
+            "temporary", b"review-reference", "would_quarantine", "[]", "{}",
+            expires_at=500_000, now=100,
+        )
+        action_id = self.store.schedule_action(
+            "temporary", reason="challenge_timeout", reference=b"action-reference",
+            execute_at=150, expected_revision=temporary_state.revision, now=100,
         )
         self.store.save_dialog_snapshot(
             "temporary", DialogSnapshot(folder_id=1, silent=True, mute_until=200)
@@ -623,6 +631,15 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(metrics["auto_forgotten"], 1)
         self.assertEqual(self.store.sender("temporary").status, "unknown")
         self.assertIsNone(self.store.dialog_snapshot("temporary"))
+        self.assertEqual(
+            self.store._connection.execute(
+                "SELECT COUNT(*) FROM review_queue WHERE sender_key='temporary'"
+            ).fetchone()[0], 0,
+        )
+        action = self.store._connection.execute(
+            "SELECT status,reference FROM pending_actions WHERE id=?", (action_id,)
+        ).fetchone()
+        self.assertEqual(tuple(action), ("cancelled", b""))
         self.assertEqual(self.store.sender("old").status, "unknown")
         self.assertEqual(self.store.sender("new").status, "suppressed")
         second_connection = StateStore(self.store.path)
