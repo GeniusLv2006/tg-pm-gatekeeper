@@ -1,12 +1,9 @@
 # Maintainer release policy
 
 > [!NOTE]
-> This document is for maintainers publishing changes to the repository. You do not need it to
-> install or run Gatekeeper. Use [deployment.md](deployment.md) for installation, updates, and daily
-> operation.
+> This document is for maintainers publishing changes to the repository. You do not need it to install or run Gatekeeper. Use [deployment.md](deployment.md) for installation, updates, and daily operation.
 
-This policy keeps behavior and security changes reviewable while allowing genuinely low-risk edits to
-move quickly.
+This policy keeps behavior and security changes reviewable while allowing genuinely low-risk edits to move quickly.
 
 ## Choose the publication path
 
@@ -32,8 +29,7 @@ A maintainer may commit directly to `main` only when every changed file is limit
 - comments, formatting, spelling, or repository metadata; or
 - `.gitignore` entries that do not hide source, configuration examples, or audit evidence.
 
-Review the complete diff and use a Conventional Commit. After pushing, confirm the `test` and
-`secrets` GitHub Actions jobs pass before related work continues.
+Review the complete diff and use a Conventional Commit. After pushing, confirm the `test` and `secrets` GitHub Actions jobs pass before related work continues.
 
 ### Pull requests required
 
@@ -63,8 +59,7 @@ docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
 
-Add checks specific to the changed executable or workflow. Test data must not contain real Telegram
-identities, messages, credentials, URLs, databases, or logs.
+Add checks specific to the changed executable or workflow. Test data must not contain real Telegram identities, messages, credentials, URLs, databases, or logs.
 
 ## Publish
 
@@ -77,15 +72,12 @@ identities, messages, credentials, URLs, databases, or logs.
 
 ### Pull-request path
 
-1. Create a narrow branch from current `main` with a change-type prefix such as `fix/`, `feat/`,
-   `docs/`, `refactor/`, `ci/`, or `chore/`.
+1. Create a narrow branch from current `main` with a change-type prefix such as `fix/`, `feat/`, `docs/`, `refactor/`, `ci/`, or `chore/`.
 2. Commit only the intended scope with a Conventional Commit.
 3. Push the branch over SSH.
 4. Open a ready-for-review PR. Use Draft only while work is genuinely incomplete.
-5. Describe behavior, security/privacy impact, licensing impact when applicable, validation, and
-   deployment requirements.
-6. For ordinary changes, enable squash auto-merge after review. Security-sensitive changes require
-   explicit human review.
+5. Describe behavior, security/privacy impact, licensing impact when applicable, validation, and deployment requirements.
+6. For ordinary changes, enable squash auto-merge after review. Security-sensitive changes require explicit human review.
 7. Keep the squash title in the form `<conventional title> (#<PR>)`.
 8. After merge, delete the branch and fast-forward local `main`.
 
@@ -93,12 +85,9 @@ Never bypass a failing check.
 
 ## Deploy a merged change
 
-No deployment is needed for changes limited to documentation, tests, license text, source notices,
-`.gitignore`, or repository metadata. Pulling those changes to the server is optional and must not
-restart a healthy container.
+No deployment is needed for changes limited to documentation, tests, license text, source notices, `.gitignore`, or repository metadata. Pulling those changes to the server is optional and must not restart a healthy container.
 
-Deploy when a merged commit changes runtime code, service configuration, Docker or dependency inputs,
-database behavior, or an operator workflow needed on the host.
+Deploy when a merged commit changes runtime code, service configuration, Docker or dependency inputs, database behavior, or an operator workflow needed on the host.
 
 Rebuild the image when executable content changes in:
 
@@ -113,22 +102,13 @@ For every live update:
 2. Create a private server-local backup for migrations or persistent-state changes.
 3. Fast-forward the server to the reviewed `main` commit.
 4. Rebuild and recreate the container only when required above.
-5. Verify the deployed commit, health, restart count, mode, redacted status, logs, private-file
-   permissions, dashboard socket, and absence of unexpected port mappings.
-6. Remove temporary tunnels after successful verification. Remove an ordinary operational backup
-   only after its checks pass. For a schema-incompatible update, retain the private pre-migration
-   backup until the operator explicitly closes the rollback window; successful startup checks alone
-   do not authorize its deletion. Follow the backup and rollback rules in
-   [deployment.md](deployment.md).
+5. Verify the deployed commit, health, restart count, mode, redacted status, logs, private-file permissions, dashboard socket, and absence of unexpected port mappings.
+6. Remove temporary tunnels after successful verification. Remove an ordinary operational backup only after its checks pass. For a schema-incompatible update, retain the private pre-migration backup until the operator explicitly closes the rollback window; successful startup checks alone do not authorize its deletion. Follow the backup and rollback rules in [deployment.md](deployment.md).
 
-If verification fails, preserve the failed state needed for diagnosis before considering a rollback.
-Do not use destructive Git or Docker commands on user data. The operator commands and security checks
-are in [deployment.md](deployment.md).
+If verification fails, preserve the failed state needed for diagnosis before considering a rollback. Do not use destructive Git or Docker commands on user data. The operator commands and security checks are in [deployment.md](deployment.md).
 
 ## Local maintainer notes
 
-Machine-specific aliases, paths, and preferred commands belong in the ignored repository-root file
-`RELEASE.local.md`. It must never contain credentials, Telegram session values, HMAC keys, raw user
-identifiers, message content, or database copies.
+Machine-specific aliases, paths, and preferred commands belong in the ignored repository-root file `RELEASE.local.md`. It must never contain credentials, Telegram session values, HMAC keys, raw user identifiers, message content, or database copies.
 
 The tracked documentation must remain usable without that file.

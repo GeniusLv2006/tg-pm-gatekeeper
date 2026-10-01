@@ -1,29 +1,22 @@
 # Security
 
-Gatekeeper controls a Telegram user session. Protect that session as you would protect the account
-itself: Telegram two-step verification does not invalidate a session that has already been stolen.
+Gatekeeper controls a Telegram user session. Protect that session as you would protect the account itself: Telegram two-step verification does not invalidate a session that has already been stolen.
 
 ## If you run Gatekeeper
 
 - Use a dedicated server and restrict administrator access.
-- Keep the Telegram session, HMAC key, Active Case review key, configuration, state, and backups out
-  of source control and general backup jobs.
-- Keep the dashboard behind the supplied SSH tunnel. Do not publish its Unix socket through Docker or
-  a reverse proxy.
+- Keep the Telegram session, HMAC key, Active Case review key, configuration, state, and backups out of source control and general backup jobs.
+- Keep the dashboard behind the supplied SSH tunnel. Do not publish its Unix socket through Docker or a reverse proxy.
 - Start in `monitor` and use a dedicated account for the first destructive-flow test.
-- Run the [post-install security checks](docs/deployment.md#confirm-the-security-settings) before
-  enabling `protect`.
+- Run the [post-install security checks](docs/deployment.md#confirm-the-security-settings) before enabling `protect`.
 
-Root access to the server is equivalent to access to the Telegram account. Container isolation cannot
-protect the session from the host administrator.
+Root access to the server is equivalent to access to the Telegram account. Container isolation cannot protect the session from the host administrator.
 
 ## Report a vulnerability
 
-Use GitHub's private vulnerability reporting for this repository when available. Do not open a public
-issue containing credentials, session data, personal messages, phone numbers, or exploit details.
+Use GitHub's private vulnerability reporting for this repository when available. Do not open a public issue containing credentials, session data, personal messages, phone numbers, or exploit details.
 
-If private reporting is unavailable, open a public issue that requests a private contact channel but
-contains no sensitive technical details.
+If private reporting is unavailable, open a public issue that requests a private contact channel but contains no sensitive technical details.
 
 ## Keep sensitive data out of GitHub
 
@@ -31,12 +24,10 @@ Never commit these values, including in examples, fixtures, logs, screenshots, o
 
 - Telegram API IDs, API hashes, login codes, two-factor passwords, or session files;
 - phone numbers, private-conversation usernames, contact lists, or user IDs;
-- message text, media, real deployment allowlists or denylists, moderation databases, or audit logs;
-  and
+- message text, media, real deployment allowlists or denylists, moderation databases, or audit logs; and
 - deployment credentials, private keys, environment files, or backups.
 
-If a secret is committed, deleting it in a later commit is not enough. Revoke or rotate it first,
-then remove it from the complete Git history.
+If a secret is committed, deleting it in a later commit is not enough. Revoke or rotate it first, then remove it from the complete Git history.
 
 ## If a Telegram session may have leaked
 
@@ -47,87 +38,46 @@ then remove it from the complete Git history.
 5. Confirm the old Telegram authorization is gone before restarting Gatekeeper.
 6. Remove leaked material from Git history, logs, or backups only after access has been revoked.
 
-Exact operator commands are in
-[Emergency session revocation](docs/deployment.md#emergency-session-revocation).
+Exact operator commands are in [Emergency session revocation](docs/deployment.md#emergency-session-revocation).
 
 ## Technical security model
 
-This section documents guarantees that contributors must preserve. For the full state and decision
-flow, see [Architecture](docs/architecture.md).
+This section documents guarantees that contributors must preserve. For the full state and decision flow, see [Architecture](docs/architecture.md).
 
 ### Credentials and identities
 
 - The Telegram StringSession is a mode `0600` file owned by the service UID.
-- The runtime uses a Telethon StringSession instead of its SQLite session, so names, usernames, and
-  phone numbers are not retained in a Telethon entity cache.
+- The runtime uses a Telethon StringSession instead of its SQLite session, so names, usernames, and phone numbers are not retained in a Telethon entity cache.
 - Sender state uses an HMAC-derived identifier rather than a raw Telegram user ID.
-- The runtime database may store Telegram message IDs, generated challenge text while delivery is
-  incomplete, authenticated encrypted short-lived references needed for message review, and a
-  separate encrypted control identity containing only Telegram user ID and access hash for each
-  active quarantine or suppression.
-- Saved Messages operator cleanup stores only artifact message IDs, deletion deadlines, and retry
-  counts. It never persists command, response, case-card, or unrelated Saved Messages text.
+- The runtime database may store Telegram message IDs, generated challenge text while delivery is incomplete, authenticated encrypted short-lived references needed for message review, and a separate encrypted control identity containing only Telegram user ID and access hash for each active quarantine or suppression.
+- Saved Messages operator cleanup stores only artifact message IDs, deletion deadlines, and retry counts. It never persists command, response, case-card, or unrelated Saved Messages text.
 - Raw user IDs, usernames, profile names, and message content are not stored in plaintext.
-- Cross-sender campaign detection stores only a keyed HMAC fingerprint, an already-derived sender
-  key, and a timestamp for at most 7 days. Canonical templates, raw URLs, and reversible hashes must
-  not be persisted or logged, and the dedicated test sender must not contribute an event.
-- The control identity uses keys domain-separated from message-review references. It remains only
-  while the restriction remains active and is erased on allowance, revocation, or temporary
-  suppression release. Evidence expiry does not erase this operator control path.
-- Archiving is a presentation decision and does not weaken suppression. Release-and-forget erases all
-  locally retained rows linked to that derived sender key without calling Telegram; a later message
-  is therefore evaluated as a new unknown sender. Per-sender cleanup is not logged with an identifier.
-- Optional automatic forgetting applies only to archived permanent suppressions, is disabled by
-  default, and skips restrictions with pending or failed deletion work.
-- The owner may enter a raw Telegram user ID only to recover a legacy restriction without a control
-  identity. The value is HMAC-derived in memory, is not persisted, and is accepted only when it
-  matches an existing quarantined or suppressed sender state.
+- Cross-sender campaign detection stores only a keyed HMAC fingerprint, an already-derived sender key, and a timestamp for at most 7 days. Canonical templates, raw URLs, and reversible hashes must not be persisted or logged, and the dedicated test sender must not contribute an event.
+- The control identity uses keys domain-separated from message-review references. It remains only while the restriction remains active and is erased on allowance, revocation, or temporary suppression release. Evidence expiry does not erase this operator control path.
+- Archiving is a presentation decision and does not weaken suppression. Release-and-forget erases all locally retained rows linked to that derived sender key without calling Telegram; a later message is therefore evaluated as a new unknown sender. Per-sender cleanup is not logged with an identifier.
+- Optional automatic forgetting applies only to archived permanent suppressions, is disabled by default, and skips restrictions with pending or failed deletion work.
+- The owner may enter a raw Telegram user ID only to recover a legacy restriction without a control identity. The value is HMAC-derived in memory, is not persisted, and is accepted only when it matches an existing quarantined or suppressed sender state.
 
 ### Encrypted review content
 
-- Active quarantines and suppressions may retain an AES-256-GCM encrypted snapshot for at most 30
-  days. It can include text/caption, Telegram-provided quoted and preview text, button text, full URLs,
-  normalized domains, URL shape, evidence signals, risk score, challenge profile, decision basis,
-  policy version, and structural features.
-- The dedicated `review.key` secret derives the Active Case encryption key through HKDF. It is
-  separate from the Telegram session and state HMAC key.
-- Webpage bodies, media, profile data, raw IDs, access hashes, and verification answers are not
-  included in Active Case snapshots.
-- Plaintext Active Case export is not provided. Dashboard responses use `Cache-Control: no-store`, but
-  decrypted content is still visible to the owner and can be captured by browser memory, screenshots,
-  or a compromised workstation.
-- Dashboard JavaScript and the lightweight status endpoint require the existing authenticated
-  dashboard session and remain behind the owner-only Unix socket and SSH tunnel. The status response
-  contains only an opaque page-state fingerprint and check time; it does not contain message content,
-  Telegram identity, encrypted references, or evidence. Content Security Policy permits scripts and
-  connection checks only from the same origin; no external browser dependency is loaded.
-- Dashboard access requires both a process-local capability path and an independent HttpOnly browser
-  session cookie. Copying the URL alone must not transfer access to another browser. A new login or
-  explicit logout revokes the previous session, and server-side idle and absolute timeouts bound its
-  lifetime. The cookie is scoped beneath its capability path and uses `SameSite=Strict`; it is not
-  marked `Secure` because the supported endpoint is loopback HTTP carried inside the SSH tunnel.
+- Active quarantines and suppressions may retain an AES-256-GCM encrypted snapshot for at most 30 days. It can include text/caption, Telegram-provided quoted and preview text, button text, full URLs, normalized domains, URL shape, evidence signals, risk score, challenge profile, decision basis, policy version, and structural features.
+- The dedicated `review.key` secret derives the Active Case encryption key through HKDF. It is separate from the Telegram session and state HMAC key.
+- Webpage bodies, media, profile data, raw IDs, access hashes, and verification answers are not included in Active Case snapshots.
+- Plaintext Active Case export is not provided. Dashboard responses use `Cache-Control: no-store`, but decrypted content is still visible to the owner and can be captured by browser memory, screenshots, or a compromised workstation.
+- Dashboard JavaScript and the lightweight status endpoint require the existing authenticated dashboard session and remain behind the owner-only Unix socket and SSH tunnel. The status response contains only an opaque page-state fingerprint and check time; it does not contain message content, Telegram identity, encrypted references, or evidence. Content Security Policy permits scripts and connection checks only from the same origin; no external browser dependency is loaded.
+- Dashboard access requires both a process-local capability path and an independent HttpOnly browser session cookie. Copying the URL alone must not transfer access to another browser. A new login or explicit logout revokes the previous session, and server-side idle and absolute timeouts bound its lifetime. The cookie is scoped beneath its capability path and uses `SameSite=Strict`; it is not marked `Secure` because the supported endpoint is loopback HTTP carried inside the SSH tunnel.
 
 ### Actions and failure handling
 
-- Arithmetic verification adds interaction friction; it is not a CAPTCHA or proof that a sender is
-  human.
-- A score alone must never authorize permanent suppression. The action additionally requires either
-  a non-quoted owner-denied domain or a repeated cross-sender campaign corroborated by promotional
-  language, multiple links, and either Telegram forwarding or a promotional Telegram webpage
-  preview containing campaign links. A quoted denylist match alone is non-destructive.
-- `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned and
-  must not be silently overridden through deployment environment variables.
-- Message handling, challenge timeout, recovery, and review transitions are serialized per derived
-  sender identifier.
+- Arithmetic verification adds interaction friction; it is not a CAPTCHA or proof that a sender is human.
+- A score alone must never authorize permanent suppression. The action additionally requires either a non-quoted owner-denied domain or a repeated cross-sender campaign corroborated by promotional language, multiple links, and either Telegram forwarding or a promotional Telegram webpage preview containing campaign links. A quoted denylist match alone is non-destructive.
+- `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned and must not be silently overridden through deployment environment variables.
+- Message handling, challenge timeout, recovery, and review transitions are serialized per derived sender identifier.
 - Exhausting the outbound-message limit must not bypass screening.
-- Whole-dialog deletion is represented by a persistent action tied to an expected sender-state
-  revision. Normal deletion jobs run only in `protect`; switching to `monitor` cancels them.
-- `TG_TEST_SENDER_ID` cleanup and an explicit dashboard Spam decision are the only mode-independent
-  deletion paths. Never assign a real correspondent to the test setting; the dashboard action must
-  remain visibly destructive and CSRF-protected.
+- Whole-dialog deletion is represented by a persistent action tied to an expected sender-state revision. Normal deletion jobs run only in `protect`; switching to `monitor` cancels them.
+- `TG_TEST_SENDER_ID` cleanup and an explicit dashboard Spam decision are the only mode-independent deletion paths. Never assign a real correspondent to the test setting; the dashboard action must remain visibly destructive and CSRF-protected.
 - The application must not expose a listening TCP port or mount the Docker socket.
 
 ## Supported versions
 
-The project has not reached a stable release. Security fixes apply only to the latest commit on the
-default branch until a versioning policy is established.
+The project has not reached a stable release. Security fixes apply only to the latest commit on the default branch until a versioning policy is established.

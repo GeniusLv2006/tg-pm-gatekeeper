@@ -1,7 +1,6 @@
 # Install and operate Gatekeeper
 
-This guide is for people installing or running Gatekeeper. You do not need to read the maintainer
-[release policy](RELEASE.md) unless you are publishing code changes to the project.
+This guide is for people installing or running Gatekeeper. You do not need to read the maintainer [release policy](RELEASE.md) unless you are publishing code changes to the project.
 
 Examples use a root maintenance login. Set your server once in the current shell:
 
@@ -18,12 +17,9 @@ On your trusted computer you need:
 - an application API ID and hash from [Telegram's developer tools](https://my.telegram.org/apps); and
 - a dedicated Telegram account for the first end-to-end test.
 
-On the server you need a dedicated Debian-compatible Linux system with Docker Engine and the Compose
-plugin.
+On the server you need a dedicated Debian-compatible Linux system with Docker Engine and the Compose plugin.
 
-Gatekeeper controls a Telegram user session and can delete private dialogs in `protect` mode. Start
-in `monitor`, test with the dedicated account, and keep the generated session and key files out of
-chat, tickets, screenshots, shell commands, and general backups.
+Gatekeeper controls a Telegram user session and can delete private dialogs in `protect` mode. Start in `monitor`, test with the dedicated account, and keep the generated session and key files out of chat, tickets, screenshots, shell commands, and general backups.
 
 ## Install Gatekeeper
 
@@ -48,10 +44,7 @@ The initializer signs in to Telegram and creates five files:
 - `config.env`: the service configuration; and
 - `deny-domains.txt`: your optional local domain denylist.
 
-The files start with owner-only permissions, and the initializer refuses to overwrite them. Transfer
-them only to the intended server over a trusted channel. The review key encrypts Active Case
-snapshots and must remain separate from the HMAC key. See
-[deny-domains.example.txt](../deny-domains.example.txt) for the denylist format.
+The files start with owner-only permissions, and the initializer refuses to overwrite them. Transfer them only to the intended server over a trusted channel. The review key encrypts Active Case snapshots and must remain separate from the HMAC key. See [deny-domains.example.txt](../deny-domains.example.txt) for the denylist format.
 
 ### 2. Prepare the server
 
@@ -62,8 +55,7 @@ ssh "$DEPLOY_HOST" 'sh -s' < deploy/bootstrap-host.sh
 ssh "$DEPLOY_HOST" 'git clone https://github.com/GeniusLv2006/tg-pm-gatekeeper.git /opt/tg-pm-gatekeeper'
 ```
 
-The bootstrap script creates a non-login service user with UID/GID `10001`. It does not create or
-copy credentials.
+The bootstrap script creates a non-login service user with UID/GID `10001`. It does not create or copy credentials.
 
 ### 3. Transfer the private files
 
@@ -125,10 +117,7 @@ Continue when:
 - `heartbeat` is a recent Unix timestamp and is not more than five seconds in the future; and
 - `action_failures` is `0`.
 
-For memory regression checks, inspect the redacted `runtime_metrics` events in the container log.
-They report only current RSS, bounded Session entity count and evictions, Telethon update-cache count,
-and task counts. The Session cache is capped at 256 user entities and the Telethon update cache at 128;
-neither limit contains identity names or message content.
+For memory regression checks, inspect the redacted `runtime_metrics` events in the container log. They report only current RSS, bounded Session entity count and evictions, Telethon update-cache count, and task counts. The Session cache is capped at 256 user entities and the Telethon update cache at 128; neither limit contains identity names or message content.
 
 If the container is not healthy, run:
 
@@ -146,25 +135,15 @@ From the local repository on your trusted computer:
 scripts/dashboard-tunnel.sh "$DEPLOY_HOST"
 ```
 
-Keep the terminal open. Press Enter when prompted to open the one-time login link, or pass `-o` to
-open it immediately. Login creates a browser-bound session protected by a random capability path and
-a path-scoped HttpOnly cookie. Copying the address into another browser does not transfer access.
-Each successful login rotates both credentials and invalidates the previous session. Use **Sign Out**
-to revoke the session explicitly. Sessions expire after 30 minutes without a dashboard request or
-eight hours in total. The sidecar exits after 10 minutes without authenticated activity. **Sign Out**
-and `Ctrl+C` both stop the sidecar, erase its process-local credentials, and leave the core running.
+Keep the terminal open. Press Enter when prompted to open the one-time login link, or pass `-o` to open it immediately. Login creates a browser-bound session protected by a random capability path and a path-scoped HttpOnly cookie. Copying the address into another browser does not transfer access. Each successful login rotates both credentials and invalidates the previous session. Use **Sign Out** to revoke the session explicitly. Sessions expire after 30 minutes without a dashboard request or eight hours in total. The sidecar exits after 10 minutes without authenticated activity. **Sign Out** and `Ctrl+C` both stop the sidecar, erase its process-local credentials, and leave the core running.
 
 ### 3. Send a safe test
 
-While the service remains in `monitor`, send a private message from a separate Telegram account that
-is not yet trusted. Do not configure it as `TG_TEST_SENDER_ID` for this first check: that setting
-deliberately runs real Telegram actions even in `monitor`. The installation is behaving as expected
-when a row appears under **Pending Reviews** and Telegram has not been changed.
+While the service remains in `monitor`, send a private message from a separate Telegram account that is not yet trusted. Do not configure it as `TG_TEST_SENDER_ID` for this first check: that setting deliberately runs real Telegram actions even in `monitor`. The installation is behaving as expected when a row appears under **Pending Reviews** and Telegram has not been changed.
 
 ### 4. Confirm the server is not exposing Gatekeeper
 
-Run the checks in [Confirm the security settings](#confirm-the-security-settings). They verify that
-the dashboard is not public and that the private files have the expected permissions.
+Run the checks in [Confirm the security settings](#confirm-the-security-settings). They verify that the dashboard is not public and that the private files have the expected permissions.
 
 ### 5. Enable protection when ready
 
@@ -180,52 +159,25 @@ Return to the safe observation mode at any time:
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor'
 ```
 
-Returning to `monitor` keeps message processing active but cancels automatically generated pending
-destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent.
+Returning to `monitor` keeps message processing active but cancels automatically generated pending destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent.
 
 ## Dashboard and daily operation
 
-The dashboard has no public TCP listener. The tunnel helper starts a hardened, network-disabled
-sidecar, connects local port `8765` to its owner-only Unix socket, and reads a fresh one-time access
-token. The sidecar has no database, Telegram session, HMAC key, review key, denylist, or `config.env`
-mount; it can request only a bounded whitelist of operations from the core over a second owner-only
-Unix socket. Login rotates the token and
-redirects to a process-local 256-bit capability path while setting a host-only, path-scoped HttpOnly
-cookie with `SameSite=Strict`. The cookie is intentionally not marked `Secure` because the supported
-transport is loopback HTTP inside the SSH tunnel, not direct HTTPS; the remote service remains an
-owner-only Unix socket with no TCP listener. While the tab is visible, the browser performs an
-authenticated lightweight connection check every 15 seconds; checks pause while the tab is hidden.
-The indicator changes between
-**Connected** and **Disconnected**, and its **Checked** timestamp updates without reloading the page.
-Use the adjacent refresh control to check immediately.
+The dashboard has no public TCP listener. The tunnel helper starts a hardened, network-disabled sidecar, connects local port `8765` to its owner-only Unix socket, and reads a fresh one-time access token. The sidecar has no database, Telegram session, HMAC key, review key, denylist, or `config.env` mount; it can request only a bounded whitelist of operations from the core over a second owner-only Unix socket. Login rotates the token and redirects to a process-local 256-bit capability path while setting a host-only, path-scoped HttpOnly cookie with `SameSite=Strict`. The cookie is intentionally not marked `Secure` because the supported transport is loopback HTTP inside the SSH tunnel, not direct HTTPS; the remote service remains an owner-only Unix socket with no TCP listener. While the tab is visible, the browser performs an authenticated lightweight connection check every 15 seconds; checks pause while the tab is hidden. The indicator changes between **Connected** and **Disconnected**, and its **Checked** timestamp updates without reloading the page. Use the adjacent refresh control to check immediately.
 
-Overview and list pages update their marked regions in place only when the service reports a changed
-state fingerprint. Current form input, focus, expanded context, and table scroll position are
-preserved during those updates. Detail pages do not replace evidence or decision controls in the
-background: if the underlying review or restriction
-changes, the dashboard disables the stale actions and asks the operator to load the current state.
-Losing the SSH tunnel leaves the current page visible while the connection indicator reports the
-failure. List pages retain their current page during refresh and show 50 rows per page in stable
-most-recently-updated order.
+Overview and list pages update their marked regions in place only when the service reports a changed state fingerprint. Current form input, focus, expanded context, and table scroll position are preserved during those updates. Detail pages do not replace evidence or decision controls in the background: if the underlying review or restriction changes, the dashboard disables the stale actions and asks the operator to load the current state. Losing the SSH tunnel leaves the current page visible while the connection indicator reports the failure. List pages retain their current page during refresh and show 50 rows per page in stable most-recently-updated order.
 
-Dashboard links update the page content in place while retaining the masthead, background, and
-stylesheet. Pagination, filters, confirmation pages, and browser Back/Forward use the same navigation
-path; superseded requests are cancelled. If the session expires or navigation fails, the browser
-falls back to normal navigation. Decision forms still submit through the existing authenticated POST
-and confirmation flow.
+Dashboard links update the page content in place while retaining the masthead, background, and stylesheet. Pagination, filters, confirmation pages, and browser Back/Forward use the same navigation path; superseded requests are cancelled. If the session expires or navigation fails, the browser falls back to normal navigation. Decision forms still submit through the existing authenticated POST and confirmation flow.
 
 ### Telegram operator controls
 
-This feature is disabled by default. To opt in, set the following deployment value and recreate the
-service:
+This feature is disabled by default. To opt in, set the following deployment value and recreate the service:
 
 ```shell
 TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true
 ```
 
-When enabled, Gatekeeper accepts a small owner-only command set in the logged-in account's Telegram
-Saved Messages. This provides quick restriction recovery from any Telegram client without exposing
-the dashboard or configuring SSH on that device:
+When enabled, Gatekeeper accepts a small owner-only command set in the logged-in account's Telegram Saved Messages. This provides quick restriction recovery from any Telegram client without exposing the dashboard or configuring SSH on that device:
 
 ```text
 /gatekeeper ping
@@ -233,93 +185,41 @@ the dashboard or configuring SSH on that device:
 /gatekeeper cases
 ```
 
-`cases` returns at most five current restrictions as separate case cards. Reply to the intended card
-with `/gatekeeper allow` within 15 minutes. A successful allowance restores the saved Telegram folder
-and notification settings when available, marks the sender allowed, cancels pending or failed
-Gatekeeper deletion jobs, and removes the Active Case evidence. The reply-bound control is single-use
-and kept only in process memory; a restart, a newer `cases` command, or expiry invalidates it.
+`cases` returns at most five current restrictions as separate case cards. Reply to the intended card with `/gatekeeper allow` within 15 minutes. A successful allowance restores the saved Telegram folder and notification settings when available, marks the sender allowed, cancels pending or failed Gatekeeper deletion jobs, and removes the Active Case evidence. The reply-bound control is single-use and kept only in process memory; a restart, a newer `cases` command, or expiry invalidates it.
 
-Commands are ignored outside Saved Messages, including messages sent to private users or groups.
-Case cards contain the resolved name or username, restriction state, reason, and age. They do not
-copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved
-Messages. Telegram may omit real-time outgoing updates created by another client, so Gatekeeper also
-checks only Saved Messages newer than its startup cursor every three seconds. Commands are
-deduplicated across both paths and are never replayed from before the current service start. The
-fallback history query searches only for `/gatekeeper` matches and does not retrieve unrelated Saved
-Messages.
+Commands are ignored outside Saved Messages, including messages sent to private users or groups. Case cards contain the resolved name or username, restriction state, reason, and age. They do not copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved Messages. Telegram may omit real-time outgoing updates created by another client, so Gatekeeper also checks only Saved Messages newer than its startup cursor every three seconds. Commands are deduplicated across both paths and are never replayed from before the current service start. The fallback history query searches only for `/gatekeeper` matches and does not retrieve unrelated Saved Messages.
 
-Processed command messages and all responses or case cards generated for them are automatically
-deleted after 15 minutes, matching the reply-control lifetime. Only their Telegram message IDs,
-deletion deadlines, and retry counts are stored in the local database; no Saved Messages text is
-persisted. Cleanup resumes after a restart and Telegram deletion failures use capped exponential
-backoff. On startup, a seven-day bounded reconciliation searches only `/gatekeeper`, `Gatekeeper`,
-and `restriction`, then retains only exact outgoing, non-forwarded Gatekeeper command or response
-templates. This removes artifacts orphaned by older process-local cleanup without deleting general
-Saved Messages or storing fetched text.
+Processed command messages and all responses or case cards generated for them are automatically deleted after 15 minutes, matching the reply-control lifetime. Only their Telegram message IDs, deletion deadlines, and retry counts are stored in the local database; no Saved Messages text is persisted. Cleanup resumes after a restart and Telegram deletion failures use capped exponential backoff. On startup, a seven-day bounded reconciliation searches only `/gatekeeper`, `Gatekeeper`, and `restriction`, then retains only exact outgoing, non-forwarded Gatekeeper command or response templates. This removes artifacts orphaned by older process-local cleanup without deleting general Saved Messages or storing fetched text.
 
-Legacy restrictions without an encrypted control identity cannot be released this way. Use the
-dashboard's collapsed **Advanced Recovery** path for those cases. Pending Review decisions and
-detailed evidence inspection also remain dashboard-only.
+Legacy restrictions without an encrypted control identity cannot be released this way. Use the dashboard's collapsed **Advanced Recovery** path for those cases. Pending Review decisions and detailed evidence inspection also remain dashboard-only.
 
-Set `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false` and recreate the service to disable command
-handling. Disabled deployments do not register the outgoing Telegram event handler.
+Set `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false` and recreate the service to disable command handling. Disabled deployments do not register the outgoing Telegram event handler.
 
 ### Pending Reviews
 
-One row represents one sender. The row contains a consolidated message count and one encrypted
-reference, not a stored conversation history. Opening it fetches one referenced message and the
-sender from Telegram.
+One row represents one sender. The row contains a consolidated message count and one encrypted reference, not a stored conversation history. Opening it fetches one referenced message and the sender from Telegram.
 
 - **Allow Sender** restores a Gatekeeper-managed archive when needed and allows the sender.
-- **Suppress and Delete** records an explicit manual permanent suppression and schedules
-  whole-dialog deletion.
-- **Dismiss & Cancel Jobs** records no classification, performs no immediate Telegram
-  action, and cancels pending or failed Gatekeeper deletion jobs for that sender.
+- **Suppress and Delete** records an explicit manual permanent suppression and schedules whole-dialog deletion.
+- **Dismiss & Cancel Jobs** records no classification, performs no immediate Telegram action, and cancels pending or failed Gatekeeper deletion jobs for that sender.
 
-If the referenced Telegram message has been deleted, use **Dismiss & Cancel Jobs**. This
-clears the local review without changing the current sender trust or restriction state.
+If the referenced Telegram message has been deleted, use **Dismiss & Cancel Jobs**. This clears the local review without changing the current sender trust or restriction state.
 
 ### Active Cases and archived restrictions
 
-**Needs Attention** contains quarantines, temporary suppressions, unacknowledged permanent
-suppressions, and restrictions with pending or failed deletion work. **Archived Restrictions**
-contains confirmed permanent suppressions after their deletion work finishes. Archiving changes only
-the dashboard grouping and does not release the sender. A separate encrypted control identity
-keeps each restriction identifiable and reversible for its full lifetime, even after its evidence
-expires. **Allow Sender** restores saved dialog settings when available; cases with no saved settings
-are moved to the main folder and notifications are enabled. **Keep and Archive** is available only
-for permanent suppression. Archived items can be returned to Needs Attention.
+**Needs Attention** contains quarantines, temporary suppressions, unacknowledged permanent suppressions, and restrictions with pending or failed deletion work. **Archived Restrictions** contains confirmed permanent suppressions after their deletion work finishes. Archiving changes only the dashboard grouping and does not release the sender. A separate encrypted control identity keeps each restriction identifiable and reversible for its full lifetime, even after its evidence expires. **Allow Sender** restores saved dialog settings when available; cases with no saved settings are moved to the main folder and notifications are enabled. **Keep and Archive** is available only for permanent suppression. Archived items can be returned to Needs Attention.
 
-**Release and Forget** is available only for archived permanent restrictions with no pending or
-failed deletion work. It erases all sender-linked local state after confirmation but does not restore,
-move, unmute, or delete the Telegram conversation. A later message is treated as coming from an
-unknown sender. The archive page can preview and apply the same action to eligible items older than
-30, 90, 180, or 365 days.
+**Release and Forget** is available only for archived permanent restrictions with no pending or failed deletion work. It erases all sender-linked local state after confirmation but does not restore, move, unmute, or delete the Telegram conversation. A later message is treated as coming from an unknown sender. The archive page can preview and apply the same action to eligible items older than 30, 90, 180, or 365 days.
 
-New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and
-**Evidence Signals**, including each signal's source, weight, and explanation. Schema 1 through 4
-snapshots show `Legacy HR Decision · recorded under rules-v2; not recalculated`; the migration does
-not reclassify them or add an action.
+New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and **Evidence Signals**, including each signal's source, weight, and explanation. Schema 1 through 4 snapshots show `Legacy HR Decision · recorded under rules-v2; not recalculated`; the migration does not reclassify them or add an action.
 
-Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance
-removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but
-does not remove the row, identity, or **Allow Sender** action. The minimal encrypted control identity is
-removed only when the restriction ends. A temporary suppression is released when that sender next
-messages after expiry or by the next twelve-hour maintenance pass. Background release changes only
-local state and does not restore Telegram folder or mute settings.
+Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but does not remove the row, identity, or **Allow Sender** action. The minimal encrypted control identity is removed only when the restriction ends. A temporary suppression is released when that sender next messages after expiry or by the next twelve-hour maintenance pass. Background release changes only local state and does not restore Telegram folder or mute settings.
 
-**Advanced Recovery** appears only for restrictions created before control identities were retained and
-which cannot be backfilled from an older encrypted reference. Entering a numeric Telegram User ID
-HMAC-derives the existing sender key without storing the ID. A matching quarantine or suppression is
-allowed and pending deletion jobs are cancelled, but Telegram settings cannot be restored without a
-control identity.
+**Advanced Recovery** appears only for restrictions created before control identities were retained and which cannot be backfilled from an older encrypted reference. Entering a numeric Telegram User ID HMAC-derives the existing sender key without storing the ID. A matching quarantine or suppression is allowed and pending deletion jobs are cancelled, but Telegram settings cannot be restored without a control identity.
 
 ### Tunnel options
 
-The SSH target can be an alias or `user@host`. Run `scripts/dashboard-tunnel.sh -h` for every option.
-The remote project defaults to `/opt/tg-pm-gatekeeper`; use `-d` or
-`TG_DASHBOARD_PROJECT_DIR` for another validated absolute path.
-Common workstation settings are:
+The SSH target can be an alias or `user@host`. Run `scripts/dashboard-tunnel.sh -h` for every option. The remote project defaults to `/opt/tg-pm-gatekeeper`; use `-d` or `TG_DASHBOARD_PROJECT_DIR` for another validated absolute path. Common workstation settings are:
 
 ```shell
 TG_DASHBOARD_HOST=root@gatekeeper.example
@@ -327,10 +227,7 @@ TG_DASHBOARD_PORT=18765
 TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf"
 ```
 
-The Dashboard socket and access-token paths are fixed under `/run/tg-pm-gatekeeper`; this keeps the
-remote helper and the isolated Compose service on one security boundary. `TG_REVIEW_HOST`,
-`TG_REVIEW_PORT`, and `TG_REVIEW_SSH_CONFIG` remain deprecated aliases. Never publish the Unix socket
-through Docker or a reverse proxy.
+The Dashboard socket and access-token paths are fixed under `/run/tg-pm-gatekeeper`; this keeps the remote helper and the isolated Compose service on one security boundary. `TG_REVIEW_HOST`, `TG_REVIEW_PORT`, and `TG_REVIEW_SSH_CONFIG` remain deprecated aliases. Never publish the Unix socket through Docker or a reverse proxy.
 
 ## Common commands
 
@@ -345,18 +242,13 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 docker compose logs --tail=100 gatekeeper
 ```
 
-Use the dashboard rather than CLI `allow` for active challenges, quarantines, or suppressions because
-the CLI cannot restore their Telegram dialog state.
+Use the dashboard rather than CLI `allow` for active challenges, quarantines, or suppressions because the CLI cannot restore their Telegram dialog state.
 
 ### Compact the SQLite database offline
 
-The status output reports database pages, free pages, logical bytes, and the free-page percentage.
-SQLite reuses free pages without shrinking the file, so routine `VACUUM` is unnecessary. Consider an
-offline compaction only after substantial forgetting when free pages are material and the host has
-temporary disk space at least comparable to the database size.
+The status output reports database pages, free pages, logical bytes, and the free-page percentage. SQLite reuses free pages without shrinking the file, so routine `VACUUM` is unnecessary. Consider an offline compaction only after substantial forgetting when free pages are material and the host has temporary disk space at least comparable to the database size.
 
-First record health and mode, switch to monitor, and stop every writer. Then make a private SQLite
-backup, run an integrity check and `VACUUM` through one-shot service containers, and restart:
+First record health and mode, switch to monitor, and stop every writer. Then make a private SQLite backup, run an integrity check and `VACUUM` through one-shot service containers, and restart:
 
 ```shell
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
@@ -373,15 +265,11 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli healthcheck
 ```
 
-The SQLite backup includes committed WAL content; keep it private and verify it exists before
-compaction. The integrity check must print `ok` or the command stops before `VACUUM`. Do not
-schedule this procedure while the service is running. Remove the private backup only after health,
-mode, and schema checks succeed.
+The SQLite backup includes committed WAL content; keep it private and verify it exists before compaction. The integrity check must print `ok` or the command stops before `VACUUM`. Do not schedule this procedure while the service is running. Remove the private backup only after health, mode, and schema checks succeed.
 
 ## Update an existing installation
 
-Before updating, confirm that the server checkout is clean and record the current commit, container
-health, and mode:
+Before updating, confirm that the server checkout is clean and record the current commit, container health, and mode:
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -408,20 +296,15 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 
 Check the logs after the update. The mode stored in the existing database is preserved.
 
-Documentation-only or host-script changes may require only `git pull --ff-only`; do not restart a
-healthy container unless runtime, configuration, Docker, or dependency inputs changed. Project
-maintainers can use [RELEASE.md](RELEASE.md) for the exact classification.
+Documentation-only or host-script changes may require only `git pull --ff-only`; do not restart a healthy container unless runtime, configuration, Docker, or dependency inputs changed. Project maintainers can use [RELEASE.md](RELEASE.md) for the exact classification.
 
 ### Advanced: schema-changing updates
 
-Most updates do not require this procedure. Use it only when release notes explicitly identify a
-state-database migration.
+Most updates do not require this procedure. Use it only when release notes explicitly identify a state-database migration.
 
 1. Switch to `monitor`.
 2. Confirm `challenged`, `challenge_issuing`, and `challenge_archiving` are all zero.
-3. Stop the core writer and create a private pre-migration backup on the server with SQLite's
-   backup API. Do this before pulling or rebuilding the new version; keep the core stopped until
-   the updated version starts. Never overwrite an existing pre-migration backup.
+3. Stop the core writer and create a private pre-migration backup on the server with SQLite's backup API. Do this before pulling or rebuilding the new version; keep the core stopped until the updated version starts. Never overwrite an existing pre-migration backup.
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -446,11 +329,7 @@ source.close()
 PYTHON
 ```
 
-Next run the normal update commands above to fast-forward the checkout and rebuild/start the
-service. After rebuilding, verify the schema version, state counts, and logs. Keep the private
-pre-migration backup after these checks: it is the database needed for the documented
-pre-schema-8 code rollback. Successful startup validation alone does not authorize deleting it.
-Preserve the failed database for diagnosis if migration fails.
+Next run the normal update commands above to fast-forward the checkout and rebuild/start the service. After rebuilding, verify the schema version, state counts, and logs. Keep the private pre-migration backup after these checks: it is the database needed for the documented pre-schema-8 code rollback. Successful startup validation alone does not authorize deleting it. Preserve the failed database for diagnosis if migration fails.
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -463,23 +342,11 @@ docker compose logs --tail=100 gatekeeper
 
 For this migration, the first command must print `8`.
 
-Schema 8 adds the nullable restriction archive timestamp and its query index. Existing restrictions
-remain unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup
-queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable
-challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table.
-Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not
-recalculated and do not schedule a new action.
+Schema 8 adds the nullable restriction archive timestamp and its query index. Existing restrictions remain unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table. Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not recalculated and do not schedule a new action.
 
-This backup is a point-in-time copy. Restoring it discards every database change made after the
-backup, so the procedure is not a lossless rollback once writes resume. Before considering it,
-stop writers and make an explicit decision about that data loss. An old migration-source host,
-Docker image, or cutover snapshot is not a substitute for this installation's pre-migration
-backup. If that backup has already been removed, do not run the restore commands below; diagnose
-the current database and pursue a compatible fix-forward or a separately reviewed recovery plan.
+This backup is a point-in-time copy. Restoring it discards every database change made after the backup, so the procedure is not a lossless rollback once writes resume. Before considering it, stop writers and make an explicit decision about that data loss. An old migration-source host, Docker image, or cutover snapshot is not a substitute for this installation's pre-migration backup. If that backup has already been removed, do not run the restore commands below; diagnose the current database and pursue a compatible fix-forward or a separately reviewed recovery plan.
 
-Schema 8 is not writable by pre-schema-8 code. A code rollback to an earlier commit therefore also
-requires the pre-migration database. Record the earlier commit before updating. If startup or live
-validation fails, keep the schema 8 database for diagnosis and restore both code and data together:
+Schema 8 is not writable by pre-schema-8 code. A code rollback to an earlier commit therefore also requires the pre-migration database. Record the earlier commit before updating. If startup or live validation fails, keep the schema 8 database for diagnosis and restore both code and data together:
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -504,19 +371,13 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 ```
 
-Do not substitute the schema 8 database into an older image or delete the failed database before
-diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt;
-do not merge the incompatible database files.
+Do not substitute the schema 8 database into an older image or delete the failed database before diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt; do not merge the incompatible database files.
 
-Once the operator explicitly closes the rollback window, confirm current health and an
-independent recovery backup, then make a separate decision to remove the private pre-migration
-backup. Record that pre-schema-8 rollback will no longer be available through this procedure.
-Do not treat successful deployment verification or an elapsed date as automatic cleanup approval.
+Once the operator explicitly closes the rollback window, confirm current health and an independent recovery backup, then make a separate decision to remove the private pre-migration backup. Record that pre-schema-8 rollback will no longer be available through this procedure. Do not treat successful deployment verification or an elapsed date as automatic cleanup approval.
 
 ## Configuration
 
-`scripts/initialize.py` writes the production defaults. [.env.example](../.env.example) lists every
-setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the container.
+`scripts/initialize.py` writes the production defaults. [.env.example](../.env.example) lists every setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the container.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
@@ -536,13 +397,7 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 
 Invalid bounded values stop startup instead of silently changing behavior.
 
-The total limit is always the hard upper bound. New challenges stop at
-`limit - notice reserve`; verification hints, corrections, timeout warnings, and result notices can
-use the remaining capacity but cannot exceed either the total limit or the per-sender notice limit.
-The `status` command reports `outbound_total_1h`, `outbound_challenge_1h`,
-`outbound_notice_1h`, and `outbound_quota_rejected_1h` without raw sender identifiers. It also reports
-the last seven days through `standard_challenge_7d`, `strict_challenge_7d`,
-`permanent_suppression_7d`, and `repeated_campaign_7d` without content or fingerprints.
+The total limit is always the hard upper bound. New challenges stop at `limit - notice reserve`; verification hints, corrections, timeout warnings, and result notices can use the remaining capacity but cannot exceed either the total limit or the per-sender notice limit. The `status` command reports `outbound_total_1h`, `outbound_challenge_1h`, `outbound_notice_1h`, and `outbound_quota_rejected_1h` without raw sender identifiers. It also reports the last seven days through `standard_challenge_7d`, `strict_challenge_7d`, `permanent_suppression_7d`, and `repeated_campaign_7d` without content or fingerprints.
 
 ### Dedicated test sender
 
@@ -552,9 +407,7 @@ Add the dedicated account's positive numeric ID to `config.env`, then recreate t
 TG_TEST_SENDER_ID=REPLACE_WITH_DEDICATED_TEST_ACCOUNT_ID
 ```
 
-This account runs the real arithmetic and cleanup flow even in `monitor`, bypasses the outbound
-quota, never contributes a campaign fingerprint, and can lose its entire test dialog after exhausted
-attempts. Remove the value after testing.
+This account runs the real arithmetic and cleanup flow even in `monitor`, bypasses the outbound quota, never contributes a campaign fingerprint, and can lose its entire test dialog after exhausted attempts. Remove the value after testing.
 
 ## Troubleshooting
 
@@ -574,14 +427,11 @@ attempts. Remove the value after testing.
 | Active Case says identity is unavailable | Open **Advanced Recovery** and enter the numeric Telegram User ID; only pre-control-identity states should need this. |
 | Mode is still `monitor` after an update | This is expected; mode is stored in the database. Switch explicitly only after checking status. |
 
-If the problem involves a sender action, preserve the current status and logs before changing policy
-or deleting local state.
+If the problem involves a sender action, preserve the current status and logs before changing policy or deleting local state.
 
 ## Confirm the security settings
 
-Run these checks once after installation and after changes to Docker, paths, permissions, or the
-dashboard. They confirm that Gatekeeper is not publicly exposed and that other server users cannot
-read its private files.
+Run these checks once after installation and after changes to Docker, paths, permissions, or the dashboard. They confirm that Gatekeeper is not publicly exposed and that other server users cannot read its private files.
 
 ```shell
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
@@ -598,11 +448,9 @@ Everything is correct when:
 - session and key files are mode `600`;
 - `config.env` and the denylist are mode `640` and owned by `root:10001`;
 - the state directory is mode `700` and owned by `10001:10001`; and
-- the core socket is mode `600` and owned by `10001:10001`; while the sidecar is active, its socket
-  and access token have the same ownership and mode.
+- the core socket is mode `600` and owned by `10001:10001`; while the sidecar is active, its socket and access token have the same ownership and mode.
 
-Stop and correct any mismatch before enabling `protect`. The dashboard access token is replaced on
-every service start.
+Stop and correct any mismatch before enabling `protect`. The dashboard access token is replaced on every service start.
 
 ## Stop or remove Gatekeeper
 
@@ -612,9 +460,7 @@ To stop screening without deleting data:
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose stop gatekeeper'
 ```
 
-To permanently disconnect the Telegram session, stop the container, terminate the session from an
-official Telegram client, and remove the server-side session file. Remove the repository, state,
-configuration, and keys only after deciding whether any local audit information is still needed.
+To permanently disconnect the Telegram session, stop the container, terminate the session from an official Telegram client, and remove the server-side session file. Remove the repository, state, configuration, and keys only after deciding whether any local audit information is still needed.
 
 ## Emergency session revocation
 

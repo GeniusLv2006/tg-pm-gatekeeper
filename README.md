@@ -1,12 +1,9 @@
 # tg-pm-gatekeeper
 
-A self-hosted Telegram userbot that screens unsolicited private messages with local deterministic
-evidence signals, an owner-only review dashboard, and optional arithmetic challenges.
+A self-hosted Telegram userbot that screens unsolicited private messages with local deterministic evidence signals, an owner-only review dashboard, and optional arithmetic challenges.
 
 > [!IMPORTANT]
-> Gatekeeper controls a Telegram user session. Anyone who steals that session can access the account.
-> The project is pre-release and currently follows the latest commit on `main`. Use a dedicated
-> Telegram account for your first end-to-end test.
+> Gatekeeper controls a Telegram user session. Anyone who steals that session can access the account. The project is pre-release and currently follows the latest commit on `main`. Use a dedicated Telegram account for your first end-to-end test.
 
 ## Is Gatekeeper right for you?
 
@@ -16,54 +13,34 @@ Gatekeeper may be useful if you:
 - are comfortable maintaining a small Docker service over SSH; and
 - want screening to stay on infrastructure you control.
 
-It may not be a good fit if you need a hosted or one-click service, are unfamiliar with SSH and
-Docker, or cannot test destructive behavior with a dedicated Telegram account.
+It may not be a good fit if you need a hosted or one-click service, are unfamiliar with SSH and Docker, or cannot test destructive behavior with a dedicated Telegram account.
 
-You need a trusted computer with Git, SSH, `curl`, and Python 3.14, plus a dedicated
-Debian-compatible server with Docker Engine and the Compose plugin.
+You need a trusted computer with Git, SSH, `curl`, and Python 3.14, plus a dedicated Debian-compatible server with Docker Engine and the Compose plugin.
 
 ## What it does
 
-Gatekeeper watches incoming private messages from people who are not already trusted. It does not
-open links, send message content to third parties, call an AI service, block users, or expose a
-public administration port.
+Gatekeeper watches incoming private messages from people who are not already trusted. It does not open links, send message content to third parties, call an AI service, block users, or expose a public administration port.
 
 | Mode | What happens to unknown senders | Telegram changes |
 | --- | --- | --- |
 | `monitor` (default) | Records what Gatekeeper would have done for your review | None |
 | `protect` | Applies the adaptive-v2 policy: standard challenge, strict challenge, or permanent suppression | Yes |
 
-Permanent suppression requires either a non-quoted owner-denied domain or a corroborated repeated
-campaign template across different senders. Repeated campaigns must also be promotional, contain
-multiple links, and be forwarded or carried by a promotional Telegram webpage preview. Strict
-challenges allow one numeric attempt; a wrong answer or timeout warns before deleting the dialog and
-suppresses the sender for 24 hours. The arithmetic check adds interaction friction; it is not a
-CAPTCHA or proof that a sender is human.
+Permanent suppression requires either a non-quoted owner-denied domain or a corroborated repeated campaign template across different senders. Repeated campaigns must also be promotional, contain multiple links, and be forwarded or carried by a promotional Telegram webpage preview. Strict challenges allow one numeric attempt; a wrong answer or timeout warns before deleting the dialog and suppresses the sender for 24 hours. The arithmetic check adds interaction friction; it is not a CAPTCHA or proof that a sender is human.
 
 ## Project direction
 
-Gatekeeper is pre-release. The following describes the current development direction, not a feature
-commitment or compatibility promise; priorities and interfaces may change before a stable release.
+Gatekeeper is pre-release. The following describes the current development direction, not a feature commitment or compatibility promise; priorities and interfaces may change before a stable release.
 
-- The shipped product remains local and deterministic: versioned evidence weights identify risk,
-  arithmetic challenges add adaptive friction, and operator review is reserved for runtime
-  exceptions and recovery.
-- The dashboard is intentionally limited to **Pending Reviews** and restriction management. Active
-  restrictions are split into **Needs Attention** and **Archived Restrictions**. The standalone
-  labeling workflow was removed after the local model-training direction was abandoned because the
-  available sample volume was not sufficient.
-- The `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned.
-  They cannot be changed through environment variables; changing an automatic-deletion boundary
-  requires tests and normal code review.
+- The shipped product remains local and deterministic: versioned evidence weights identify risk, arithmetic challenges add adaptive friction, and operator review is reserved for runtime exceptions and recovery.
+- The dashboard is intentionally limited to **Pending Reviews** and restriction management. Active restrictions are split into **Needs Attention** and **Archived Restrictions**. The standalone labeling workflow was removed after the local model-training direction was abandoned because the available sample volume was not sufficient.
+- The `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned. They cannot be changed through environment variables; changing an automatic-deletion boundary requires tests and normal code review.
 
-The current release does not send message content to an AI provider. Features documented elsewhere
-in this repository describe shipped behavior unless they are explicitly marked as a possible
-direction here.
+The current release does not send message content to an AI provider. Features documented elsewhere in this repository describe shipped behavior unless they are explicitly marked as a possible direction here.
 
 ## First installation
 
-1. Enable Telegram two-step verification and create an application API ID and hash through
-   [Telegram's developer tools](https://my.telegram.org/apps).
+1. Enable Telegram two-step verification and create an application API ID and hash through [Telegram's developer tools](https://my.telegram.org/apps).
 2. Clone the repository on your trusted computer and install the pinned dependencies:
 
    ```shell
@@ -80,16 +57,11 @@ direction here.
    .venv/bin/python scripts/initialize.py
    ```
 
-   The initializer hides your API hash, login code, and 2FA password while prompting. It refuses to
-   overwrite existing output. Transfer the generated files only to the intended server over a trusted
-   channel; never print, commit, paste, or share their contents.
+   The initializer hides your API hash, login code, and 2FA password while prompting. It refuses to overwrite existing output. Transfer the generated files only to the intended server over a trusted channel; never print, commit, paste, or share their contents.
 
-4. Follow the [installation guide](docs/deployment.md#install-gatekeeper) to prepare the server,
-   transfer the files, and start the container.
-5. Leave the new installation in `monitor` mode while you send test messages and inspect the
-   dashboard.
-6. Switch to `protect` only after the installation checks pass and you understand the destructive
-   paths:
+4. Follow the [installation guide](docs/deployment.md#install-gatekeeper) to prepare the server, transfer the files, and start the container.
+5. Leave the new installation in `monitor` mode while you send test messages and inspect the dashboard.
+6. Switch to `protect` only after the installation checks pass and you understand the destructive paths:
 
    ```shell
    ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode protect'
@@ -105,59 +77,33 @@ Your first installation is complete when:
 - a message from a separate, unknown test account appears under **Pending Reviews**; and
 - the deployment checks show no public Gatekeeper port.
 
-The [installation guide](docs/deployment.md#confirm-the-installation) provides the exact commands and
-explains what to do when a check fails.
+The [installation guide](docs/deployment.md#confirm-the-installation) provides the exact commands and explains what to do when a check fails.
 
 ## Operations Dashboard
 
-The dashboard runs as an on-demand, network-disabled sidecar and is available only through an SSH
-tunnel; Docker publishes no Gatekeeper port:
+The dashboard runs as an on-demand, network-disabled sidecar and is available only through an SSH tunnel; Docker publishes no Gatekeeper port:
 
 ```shell
 scripts/dashboard-tunnel.sh root@server.example
 ```
 
-The one-time login creates a browser-bound session protected by both a random, process-local
-capability path and a path-scoped HttpOnly cookie. Copying the resulting address into another browser
-does not transfer access. A new login or **Sign Out** immediately invalidates the previous session;
-sessions also expire after 30 minutes without a dashboard request or eight hours in total. The
-sidecar itself exits after 10 minutes without authenticated activity. Signing out or closing the
-tunnel helper stops it immediately without interrupting the Telegram core.
+The one-time login creates a browser-bound session protected by both a random, process-local capability path and a path-scoped HttpOnly cookie. Copying the resulting address into another browser does not transfer access. A new login or **Sign Out** immediately invalidates the previous session; sessions also expire after 30 minutes without a dashboard request or eight hours in total. The sidecar itself exits after 10 minutes without authenticated activity. Signing out or closing the tunnel helper stops it immediately without interrupting the Telegram core.
 
 It has two main areas:
 
-- **Active Cases · Needs Attention**: review quarantines, temporary suppressions, automatic permanent
-  suppressions, and restrictions with unfinished deletion work;
-- **Archived Restrictions**: retain confirmed permanent policy decisions outside the working queue;
-  encrypted control identities remain available while evidence is retained for up to 30 days;
+- **Active Cases · Needs Attention**: review quarantines, temporary suppressions, automatic permanent suppressions, and restrictions with unfinished deletion work;
+- **Archived Restrictions**: retain confirmed permanent policy decisions outside the working queue; encrypted control identities remain available while evidence is retained for up to 30 days;
 - **Pending Reviews**: resolve monitor-mode simulations and protect-mode exceptions.
 
 All lists are ordered by most recent activity and paginated at 50 rows per page.
 
-Archiving changes only dashboard organization and never releases a sender. Confirmed manual spam is
-archived after its deletion job finishes; automatic permanent suppression remains in Needs Attention
-until **Keep and archive** is selected. Archived permanent restrictions can be moved back or released
-and forgotten after an explicit confirmation. Forgetting is local-only: Telegram folder, mute, and
-conversation state are not changed, and a future message is treated as coming from an unknown sender.
-Optional age-based automatic forgetting is disabled by default.
+Archiving changes only dashboard organization and never releases a sender. Confirmed manual spam is archived after its deletion job finishes; automatic permanent suppression remains in Needs Attention until **Keep and archive** is selected. Archived permanent restrictions can be moved back or released and forgotten after an explicit confirmation. Forgetting is local-only: Telegram folder, mute, and conversation state are not changed, and a future message is treated as coming from an unknown sender. Optional age-based automatic forgetting is disabled by default.
 
-When `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true`, a quick recovery is available without opening the
-dashboard: send `/gatekeeper cases` in Telegram Saved Messages. Gatekeeper returns up to five current
-restrictions. Reply to the intended case card with `/gatekeeper allow` within 15 minutes to restore
-the dialog, allow the sender, and cancel pending Gatekeeper deletion jobs. The optional commands are
-accepted only from the logged-in account in its own Saved Messages; case cards contain identity and
-restriction metadata, not retained message evidence. Responses can take a few seconds when Telegram
-does not deliver another device's outgoing-message update in real time. Gatekeeper automatically
-deletes processed commands and all replies or case cards they create after 15 minutes. Cleanup is
-persisted and resumes after a service restart; Telegram deletion failures are retried automatically.
+When `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true`, a quick recovery is available without opening the dashboard: send `/gatekeeper cases` in Telegram Saved Messages. Gatekeeper returns up to five current restrictions. Reply to the intended case card with `/gatekeeper allow` within 15 minutes to restore the dialog, allow the sender, and cancel pending Gatekeeper deletion jobs. The optional commands are accepted only from the logged-in account in its own Saved Messages; case cards contain identity and restriction metadata, not retained message evidence. Responses can take a few seconds when Telegram does not deliver another device's outgoing-message update in real time. Gatekeeper automatically deletes processed commands and all replies or case cards they create after 15 minutes. Cleanup is persisted and resumes after a service restart; Telegram deletion failures are retried automatically.
 
-One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one
-referenced Telegram message. **Allow sender** allows the sender, **Suppress and delete** records an
-explicit owner decision and schedules deletion, and **Dismiss & cancel jobs** closes the review and
-cancels pending Gatekeeper deletion jobs without changing the current trust decision.
+One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one referenced Telegram message. **Allow sender** allows the sender, **Suppress and delete** records an explicit owner decision and schedules deletion, and **Dismiss & cancel jobs** closes the review and cancels pending Gatekeeper deletion jobs without changing the current trust decision.
 
-See [Dashboard and daily operation](docs/deployment.md#dashboard-and-daily-operation) for the detailed
-behavior and tunnel options.
+See [Dashboard and daily operation](docs/deployment.md#dashboard-and-daily-operation) for the detailed behavior and tunnel options.
 
 ## What protect mode does
 
@@ -175,14 +121,10 @@ incoming private message
       -> new-challenge quota reached: keep archived and send to manual review
 ```
 
-The hourly outbound limit remains a hard cap. Part of that capacity is reserved for bounded
-verification hints, corrections, timeout warnings, and results for challenges already in progress,
-so a burst of new senders cannot consume every notification slot.
+The hourly outbound limit remains a hard cap. Part of that capacity is reserved for bounded verification hints, corrections, timeout warnings, and results for challenges already in progress, so a burst of new senders cannot consume every notification slot.
 
-Risk is a fixed sum of structured evidence signals. A score alone cannot authorize permanent
-suppression: weak signals and quoted denylist matches remain on the strict-challenge path even above
-70. The full signal map, thresholds, destructive gates, and state behavior are documented in
-[Architecture](docs/architecture.md).
+Risk is a fixed sum of structured evidence signals. A score alone cannot authorize permanent suppression: weak signals and quoted denylist matches remain on the strict-challenge path even above
+70. The full signal map, thresholds, destructive gates, and state behavior are documented in [Architecture](docs/architecture.md).
 
 ## Common operator commands
 
@@ -196,23 +138,13 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli allow USER_ID
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 ```
 
-Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual
-spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active
-challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use
-**Allow sender** in the dashboard instead. If Active Case evidence has expired, the restriction
-remains listed and **Allow sender** continues to work through a separate
-encrypted control identity. A manual User ID form remains only for legacy restrictions that predate
-that identity record. The entered ID is used only to derive the existing sender key and is not
-stored. A raw user ID supplied on the command line may remain in shell history.
+Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use **Allow sender** in the dashboard instead. If Active Case evidence has expired, the restriction remains listed and **Allow sender** continues to work through a separate encrypted control identity. A manual User ID form remains only for legacy restrictions that predate that identity record. The entered ID is used only to derive the existing sender key and is not stored. A raw user ID supplied on the command line may remain in shell history.
 
 ## Optional features
 
 ### Dedicated test sender
 
-`TG_TEST_SENDER_ID` lets one dedicated account exercise the real challenge and cleanup flow even in
-`monitor`. It can delete the test dialog after exhausted attempts. Do not assign a real correspondent;
-remove the setting when testing is complete. See
-[Dedicated test sender](docs/deployment.md#dedicated-test-sender).
+`TG_TEST_SENDER_ID` lets one dedicated account exercise the real challenge and cleanup flow even in `monitor`. It can delete the test dialog after exhausted attempts. Do not assign a real correspondent; remove the setting when testing is complete. See [Dedicated test sender](docs/deployment.md#dedicated-test-sender).
 
 ## Documentation
 
@@ -239,11 +171,8 @@ docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
 
-Runtime dependencies and the Python image are pinned. The container runs as UID/GID `10001`, uses a
-read-only root filesystem, drops all capabilities, and exposes no network port.
+Runtime dependencies and the Python image are pinned. The container runs as UID/GID `10001`, uses a read-only root filesystem, drops all capabilities, and exposes no network port.
 
 ## License
 
-This project is licensed under the [Mozilla Public License 2.0](LICENSE). MPL-2.0 applies copyleft at
-the file level: distributed modifications to covered files remain available under MPL-2.0, while
-separate files in a larger work may use other terms.
+This project is licensed under the [Mozilla Public License 2.0](LICENSE). MPL-2.0 applies copyleft at the file level: distributed modifications to covered files remain available under MPL-2.0, while separate files in a larger work may use other terms.
