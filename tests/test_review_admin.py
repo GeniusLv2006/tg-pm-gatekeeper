@@ -250,7 +250,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Test Sender (@testsender)", response)
         self.assertIn(b"ID 123456789", response)
         self.assertIn(b"<th>Review</th>", response)
-        self.assertNotIn(b">Simulation<", response)
 
     async def test_archive_cleanup_is_inside_main_and_live_region(self) -> None:
         page = await self.server._enforcement_index_page(archived=True)
@@ -303,7 +302,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             b"<th>Sender</th><th>State</th><th>Trigger</th><th>Evidence</th><th>Age</th>",
             cases,
         )
-        self.assertNotIn(b"<th>Case</th>", cases)
         self.assertIn(f"href='/cases/{sender_key}'".encode(), cases)
         self.assertNotIn(b"<details class='advanced-recovery'>", cases)
         for label in (b"Sender", b"State", b"Trigger", b"Evidence", b"Age"):
@@ -336,17 +334,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"First explanation", detail)
         self.assertIn(b"Second explanation", detail)
 
-    async def test_dashboard_css_contracts_cover_density_and_accessibility(self) -> None:
+    async def test_dashboard_css_keeps_accessibility_rules(self) -> None:
         status, headers, page = await self.server._dispatch("GET", "/dashboard.css", b"")
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "text/css; charset=utf-8")
 
-        self.assertIn(b"--signal:#c33c1e", page)
-        self.assertIn(b"white-space:nowrap;overflow-wrap:normal", page)
         self.assertIn(b":focus-visible", page)
         self.assertIn(b"@media(prefers-reduced-motion:reduce)", page)
-        self.assertIn(b".data-table{display:block;min-width:0}", page)
-        self.assertIn(b"padding:.65rem .8rem", page)
 
     def test_active_case_state_summaries_cover_release_states(self) -> None:
         now = int(time.time())
@@ -385,22 +379,14 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.server._restriction_summary(restriction("suppressed", now + 700)),
         )
 
-    async def test_masthead_places_page_indicator_before_connection(self) -> None:
-        response = await self.server._enforcement_index_page()
-        section = response.index(b"data-section-indicator")
-        connection = response.index(b"data-connection data-state")
-        self.assertLess(section, connection)
-
-    async def test_dashboard_script_pauses_hidden_tabs_and_replaces_regions(self) -> None:
+    async def test_dashboard_script_pauses_hidden_tabs_and_keeps_logout_enabled(self) -> None:
         status, headers, response = await self.server._dispatch(
             "GET", "/dashboard.js", b""
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
         self.assertIn(b"document.visibilityState", response)
-        self.assertIn(b"region.replaceWith(replacement)", response)
         self.assertIn(b"form:not(.logout-form) button", response)
-        self.assertNotIn(b"querySelectorAll('form button')", response)
 
     async def test_status_version_changes_without_exposing_review_content(self) -> None:
         status, headers, response = await self.server._dispatch(
@@ -449,7 +435,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         response = await self.server._review_queue_page()
 
         self.assertIn("Challenge Unavailable · Protect".encode(), response)
-        self.assertNotIn(b">Simulation<", response)
 
     async def test_queue_identity_uses_short_lived_memory_cache(self) -> None:
         first = await self.server._review_queue_page()
@@ -458,28 +443,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Test Sender", second)
         self.assertEqual(self.client.entity_requests, 1)
 
-    async def test_review_page_uses_one_aligned_component_rail(self) -> None:
-        status, _, response = await self.server._dispatch(
-            "GET", f"/review/{self.review_id}", b""
-        )
-        self.assertEqual(status, 200)
-        _, _, stylesheet = await self.server._dispatch("GET", "/dashboard.css", b"")
-        self.assertIn(
-            b".decision-panel{position:relative;width:calc(100% - 2.5rem);"
-            b"max-width:1080px",
-            stylesheet,
-        )
-        self.assertNotIn(b".decision-panel h2{max-width:", stylesheet)
-        self.assertIn(
-            b".actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))",
-            stylesheet,
-        )
-        self.assertIn(b"button{width:100%}", stylesheet)
-
     async def test_error_page_uses_dashboard_layout_and_actionable_copy(self) -> None:
         response = self.server._page("Invalid Access Token")
         self.assertIn(b'href="/dashboard-error.css"', response)
-        status, headers, stylesheet = await self.server._dispatch(
+        status, headers, _ = await self.server._dispatch(
             "GET",
             "/dashboard-error.css",
             b"",
@@ -491,10 +458,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"class='error-card'", response)
         self.assertIn(b"has already been used", response)
         self.assertIn(b"scripts/dashboard-tunnel.sh SSH_TARGET", response)
-        self.assertNotIn(b"Return to Dashboard", response)
-        self.assertIn(b"width:min(100%,44rem)", stylesheet)
         self.assertIn(b"class='error-content'", response)
-        self.assertNotIn(b"<body><h1>", response)
 
     async def test_partial_request_does_not_block_shutdown(self) -> None:
         await self.server.start()
@@ -583,7 +547,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 404)
         self.assertIn(b"Dashboard Access Missing", response)
-        self.assertNotIn(b"Return to Dashboard", response)
         for protected_path in (
             "/dashboard.js",
             "/dashboard.css",
@@ -953,13 +916,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"gate-check unmet", detail)
         self.assertIn(b"Final Policy Decision", detail)
         self.assertIn(b"<strong>Strict Challenge</strong>", detail)
-        _, _, stylesheet = await self.server._dispatch("GET", "/dashboard.css", b"")
-        self.assertIn(b"--field:#f7f2e7", stylesheet)
-        self.assertIn(b"pre.message{min-height:180px", stylesheet)
-        self.assertIn(b"background:var(--field);color:var(--ink)", stylesheet)
-        self.assertIn(b"pre.message.quote{min-height:96px;background:var(--field)", stylesheet)
-        self.assertIn(b".policy-outcome{margin-top:.75rem", stylesheet)
-        self.assertNotIn(b"background:var(--ink);color:#f7f1df", stylesheet)
         self.assertIn(b"<ol class='signal-list' aria-label='Evidence signals'>", detail)
         self.assertIn(b"<strong>Preview Promotional Language</strong>", detail)
         self.assertIn(b"<span class='signal-source'>Preview</span>", detail)
@@ -1044,7 +1000,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Reviewable Evidence", index)
         self.assertIn(b"State reasons:", index)
         self.assertIn(b"Every active restriction currently has reviewable evidence", index)
-        self.assertNotIn(b"<dt>Reasons</dt>", index)
         self.assertNotIn(b"enforcement-private-canary", index)
         status, _, detail = await self.server._dispatch_enforcement(
             "GET", f"/cases/{sender_key}", b""

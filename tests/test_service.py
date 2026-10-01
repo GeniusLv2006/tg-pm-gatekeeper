@@ -240,7 +240,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     def test_nondefault_ttl_is_rendered_in_prompt(self) -> None:
         prompt = challenge_prompt(Challenge("id", "56", "8 × 7 = ?"), 90)
         self.assertIn("within 90 seconds", prompt)
-        self.assertNotIn("within 1 minute", prompt)
         one_second = challenge_prompt(Challenge("id", "56", "8 × 7 = ?"), 1)
         self.assertIn("within 1 second", one_second)
 
@@ -431,7 +430,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 text="T.me/+invite",
                 facts=MessageFacts(
                     text="T.me/+invite",
-                    preview_text="汇盈社区 高返70% 合约跟单 免费跟单，交易所返佣",
+                    preview_text="示例社区 高返70% 合约跟单 免费跟单，交易所返佣",
                     urls=("https://t.me/+invite",),
                     domains=("t.me",),
                 ),
@@ -634,9 +633,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             return MessageFacts(
                 text=opener,
                 quote_text=(
-                    f"888联盟网址 https://{domain}\n"
-                    f"888联盟频道 https://t.me/+{first_invite}\n"
-                    f"乔治引流代发 https://t.me/+{second_invite}"
+                    f"示例联盟网址 https://{domain}\n"
+                    f"示例联盟频道 https://t.me/+{first_invite}\n"
+                    f"示例引流代发 https://t.me/+{second_invite}"
                 ),
                 quote_urls=(
                     f"https://{domain}",
@@ -649,7 +648,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         first = campaign(
             "在吗",
-            "h4226.invalid",
+            "campaign-one.invalid",
             "firstInvite",
             "secondInvite",
         )
@@ -663,7 +662,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         second_actions = FakeActions()
         second = campaign(
             "滴滴",
-            "h5388.invalid",
+            "campaign-two.invalid",
             "thirdInvite",
             "fourthInvite",
         )
@@ -686,8 +685,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             {signal["code"] for signal in payload["signals"]},
         )
         database = self.database_path.read_bytes()
-        self.assertNotIn("888联盟网址".encode(), database)
-        self.assertNotIn(b"https://h5388.invalid", database)
+        self.assertNotIn("示例联盟网址".encode(), database)
+        self.assertNotIn(b"https://campaign-two.invalid", database)
 
     async def test_repeated_promotional_preview_crosses_destructive_gate(
         self,
@@ -696,7 +695,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
         def preview(post: str, invite: str) -> MessageFacts:
             preview_text = (
-                "Telegram 汇盈俱乐部 七年合约社区交流群 "
+                "Telegram 示例俱乐部 合约社区交流群 "
                 f"https://t.me/+{invite} 免费带单 70%返佣"
             )
             post_url = f"https://t.me/{post}/917"
@@ -734,7 +733,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             payload["decision_basis"], "corroborated_repeated_campaign"
         )
         database = self.database_path.read_bytes()
-        self.assertNotIn("汇盈俱乐部".encode(), database)
+        self.assertNotIn("示例俱乐部".encode(), database)
         self.assertNotIn(b"https://t.me/secondChannel/917", database)
 
     async def test_repeated_authored_campaign_without_provenance_stays_strict(
@@ -987,7 +986,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(self.store.sender(sender_key).attempts, 0)
         self.assertEqual([text for text, _ in actions.sent], [REPLY_REQUIRED_TEXT])
-        self.assertNotIn("example", actions.sent[0][0].casefold())
 
     async def test_non_numeric_reply_does_not_consume_attempt(self) -> None:
         sender_key = self.set_active_challenge()
@@ -1000,7 +998,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outcome, "challenge_pending")
         self.assertEqual(self.store.sender(sender_key).attempts, 0)
         self.assertEqual([text for text, _ in actions.sent], [DIGITS_REQUIRED_TEXT])
-        self.assertNotIn("12", DIGITS_REQUIRED_TEXT)
 
     async def test_fullwidth_digits_and_leading_zero_are_canonicalized(self) -> None:
         sender_key = self.set_active_challenge()

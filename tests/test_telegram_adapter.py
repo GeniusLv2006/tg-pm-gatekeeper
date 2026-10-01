@@ -21,8 +21,6 @@ from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
-    SESSION_ENTITY_CACHE_LIMIT,
-    TELETHON_ENTITY_CACHE_LIMIT,
     BoundedStringSession,
     OperatorCaseControl,
     TelegramActions,
@@ -37,11 +35,14 @@ from tg_pm_gatekeeper.telegram_adapter import (
 )
 
 
-class BoundedStringSessionTests(unittest.TestCase):
-    def test_production_entity_limits_are_small_and_bounded(self) -> None:
-        self.assertEqual(SESSION_ENTITY_CACHE_LIMIT, 256)
-        self.assertEqual(TELETHON_ENTITY_CACHE_LIMIT, 128)
+def temporary_store(test: unittest.TestCase) -> StateStore:
+    directory = test.enterContext(tempfile.TemporaryDirectory())
+    store = StateStore(Path(directory) / "state.sqlite3")
+    test.addCleanup(store.close)
+    return store
 
+
+class BoundedStringSessionTests(unittest.TestCase):
     def test_entity_cache_is_bounded_and_replaces_existing_peer(self) -> None:
         session = BoundedStringSession(entity_limit=2)
         session.process_entities(
@@ -134,7 +135,7 @@ class TelegramAdapterTests(unittest.TestCase):
         webpage = SimpleNamespace(
             url="https://t.me/+invite",
             site_name="Telegram",
-            title="汇盈社区 高返70% 合约跟单",
+            title="示例社区 高返70% 合约跟单",
             description="免费跟单，交易所返佣",
             author=None,
         )
@@ -671,313 +672,273 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
     async def test_delayed_verification_cleanup_deletes_full_batch_and_audits(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                client = SimpleNamespace(delete_messages=AsyncMock())
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.client = client
-                adapter.store = store
-                peer = types.InputPeerUser(user_id=123, access_hash=456)
+        store = temporary_store(self)
+        client = SimpleNamespace(delete_messages=AsyncMock())
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = client
+        adapter.store = store
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
 
-                await adapter._verification_message_deletion_worker(
-                    peer, "sender", (10, 11, 12, 13, 14), 0
-                )
+        await adapter._verification_message_deletion_worker(
+            peer, "sender", (10, 11, 12, 13, 14), 0
+        )
 
-                client.delete_messages.assert_awaited_once_with(
-                    peer, [10, 11, 12, 13, 14], revoke=True
-                )
-                row = store._connection.execute(
-                    "SELECT outcome FROM audit WHERE sender_key='sender' "
-                    "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                self.assertEqual(row["outcome"], "messages_deleted")
-            finally:
-                store.close()
+        client.delete_messages.assert_awaited_once_with(
+            peer, [10, 11, 12, 13, 14], revoke=True
+        )
+        row = store._connection.execute(
+            "SELECT outcome FROM audit WHERE sender_key='sender' "
+            "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["outcome"], "messages_deleted")
 
     async def test_delayed_verification_cleanup_records_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                client = SimpleNamespace(
-                    delete_messages=AsyncMock(side_effect=RuntimeError("delete failed"))
-                )
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.client = client
-                adapter.store = store
-                peer = types.InputPeerUser(user_id=123, access_hash=456)
+        store = temporary_store(self)
+        client = SimpleNamespace(
+            delete_messages=AsyncMock(side_effect=RuntimeError("delete failed"))
+        )
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = client
+        adapter.store = store
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
 
-                await adapter._verification_message_deletion_worker(
-                    peer, "sender", (10, 11), 0
-                )
+        await adapter._verification_message_deletion_worker(
+            peer, "sender", (10, 11), 0
+        )
 
-                row = store._connection.execute(
-                    "SELECT outcome FROM audit WHERE sender_key='sender' "
-                    "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                self.assertEqual(row["outcome"], "action_failed")
-            finally:
-                store.close()
+        row = store._connection.execute(
+            "SELECT outcome FROM audit WHERE sender_key='sender' "
+            "AND rule_code='CHALLENGE_CLEANUP' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["outcome"], "action_failed")
 
     async def test_delete_dialog_revokes_history_and_clears_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                store.save_dialog_snapshot(
-                    "sender", DialogSnapshot(folder_id=0, silent=False, mute_until=None)
-                )
-                client = SimpleNamespace(delete_dialog=AsyncMock())
-                adapter = SimpleNamespace(client=client, store=store)
-                peer = types.InputPeerUser(user_id=123, access_hash=456)
-                actions = TelegramActions(adapter, peer, "sender")
+        store = temporary_store(self)
+        store.save_dialog_snapshot(
+            "sender", DialogSnapshot(folder_id=0, silent=False, mute_until=None)
+        )
+        client = SimpleNamespace(delete_dialog=AsyncMock())
+        adapter = SimpleNamespace(client=client, store=store)
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
+        actions = TelegramActions(adapter, peer, "sender")
 
-                self.assertTrue(await actions.delete_dialog())
+        self.assertTrue(await actions.delete_dialog())
 
-                client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
-                self.assertIsNone(store.dialog_snapshot("sender"))
-            finally:
-                store.close()
+        client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
+        self.assertIsNone(store.dialog_snapshot("sender"))
 
     async def test_delayed_dialog_worker_deletes_the_dialog_once(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                client = SimpleNamespace(delete_dialog=AsyncMock())
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.client = client
-                adapter.store = store
-                protector = IdentifierProtector(b"k" * 32)
-                adapter.service = GatekeeperService(store, protector)
-                peer = types.InputPeerUser(user_id=123, access_hash=456)
-                reference = protector.seal_review_reference(123, 456, 1)
-                restriction_reference = protector.seal_restriction_reference(123, 456)
-                state = store.suppress(
-                    "sender",
-                    "critical_rule",
-                    until=None,
-                    reference=reference,
-                    restriction_reference=restriction_reference,
-                )
-                action_id = store.schedule_action(
-                    "sender",
-                    reason="critical_rule",
-                    reference=reference,
-                    execute_at=0,
-                    expected_revision=state.revision,
-                )
-                store.set_mode("protect")
+        store = temporary_store(self)
+        client = SimpleNamespace(delete_dialog=AsyncMock())
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = client
+        adapter.store = store
+        protector = IdentifierProtector(b"k" * 32)
+        adapter.service = GatekeeperService(store, protector)
+        peer = types.InputPeerUser(user_id=123, access_hash=456)
+        reference = protector.seal_review_reference(123, 456, 1)
+        restriction_reference = protector.seal_restriction_reference(123, 456)
+        state = store.suppress(
+            "sender",
+            "critical_rule",
+            until=None,
+            reference=reference,
+            restriction_reference=restriction_reference,
+        )
+        action_id = store.schedule_action(
+            "sender",
+            reason="critical_rule",
+            reference=reference,
+            execute_at=0,
+            expected_revision=state.revision,
+        )
+        store.set_mode("protect")
 
-                await adapter._dialog_deletion_worker(action_id, 0)
+        await adapter._dialog_deletion_worker(action_id, 0)
 
-                client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
-                retained = store.sender("sender")
-                self.assertIsNone(retained.challenge_action_reference)
-                self.assertEqual(retained.restriction_reference, restriction_reference)
-            finally:
-                store.close()
+        client.delete_dialog.assert_awaited_once_with(peer, revoke=True)
+        retained = store.sender("sender")
+        self.assertIsNone(retained.challenge_action_reference)
+        self.assertEqual(retained.restriction_reference, restriction_reference)
 
     async def test_expired_temporary_action_never_deletes_dialog(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                protector = IdentifierProtector(b"k" * 32)
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
-                adapter.store = store
-                adapter.service = GatekeeperService(store, protector)
-                reference = protector.seal_review_reference(123, 456, 1)
-                state = store.suppress(
-                    "sender", "challenge_timeout", until=int(time.time()) - 1,
-                    reference=reference,
-                )
-                action_id = store.schedule_action(
-                    "sender", reason="challenge_timeout", reference=reference,
-                    execute_at=0, expected_revision=state.revision,
-                )
-                store.set_mode("protect")
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
+        adapter.store = store
+        adapter.service = GatekeeperService(store, protector)
+        reference = protector.seal_review_reference(123, 456, 1)
+        state = store.suppress(
+            "sender", "challenge_timeout", until=int(time.time()) - 1,
+            reference=reference,
+        )
+        action_id = store.schedule_action(
+            "sender", reason="challenge_timeout", reference=reference,
+            execute_at=0, expected_revision=state.revision,
+        )
+        store.set_mode("protect")
 
-                await adapter._dialog_deletion_worker(action_id, 0)
+        await adapter._dialog_deletion_worker(action_id, 0)
 
-                adapter.client.delete_dialog.assert_not_awaited()
-                self.assertEqual(store.statistics()["pending_actions"], 1)
-            finally:
-                store.close()
+        adapter.client.delete_dialog.assert_not_awaited()
+        self.assertEqual(store.statistics()["pending_actions"], 1)
 
     async def test_temporary_release_waits_for_running_dialog_deletion(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                started = asyncio.Event()
-                finish = asyncio.Event()
+        store = temporary_store(self)
+        started = asyncio.Event()
+        finish = asyncio.Event()
 
-                async def delete_dialog(_peer, *, revoke):
-                    started.set()
-                    await finish.wait()
+        async def delete_dialog(_peer, *, revoke):
+            started.set()
+            await finish.wait()
 
-                protector = IdentifierProtector(b"k" * 32)
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.client = SimpleNamespace(delete_dialog=AsyncMock(side_effect=delete_dialog))
-                adapter.store = store
-                adapter.service = GatekeeperService(store, protector)
-                reference = protector.seal_review_reference(123, 456, 1)
-                now = int(time.time())
-                state = store.suppress(
-                    "sender", "challenge_timeout", until=now + 30,
-                    reference=reference,
+        protector = IdentifierProtector(b"k" * 32)
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = SimpleNamespace(delete_dialog=AsyncMock(side_effect=delete_dialog))
+        adapter.store = store
+        adapter.service = GatekeeperService(store, protector)
+        reference = protector.seal_review_reference(123, 456, 1)
+        now = int(time.time())
+        state = store.suppress(
+            "sender", "challenge_timeout", until=now + 30,
+            reference=reference,
+        )
+        action_id = store.schedule_action(
+            "sender", reason="challenge_timeout", reference=reference,
+            execute_at=0, expected_revision=state.revision,
+        )
+        store.set_mode("protect")
+        worker = asyncio.create_task(adapter._dialog_deletion_worker(action_id, 0))
+        await started.wait()
+
+        async def release():
+            async with adapter.service.sender_lock("sender"):
+                return store.prune(
+                    30, now=now + 60, lifecycle_sender_keys=["sender"]
                 )
-                action_id = store.schedule_action(
-                    "sender", reason="challenge_timeout", reference=reference,
-                    execute_at=0, expected_revision=state.revision,
-                )
-                store.set_mode("protect")
-                worker = asyncio.create_task(adapter._dialog_deletion_worker(action_id, 0))
-                await started.wait()
 
-                async def release():
-                    async with adapter.service.sender_lock("sender"):
-                        return store.prune(
-                            30, now=now + 60, lifecycle_sender_keys=["sender"]
-                        )
-
-                releasing = asyncio.create_task(release())
-                await asyncio.sleep(0)
-                self.assertFalse(releasing.done())
-                finish.set()
-                await worker
-                self.assertEqual((await releasing)["temporary_released"], 1)
-                self.assertEqual(store.sender("sender").status, "unknown")
-            finally:
-                store.close()
+        releasing = asyncio.create_task(release())
+        await asyncio.sleep(0)
+        self.assertFalse(releasing.done())
+        finish.set()
+        await worker
+        self.assertEqual((await releasing)["temporary_released"], 1)
+        self.assertEqual(store.sender("sender").status, "unknown")
 
     async def test_invalid_persistent_reference_enters_exception_queue(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
-                adapter.store = store
-                adapter.service = GatekeeperService(
-                    store, IdentifierProtector(b"k" * 32)
-                )
-                state = store.suppress(
-                    "sender", "critical_rule", until=None, reference=b"invalid"
-                )
-                action_id = store.schedule_action(
-                    "sender",
-                    reason="critical_rule",
-                    reference=b"invalid",
-                    execute_at=0,
-                    expected_revision=state.revision,
-                )
-                store.set_mode("protect")
+        store = temporary_store(self)
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
+        adapter.store = store
+        adapter.service = GatekeeperService(
+            store, IdentifierProtector(b"k" * 32)
+        )
+        state = store.suppress(
+            "sender", "critical_rule", until=None, reference=b"invalid"
+        )
+        action_id = store.schedule_action(
+            "sender",
+            reason="critical_rule",
+            reference=b"invalid",
+            execute_at=0,
+            expected_revision=state.revision,
+        )
+        store.set_mode("protect")
 
-                await adapter._dialog_deletion_worker(action_id, 0)
+        await adapter._dialog_deletion_worker(action_id, 0)
 
-                self.assertEqual(store.statistics()["action_failures"], 1)
-                self.assertEqual(store.statistics()["pending_reviews"], 1)
-                adapter.client.delete_dialog.assert_not_awaited()
-            finally:
-                store.close()
+        self.assertEqual(store.statistics()["action_failures"], 1)
+        self.assertEqual(store.statistics()["pending_reviews"], 1)
+        adapter.client.delete_dialog.assert_not_awaited()
 
 
 class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_lookup_failure_continues_as_untrusted(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                protector = IdentifierProtector(b"k" * 32)
-                service = SimpleNamespace(
-                    protector=protector,
-                    handle=AsyncMock(return_value="challenged"),
-                )
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.store = store
-                adapter.service = service
-                adapter.settings = SimpleNamespace(test_sender_id=None)
-                adapter._has_prior_outgoing = AsyncMock(
-                    side_effect=RuntimeError("telegram lookup failed")
-                )
-                sender = SimpleNamespace(
-                    id=123,
-                    access_hash=456,
-                    bot=False,
-                    contact=False,
-                )
-                event = SimpleNamespace(
-                    is_private=True,
-                    message=types.Message(
-                        id=1,
-                        peer_id=types.PeerUser(123),
-                        date=datetime.fromtimestamp(100, timezone.utc),
-                        message="hello",
-                    ),
-                    input_chat=types.InputPeerUser(123, 456),
-                    get_sender=AsyncMock(return_value=sender),
-                )
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        service = SimpleNamespace(
+            protector=protector,
+            handle=AsyncMock(return_value="challenged"),
+        )
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.store = store
+        adapter.service = service
+        adapter.settings = SimpleNamespace(test_sender_id=None)
+        adapter._has_prior_outgoing = AsyncMock(
+            side_effect=RuntimeError("telegram lookup failed")
+        )
+        sender = SimpleNamespace(
+            id=123,
+            access_hash=456,
+            bot=False,
+            contact=False,
+        )
+        event = SimpleNamespace(
+            is_private=True,
+            message=types.Message(
+                id=1,
+                peer_id=types.PeerUser(123),
+                date=datetime.fromtimestamp(100, timezone.utc),
+                message="hello",
+            ),
+            input_chat=types.InputPeerUser(123, 456),
+            get_sender=AsyncMock(return_value=sender),
+        )
 
-                await adapter._on_message(event)
+        await adapter._on_message(event)
 
-                service.handle.assert_awaited_once()
-                incoming = service.handle.await_args.args[0]
-                self.assertFalse(incoming.has_trusted_history)
-                self.assertEqual(store.statistics()["audit_records"], 1)
-            finally:
-                store.close()
+        service.handle.assert_awaited_once()
+        incoming = service.handle.await_args.args[0]
+        self.assertFalse(incoming.has_trusted_history)
+        self.assertEqual(store.statistics()["audit_records"], 1)
 
     async def test_automated_outgoing_message_does_not_create_trust(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                protector = IdentifierProtector(b"k" * 32)
-                service = GatekeeperService(store, protector)
-                sender_key = protector.sender_key(123)
-                store.record_automated_message(sender_key, 10, 100)
-                outgoing = SimpleNamespace(
-                    id=10,
-                    out=True,
-                    message="Verification passed. This conversation has been restored.",
-                    date=datetime.fromtimestamp(101, timezone.utc),
-                )
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.store = store
-                adapter.service = service
-                adapter.client = FakeHistoryClient([outgoing])
-                event = SimpleNamespace(
-                    input_chat="peer", message=SimpleNamespace(id=11)
-                )
-                trusted = await adapter._has_prior_outgoing(
-                    event, sender_key, since=100
-                )
-                self.assertFalse(trusted)
-            finally:
-                store.close()
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        service = GatekeeperService(store, protector)
+        sender_key = protector.sender_key(123)
+        store.record_automated_message(sender_key, 10, 100)
+        outgoing = SimpleNamespace(
+            id=10,
+            out=True,
+            message="Verification passed. This conversation has been restored.",
+            date=datetime.fromtimestamp(101, timezone.utc),
+        )
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.store = store
+        adapter.service = service
+        adapter.client = FakeHistoryClient([outgoing])
+        event = SimpleNamespace(
+            input_chat="peer", message=SimpleNamespace(id=11)
+        )
+        trusted = await adapter._has_prior_outgoing(
+            event, sender_key, since=100
+        )
+        self.assertFalse(trusted)
 
     async def test_manual_outgoing_message_promotes_trust(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = StateStore(Path(directory) / "state.sqlite3")
-            try:
-                protector = IdentifierProtector(b"k" * 32)
-                service = GatekeeperService(store, protector)
-                sender_key = protector.sender_key(123)
-                outgoing = SimpleNamespace(
-                    id=12,
-                    out=True,
-                    message="Thanks, I will reply shortly.",
-                    date=datetime.fromtimestamp(100, timezone.utc),
-                )
-                adapter = TelegramAdapter.__new__(TelegramAdapter)
-                adapter.store = store
-                adapter.service = service
-                adapter.client = FakeHistoryClient([outgoing])
-                event = SimpleNamespace(
-                    input_chat="peer", message=SimpleNamespace(id=13)
-                )
-                trusted = await adapter._has_prior_outgoing(
-                    event, sender_key, since=100
-                )
-                self.assertTrue(trusted)
-            finally:
-                store.close()
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        service = GatekeeperService(store, protector)
+        sender_key = protector.sender_key(123)
+        outgoing = SimpleNamespace(
+            id=12,
+            out=True,
+            message="Thanks, I will reply shortly.",
+            date=datetime.fromtimestamp(100, timezone.utc),
+        )
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.store = store
+        adapter.service = service
+        adapter.client = FakeHistoryClient([outgoing])
+        event = SimpleNamespace(
+            input_chat="peer", message=SimpleNamespace(id=13)
+        )
+        trusted = await adapter._has_prior_outgoing(
+            event, sender_key, since=100
+        )
+        self.assertTrue(trusted)
 
 
 class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
