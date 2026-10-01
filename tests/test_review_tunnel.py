@@ -13,23 +13,16 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "dashboard-tunnel.sh"
 REMOTE_SCRIPT = Path(__file__).parents[1] / "scripts" / "dashboard-remote.sh"
-LEGACY_SCRIPT = Path(__file__).parents[1] / "scripts" / "review-tunnel.sh"
 
 
 class ReviewTunnelTests(unittest.TestCase):
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         for name in (
-            "TG_REVIEW_HOST",
-            "TG_REVIEW_PORT",
-            "TG_REVIEW_SOCKET",
-            "TG_REVIEW_TOKEN",
-            "TG_REVIEW_SSH_CONFIG",
             "TG_DASHBOARD_HOST",
             "TG_DASHBOARD_PORT",
-            "TG_DASHBOARD_SOCKET",
-            "TG_DASHBOARD_TOKEN",
             "TG_DASHBOARD_SSH_CONFIG",
+            "TG_DASHBOARD_PROJECT_DIR",
         ):
             environment.pop(name, None)
         return subprocess.run(
@@ -45,19 +38,7 @@ class ReviewTunnelTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("SSH_TARGET", result.stdout)
         self.assertIn("TG_DASHBOARD_HOST", result.stdout)
-        self.assertIn("TG_REVIEW_*", result.stdout)
         self.assertIn("-o", result.stdout)
-
-    def test_legacy_wrapper_delegates_with_deprecation_notice(self) -> None:
-        result = subprocess.run(
-            [str(LEGACY_SCRIPT), "-h"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("dashboard-tunnel.sh", result.stdout)
-        self.assertIn("deprecated", result.stderr)
 
     def test_open_option_launches_default_browser(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -140,11 +121,6 @@ class ReviewTunnelTests(unittest.TestCase):
         result = self.run_script("-p", "70000", "user@server.example")
         self.assertEqual(result.returncode, 2)
         self.assertIn("1 to 65535", result.stderr)
-
-    def test_obsolete_custom_runtime_paths_are_rejected(self) -> None:
-        result = self.run_script("-s", "/tmp/review.sock", "user@server.example")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("illegal option", result.stderr.lower())
 
     def test_start_failure_still_attempts_remote_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

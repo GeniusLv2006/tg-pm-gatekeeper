@@ -327,11 +327,6 @@ class DashboardHttpServer:
                 return 200, {}, await self._review_queue_page(page=page)
             except DashboardBackendError:
                 return 404, {}, self._page("Not Found")
-        if path == "/enforcement" and method == "GET":
-            return 303, {"Location": "/cases"}, b""
-        if path.startswith("/enforcement/"):
-            suffix = path.removeprefix("/enforcement/")
-            return 303, {"Location": f"/cases/{suffix}"}, b""
         if path == "/cases/archive" and method == "GET":
             page = self._page_number(parsed.query)
             if page is None:
@@ -713,14 +708,6 @@ class DashboardHttpServer:
           </div>
         </section>"""
 
-    @staticmethod
-    def _is_legacy_payload(payload: dict[str, object]) -> bool:
-        try:
-            schema_version = int(payload.get("schema_version", 0))
-        except (TypeError, ValueError):
-            schema_version = 0
-        return schema_version < 5 or payload.get("policy_version") == "rules-v2"
-
     def _review_sections(self, payload: dict[str, object]) -> str:
         text = str(payload.get("text", ""))
         quote_text = str(payload.get("quote_text", ""))
@@ -760,17 +747,6 @@ class DashboardHttpServer:
             + f"<details><summary>Quoted-Context Link Shape</summary><pre>{quote_url_shape}</pre></details>"
             + f"<details><summary>Full Decrypted Case Payload</summary><pre>{details}</pre></details>"
         )
-
-    @staticmethod
-    def _legacy_severity_label(payload: dict[str, object], reason: str) -> str:
-        severity = str(payload.get("severity") or "").strip().casefold()
-        if severity in {"none", "signal", "high", "critical"}:
-            return severity.title()
-        if severity == "manual":
-            return "Manual Decision"
-        if reason == "critical_rule":
-            return "Critical"
-        return "Not Recorded"
 
     async def _dispatch_enforcement(
         self, method: str, path: str, body: bytes
@@ -1121,27 +1097,8 @@ class DashboardHttpServer:
                 f"<a class='telegram-link' href='tg://user?id={user_id}'>"
                 "Open This Conversation in Telegram ↗</a>"
             )
-        legacy_payload = self._is_legacy_payload(payload)
-        if legacy_payload:
-            signal_breakdown = self._signal_breakdown(payload.get("rule_codes", []))
-            risk_label = self._legacy_severity_label(payload, item.reason)
-            policy_decision = "Legacy decision retained"
-            decision_basis = "Recorded under rules-v2; not recalculated."
-            legacy_decision_rows = (
-                f"<dt>Risk Score</dt><dd>{html.escape(risk_label)}</dd>"
-                f"<dt>Policy Decision</dt><dd>{html.escape(policy_decision)}</dd>"
-                f"<dt>Decision Basis</dt><dd>{html.escape(decision_basis)}</dd>"
-            )
-            policy_panel = ""
-            legacy_notice = (
-                "<div class='notice'><strong>Legacy HR Decision</strong> "
-                "Recorded under rules-v2; not recalculated and no new action was added.</div>"
-            )
-        else:
-            signal_breakdown = self._signal_breakdown(payload.get("signals", []))
-            legacy_decision_rows = ""
-            policy_panel = self._policy_decision_panel(payload)
-            legacy_notice = ""
+        signal_breakdown = self._signal_breakdown(payload.get("signals", []))
+        policy_panel = self._policy_decision_panel(payload)
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
         observed_at = item.evidence_created_at or item.updated_at
         observed = datetime.fromtimestamp(observed_at, timezone.utc).strftime(
@@ -1216,13 +1173,11 @@ class DashboardHttpServer:
           <p class="eyebrow">{evidence_heading}</p>
           <h2>{html.escape(identity)}</h2>
           <p class="refresh-note">{evidence_note}</p>
-          {legacy_notice}
           {evidence_content}
           {telegram_link}
         </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
           <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
-          <dt>Restriction Cause</dt><dd>{html.escape(self._human_label(item.reason))}</dd>
-          {legacy_decision_rows}</dl>
+          <dt>Restriction Cause</dt><dd>{html.escape(self._human_label(item.reason))}</dd></dl>
           {policy_panel}
           <dl>
           <dt>Evidence Signals</dt><dd class="signal-breakdown">{signal_breakdown}</dd>

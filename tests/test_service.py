@@ -24,7 +24,6 @@ from tg_pm_gatekeeper.service import (
     IncomingMessage,
     TextStyleSpan,
     challenge_prompt,
-    challenge_prompt_formatting,
     new_challenge,
 )
 from tg_pm_gatekeeper.store import StateStore
@@ -243,19 +242,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         one_second = challenge_prompt(Challenge("id", "56", "8 × 7 = ?"), 1)
         self.assertIn("within 1 second", one_second)
 
-    def test_legacy_recovery_prompt_keeps_safe_title_formatting(self) -> None:
-        legacy = (
-            "Verification required\n\nPlease reply directly to this message within "
-            "1 minute using Telegram's Reply action.\nSend only the answer: "
-            "8 × 7 = ?\nA separate message will not be accepted."
-        )
-        spans = challenge_prompt_formatting(legacy)
-        self.assertEqual(len(spans), 1)
-        self.assertEqual(
-            legacy[spans[0].offset : spans[0].offset + spans[0].length],
-            "Verification required",
-        )
-
     def test_challenge_generator_covers_bounded_operation_families(self) -> None:
         cases = (
             ([0, 0, 23], "2 + 25 = ?", "27"),
@@ -370,7 +356,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             sender_key,
             reference=review_reference,
             envelope=self.review_protector.seal(
-                {"schema_version": 4, "text": "private-canary"}
+                {"schema_version": 5, "text": "private-canary"}
             ),
             reason="critical_rule",
             expires_at=self.now - 1,

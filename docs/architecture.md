@@ -128,7 +128,7 @@ The runtime uses a bounded Telethon StringSession rather than its default SQLite
 
 Active Case snapshots use AES-256-GCM with a key derived through HKDF from the dedicated owner-only `review.key` secret. The runtime reads it through `TG_REVIEW_KEY_FILE`. A snapshot includes the original trigger, quoted context, Telegram preview text, button text, full URLs, normalized domains, URL shape, evidence signals, risk score, challenge profile, decision basis, policy version, and structural features, but never verification answers, webpage bodies, or media. Snapshots expire after no more than 30 days and are removed sooner after successful verification, rollback, or manual allowance.
 
-Schema 1 through 4 Active Case snapshots remain read-only compatible. The dashboard labels them `Legacy HR Decision · recorded under rules-v2; not recalculated`; migration does not recalculate their scores, replace their evidence, or schedule any new action.
+The state database can be upgraded only from schema 6 or later. Startup refuses an older or newer schema without modifying it.
 
 ## Failure behavior
 

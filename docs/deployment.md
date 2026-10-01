@@ -213,7 +213,7 @@ If the referenced Telegram message has been deleted, use **Dismiss & Cancel Jobs
 
 **Release and Forget** is available only for archived permanent restrictions with no pending or failed deletion work. It erases all sender-linked local state after confirmation but does not restore, move, unmute, or delete the Telegram conversation. A later message is treated as coming from an unknown sender. The archive page can preview and apply the same action to eligible items older than 30, 90, 180, or 365 days.
 
-New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and **Evidence Signals**, including each signal's source, weight, and explanation. Schema 1 through 4 snapshots show `Legacy HR Decision · recorded under rules-v2; not recalculated`; the migration does not reclassify them or add an action.
+New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and **Evidence Signals**, including each signal's source, weight, and explanation.
 
 Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but does not remove the row, identity, or **Allow Sender** action. The minimal encrypted control identity is removed only when the restriction ends. A temporary suppression is released when that sender next messages after expiry or by the next twelve-hour maintenance pass. Background release changes only local state and does not restore Telegram folder or mute settings.
 
@@ -229,7 +229,7 @@ TG_DASHBOARD_PORT=18765
 TG_DASHBOARD_SSH_CONFIG="$HOME/.ssh/gatekeeper.conf"
 ```
 
-The Dashboard socket and access-token paths are fixed under `/run/tg-pm-gatekeeper`; this keeps the remote helper and the isolated Compose service on one security boundary. `TG_REVIEW_HOST`, `TG_REVIEW_PORT`, and `TG_REVIEW_SSH_CONFIG` remain deprecated aliases. Never publish the Unix socket through Docker or a reverse proxy.
+The Dashboard socket and access-token paths are fixed under `/run/tg-pm-gatekeeper`; this keeps the remote helper and the isolated Compose service on one security boundary. Never publish the Unix socket through Docker or a reverse proxy.
 
 ## Common commands
 
@@ -344,7 +344,7 @@ docker compose logs --tail=100 gatekeeper
 
 For this migration, the first command must print `8`.
 
-Schema 8 adds the nullable restriction archive timestamp and its query index. Existing restrictions remain unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table. Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not recalculated and do not schedule a new action.
+Schema 8 adds the nullable restriction archive timestamp and its query index. Existing restrictions remain unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table. Databases older than schema 6 are no longer migrated: startup fails with `startup_database_migration_failed` and leaves the database unchanged.
 
 This backup is a point-in-time copy. Restoring it discards every database change made after the backup, so the procedure is not a lossless rollback once writes resume. Before considering it, stop writers and make an explicit decision about that data loss. An old migration-source host, Docker image, or cutover snapshot is not a substitute for this installation's pre-migration backup. If that backup has already been removed, do not run the restore commands below; diagnose the current database and pursue a compatible fix-forward or a separately reviewed recovery plan.
 

@@ -796,17 +796,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(repeated["items"]), 3)
         self.assertEqual(self.client.entity_requests, 2)
 
-    async def test_legacy_enforcement_routes_redirect(self) -> None:
-        status, headers, _ = await self.server._dispatch("GET", "/enforcement", b"")
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/cases")
-
-        status, headers, _ = await self.server._dispatch(
-            "GET", "/enforcement/sender-key", b""
-        )
-        self.assertEqual(status, 303)
-        self.assertEqual(headers["Location"], "/cases/sender-key")
-
     async def test_active_case_uses_case_specific_limited_evidence_guidance(
         self,
     ) -> None:
@@ -816,14 +805,20 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         envelope = self.review_protector.seal(
             {
-                "schema_version": 4,
+                "schema_version": 5,
                 "text": "",
                 "quote_text": "",
                 "preview_text": "",
                 "button_texts": ["Open"],
                 "urls": [{"url": "https://example.invalid"}],
-                "rule_codes": ["HR-01_MULTIPLE_LINK_BUTTONS"],
-                "severity": "critical",
+                "signals": [
+                    {
+                        "code": "MULTIPLE_LINK_BUTTONS",
+                        "source": "button",
+                        "weight": 25,
+                        "explanation": "Several link buttons were attached.",
+                    }
+                ],
             }
         )
         self.store.save_enforcement_review(
@@ -851,13 +846,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"deciding whether to allow the sender", detail)
         self.assertIn(b"Decrypted Local Evidence", detail)
         self.assertIn(b"Critical HR Match", detail)
-        self.assertIn(b"Legacy HR Decision", detail)
-        self.assertIn(b"<dt>Risk Score</dt><dd>Critical</dd>", detail)
         self.assertIn(b"Evidence Signals", detail)
         self.assertIn(b"<ol class='signal-list'", detail)
-        self.assertIn(b"<li class='signal-item'>", detail)
-        self.assertIn(b"HR-01 \xc2\xb7 Multiple Link Buttons", detail)
-        self.assertNotIn(b"class=\"policy-map\"", detail)
+        self.assertIn(b"<strong>Multiple Link Buttons</strong>", detail)
 
     async def test_active_case_shows_adaptive_signal_breakdown(self) -> None:
         sender_key = self.protector.sender_key(123456789)
@@ -922,7 +913,6 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"<span class='signal-score'>+20</span>", detail)
         self.assertIn(b"Telegram &lt;preview&gt; metadata", detail)
         self.assertNotIn(explanation.encode(), detail)
-        self.assertNotIn(b"Legacy HR Decision", detail)
 
     def test_policy_decision_panel_explains_both_permanent_gates(self) -> None:
         no_destructive_gate = self.server._policy_decision_panel(
@@ -971,10 +961,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         envelope = self.review_protector.seal(
             {
-                "schema_version": 1,
+                "schema_version": 5,
                 "text": "enforcement-private-canary",
                 "quote_text": "quoted-enforcement-canary",
-                "rule_codes": ["HR-06_DENIED_DOMAIN"],
+                "signals": [],
                 "features": {"has_quote": True},
             }
         )
@@ -1118,7 +1108,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             123456789, -987654321, 42
         )
         envelope = self.review_protector.seal(
-            {"schema_version": 4, "text": "private-canary"}
+            {"schema_version": 5, "text": "private-canary"}
         )
         self.store.save_enforcement_review(
             sender_key,
@@ -1154,7 +1144,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             sender_key,
             reference=review_reference,
             envelope=self.review_protector.seal(
-                {"schema_version": 4, "text": "expired-private-canary"}
+                {"schema_version": 5, "text": "expired-private-canary"}
             ),
             reason="critical_rule",
             expires_at=int(time.time()) - 1,
@@ -1222,7 +1212,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_active_enforcement_disables_allow_without_identity(self) -> None:
         sender_key = self.protector.sender_key(987654321)
         envelope = self.review_protector.seal(
-            {"schema_version": 1, "text": "private-canary", "quote_text": ""}
+            {"schema_version": 5, "text": "private-canary", "quote_text": ""}
         )
         self.store.save_enforcement_review(
             sender_key,
