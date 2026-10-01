@@ -12,7 +12,7 @@ Start the on-demand Gatekeeper Dashboard sidecar and open a local SSH tunnel.
 
 Arguments:
   SSH_TARGET             SSH host, alias, or user@host. Required unless
-                         TG_DASHBOARD_HOST or TG_REVIEW_HOST is set.
+                         TG_DASHBOARD_HOST is set.
 
 Options:
   -d PROJECT_DIR         Remote project directory (default:
@@ -21,18 +21,13 @@ Options:
   -p PORT                Local TCP port (default: 8765)
   -F SSH_CONFIG          Alternate OpenSSH config file
   -h                     Show this help
-
-TG_REVIEW_* environment names remain deprecated compatibility aliases.
 EOF
 }
 
-deprecated_alias_used=false
-[ -n "${TG_REVIEW_HOST:-}${TG_REVIEW_PORT:-}${TG_REVIEW_SSH_CONFIG:-}" ] && deprecated_alias_used=true
-
-port="${TG_DASHBOARD_PORT:-${TG_REVIEW_PORT:-8765}}"
+port="${TG_DASHBOARD_PORT:-8765}"
 remote_socket=/run/tg-pm-gatekeeper/dashboard.sock
 remote_token=/run/tg-pm-gatekeeper/dashboard.access-token
-ssh_config="${TG_DASHBOARD_SSH_CONFIG:-${TG_REVIEW_SSH_CONFIG:-}}"
+ssh_config="${TG_DASHBOARD_SSH_CONFIG:-}"
 project_dir="${TG_DASHBOARD_PROJECT_DIR:-/opt/tg-pm-gatekeeper}"
 open_on_connect=false
 
@@ -49,7 +44,7 @@ done
 shift $((OPTIND - 1))
 
 [ "$#" -le 1 ] || { echo "Only one SSH target may be supplied." >&2; exit 2; }
-host="${1:-${TG_DASHBOARD_HOST:-${TG_REVIEW_HOST:-}}}"
+host="${1:-${TG_DASHBOARD_HOST:-}}"
 [ -n "$host" ] || { echo "An SSH target is required." >&2; exit 2; }
 case "$host" in -*) echo "SSH target must not begin with '-'." >&2; exit 2 ;; esac
 case "$port" in ''|*[!0-9]*) echo "Local port must be an integer from 1 to 65535." >&2; exit 2 ;; esac
@@ -76,7 +71,6 @@ validate_absolute_path "Remote project directory" "$project_dir"
 for dependency in ssh curl; do
     command -v "$dependency" >/dev/null 2>&1 || { echo "Required command is missing: $dependency" >&2; exit 127; }
 done
-[ "$deprecated_alias_used" = false ] || echo "Warning: TG_REVIEW_* variables are deprecated; use TG_DASHBOARD_*." >&2
 
 url="http://127.0.0.1:${port}/"
 remote_helper="$project_dir/scripts/dashboard-remote.sh"

@@ -676,250 +676,6 @@ class StoreMigrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def create_legacy_database(self, status: str) -> None:
-        connection = sqlite3.connect(self.path)
-        connection.executescript(
-            """
-            CREATE TABLE sender_state (
-                sender_key TEXT PRIMARY KEY,
-                status TEXT NOT NULL CHECK (
-                    status IN ('unknown', 'challenged', 'allowed', 'quarantined')
-                ),
-                challenge_id TEXT,
-                answer_digest TEXT,
-                challenge_expires_at INTEGER,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO settings(key, value) VALUES ('mode', 'observe');
-            """
-        )
-        connection.execute(
-            "INSERT INTO sender_state VALUES (?, ?, NULL, NULL, NULL, 0, 100)",
-            ("sender", status),
-        )
-        connection.commit()
-        connection.close()
-
-    def test_v0_database_migrates_preserving_allowed_sender(self) -> None:
-        self.create_legacy_database("allowed")
-        store = StateStore(self.path)
-        try:
-            self.assertEqual(store.sender("sender").status, "allowed")
-            self.assertEqual(store.get_mode(), "monitor")
-            version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 8)
-            columns = {
-                row[1]
-                for row in store._connection.execute("PRAGMA table_info(sender_state)")
-            }
-            self.assertIn("challenge_message_id", columns)
-            self.assertIn("challenge_action_reference", columns)
-            tables = {
-                row[0]
-                for row in store._connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            self.assertIn("automated_messages", tables)
-            self.assertIn("enforcement_reviews", tables)
-            self.assertIn("operator_artifacts", tables)
-        finally:
-            store.close()
-
-    def test_v0_database_refuses_active_challenge(self) -> None:
-        self.create_legacy_database("challenged")
-        with self.assertRaises(StoreMigrationError):
-            StateStore(self.path)
-
-    def test_v1_database_adds_dialog_snapshot_table_compatibly(self) -> None:
-        store = StateStore(self.path)
-        store._connection.execute("DROP TABLE dialog_snapshots")
-        store._connection.commit()
-        store.close()
-
-        reopened = StateStore(self.path)
-        try:
-            table = reopened._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name='dialog_snapshots'"
-            ).fetchone()
-            self.assertIsNotNone(table)
-            self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                8,
-            )
-        finally:
-            reopened.close()
-
-    def test_v1_mode_and_sender_schema_migrate_to_v2(self) -> None:
-        connection = sqlite3.connect(self.path)
-        connection.executescript(
-            """
-            CREATE TABLE sender_state (
-                sender_key TEXT PRIMARY KEY,
-                status TEXT NOT NULL CHECK (status IN (
-                    'unknown','challenge_issuing','challenge_archiving','challenged',
-                    'provisional','allowed','quarantined')),
-                challenge_id TEXT, answer_digest TEXT,
-                challenge_expires_at INTEGER, challenge_message_id INTEGER,
-                challenge_prompt TEXT, challenge_action_reference BLOB,
-                guidance_sent INTEGER NOT NULL DEFAULT 0,
-                attempts INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO settings VALUES ('mode','enforce');
-            INSERT INTO sender_state(sender_key,status,updated_at)
-                VALUES ('sender','allowed',100);
-            PRAGMA user_version=1;
-            """
-        )
-        connection.close()
-        store = StateStore(self.path)
-        try:
-            self.assertEqual(store.get_mode(), "protect")
-            self.assertEqual(store.sender("sender").status, "allowed")
-            self.assertEqual(store.sender("sender").revision, 0)
-            self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 8
-            )
-        finally:
-            store.close()
-
-    def test_v2_database_adds_enforcement_reviews(self) -> None:
-        store = StateStore(self.path)
-        store._connection.execute("DROP TABLE enforcement_reviews")
-        store._connection.execute("PRAGMA user_version=2")
-        store._connection.commit()
-        store.close()
-
-        reopened = StateStore(self.path)
-        try:
-            table = reopened._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name='enforcement_reviews'"
-            ).fetchone()
-            self.assertIsNotNone(table)
-            self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
-            )
-        finally:
-            reopened.close()
-
-    def test_v3_database_adds_restriction_reference(self) -> None:
-        store = StateStore(self.path)
-        store._connection.execute(
-            "ALTER TABLE sender_state DROP COLUMN restriction_reference"
-        )
-        store._connection.execute("PRAGMA user_version=3")
-        store._connection.commit()
-        store.close()
-
-        reopened = StateStore(self.path)
-        try:
-            columns = {
-                row["name"]
-                for row in reopened._connection.execute(
-                    "PRAGMA table_info(sender_state)"
-                )
-            }
-            self.assertIn("restriction_reference", columns)
-            self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
-            )
-        finally:
-            reopened.close()
-
-    def test_v4_outbound_events_migrate_as_legacy_without_sender_ids(self) -> None:
-        store = StateStore(self.path)
-        store._connection.executescript(
-            """
-            DROP INDEX outbound_events_sender_category_time_idx;
-            DROP INDEX outbound_events_time_idx;
-            ALTER TABLE outbound_events RENAME TO outbound_events_v5;
-            CREATE TABLE outbound_events (created_at INTEGER NOT NULL);
-            INSERT INTO outbound_events VALUES (1000), (1001);
-            DROP TABLE outbound_events_v5;
-            PRAGMA user_version=4;
-            """
-        )
-        store.close()
-
-        reopened = StateStore(self.path)
-        try:
-            rows = reopened._connection.execute(
-                "SELECT sender_key,category,created_at FROM outbound_events "
-                "ORDER BY created_at"
-            ).fetchall()
-            self.assertEqual(
-                [(row["sender_key"], row["category"], row["created_at"]) for row in rows],
-                [(None, "legacy", 1000), (None, "legacy", 1001)],
-            )
-            self.assertEqual(
-                reopened.outbound_statistics(now=1001)["outbound_total_1h"], 2
-            )
-            self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
-            )
-        finally:
-            reopened.close()
-
-    def test_v5_database_migrates_active_challenge_and_legacy_decision(self) -> None:
-        store = StateStore(self.path)
-        store.suppress(
-            "legacy-case",
-            "critical_rule",
-            until=None,
-            reference=b"legacy-reference",
-            now=90,
-        )
-        store._connection.executescript(
-            """
-            INSERT INTO sender_state(
-                sender_key,status,challenge_id,answer_digest,challenge_expires_at,
-                challenge_message_id,updated_at
-            ) VALUES ('sender','challenged','id','digest',700,12,100);
-            INSERT INTO decision_events(
-                sender_key,detector,signals,assessment,risk_score,model_version,
-                decision_basis,planned_action,actual_action,policy_version,created_at
-            ) VALUES (
-                'sender','hard_rules','[\"HR-01\"]','critical',100,NULL,
-                'legacy_rules_v2','suppress','suppressed','rules-v2',100
-            );
-            ALTER TABLE sender_state DROP COLUMN challenge_profile;
-            ALTER TABLE review_queue RENAME COLUMN signals TO rule_codes;
-            ALTER TABLE decision_events RENAME COLUMN assessment TO severity;
-            ALTER TABLE decision_events RENAME COLUMN risk_score TO score;
-            ALTER TABLE decision_events DROP COLUMN decision_basis;
-            DROP TABLE campaign_events;
-            PRAGMA user_version=5;
-            """
-        )
-        store.close()
-
-        reopened = StateStore(self.path)
-        try:
-            self.assertEqual(reopened.sender("sender").challenge_profile, "standard")
-            row = reopened._connection.execute(
-                "SELECT signals,assessment,risk_score,decision_basis,policy_version "
-                "FROM decision_events WHERE sender_key='sender'"
-            ).fetchone()
-            self.assertEqual(row["signals"], '["HR-01"]')
-            self.assertEqual(row["assessment"], "critical")
-            self.assertEqual(row["risk_score"], 100)
-            self.assertEqual(row["decision_basis"], "legacy_rules_v2")
-            self.assertEqual(row["policy_version"], "rules-v2")
-            legacy_state = reopened.sender("legacy-case")
-            self.assertEqual(legacy_state.status, "suppressed")
-            self.assertEqual(legacy_state.suppression_reason, "critical_rule")
-            self.assertEqual(reopened.pending_actions(), [])
-            self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
-            )
-        finally:
-            reopened.close()
-
     def test_v6_database_adds_operator_artifact_cleanup_queue(self) -> None:
         store = StateStore(self.path)
         store._connection.executescript(
@@ -987,26 +743,30 @@ class StoreMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_newer_schema_is_refused_without_mutation(self) -> None:
-        store = StateStore(self.path)
-        store.close()
-        connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA user_version=9")
-        connection.close()
+    def test_unsupported_schema_is_refused_without_mutation(self) -> None:
+        for version in (5, 9):
+            with self.subTest(version=version):
+                self.path.unlink(missing_ok=True)
+                store = StateStore(self.path)
+                store.close()
+                connection = sqlite3.connect(self.path)
+                connection.execute(f"PRAGMA user_version={version}")
+                connection.close()
 
-        with self.assertRaisesRegex(
-            StoreMigrationError, "unsupported database schema version: 9"
-        ):
-            StateStore(self.path)
+                with self.assertRaisesRegex(
+                    StoreMigrationError,
+                    f"unsupported database schema version: {version}",
+                ):
+                    StateStore(self.path)
 
-        connection = sqlite3.connect(self.path)
-        try:
-            self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 9
-            )
-        finally:
-            connection.close()
-
+                connection = sqlite3.connect(self.path)
+                try:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone()[0],
+                        version,
+                    )
+                finally:
+                    connection.close()
 
 if __name__ == "__main__":
     unittest.main()

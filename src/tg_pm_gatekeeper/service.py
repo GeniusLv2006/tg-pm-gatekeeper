@@ -189,7 +189,7 @@ def challenge_prompt_formatting(prompt: str) -> tuple[TextStyleSpan, ...]:
         or not lines[4].startswith("Answer: ")
         or not lines[5].startswith("Attempts allowed: ")
     ):
-        return emphasized(prompt, lines[0]) if lines else ()
+        return ()
     duration = lines[2].removeprefix("Reply to this message within ").removesuffix(".")
     expression = lines[4].removeprefix("Answer: ")
     attempts = lines[5].removeprefix("Attempts allowed: ")
