@@ -48,7 +48,8 @@ commitment or compatibility promise; priorities and interfaces may change before
 - The shipped product remains local and deterministic: versioned evidence weights identify risk,
   arithmetic challenges add adaptive friction, and operator review is reserved for runtime
   exceptions and recovery.
-- The dashboard is intentionally limited to **Pending Reviews** and **Active Cases**. The standalone
+- The dashboard is intentionally limited to **Pending Reviews** and restriction management. Active
+  restrictions are split into **Needs Attention** and **Archived Restrictions**. The standalone
   labeling workflow was removed after the local model-training direction was abandoned because the
   available sample volume was not sufficient.
 - The `adaptive-v2` weights, thresholds, campaign window, and destructive gates are code-versioned.
@@ -125,11 +126,20 @@ tunnel helper stops it immediately without interrupting the Telegram core.
 
 It has two main areas:
 
-- **Active Cases**: review every current restriction; encrypted control identities remain available
-  for the restriction lifetime, while message evidence is retained for up to 30 days;
+- **Active Cases · Needs Attention**: review quarantines, temporary suppressions, automatic permanent
+  suppressions, and restrictions with unfinished deletion work;
+- **Archived Restrictions**: retain confirmed permanent policy decisions outside the working queue;
+  encrypted control identities remain available while evidence is retained for up to 30 days;
 - **Pending Reviews**: resolve monitor-mode simulations and protect-mode exceptions.
 
-Both lists are ordered by most recent activity and paginated at 50 rows per page.
+All lists are ordered by most recent activity and paginated at 50 rows per page.
+
+Archiving changes only dashboard organization and never releases a sender. Confirmed manual spam is
+archived after its deletion job finishes; automatic permanent suppression remains in Needs Attention
+until **Keep and archive** is selected. Archived permanent restrictions can be moved back or released
+and forgotten after an explicit confirmation. Forgetting is local-only: Telegram folder, mute, and
+conversation state are not changed, and a future message is treated as coming from an unknown sender.
+Optional age-based automatic forgetting is disabled by default.
 
 When `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true`, a quick recovery is available without opening the
 dashboard: send `/gatekeeper cases` in Telegram Saved Messages. Gatekeeper returns up to five current

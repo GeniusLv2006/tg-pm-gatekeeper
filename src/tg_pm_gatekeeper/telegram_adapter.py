@@ -9,6 +9,7 @@ import os
 import time
 import unicodedata
 from collections import OrderedDict
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -428,6 +429,7 @@ class TelegramAdapter:
         )
         self._timeout_tasks: dict[str, asyncio.Task] = {}
         self._maintenance_tasks: set[asyncio.Task] = set()
+        self._sender_cleanup_tasks: dict[str, set[asyncio.Task]] = {}
         self._heartbeat_task: asyncio.Task | None = None
         self._self_user_id: int | None = None
         self._operator_case_controls: dict[int, OperatorCaseControl] = {}
@@ -448,9 +450,11 @@ class TelegramAdapter:
             self.client,
             mute_days=settings.mute_days,
             cancel_timeout=self.cancel_timeout,
+            on_sender_forgotten=self._forget_sender_runtime_refs,
             schedule_dialog_deletion=self.schedule_dialog_deletion,
             restriction_actions=self._restriction_actions,
         )
+        self._dashboard_backend = dashboard_backend
         self._dashboard_rpc = DashboardRpcServer(
             settings.dashboard_rpc_socket_path, dashboard_backend
         )
@@ -517,7 +521,36 @@ class TelegramAdapter:
             self.store.heartbeat(now)
             write_runtime_heartbeat(HEARTBEAT_PATH, now)
             if now >= next_prune:
-                self.store.prune(self.settings.audit_retention_days, now)
+                sender_keys = self.store.maintenance_sender_keys(
+                    now, self.settings.archived_restriction_retention_days
+                )
+                async with AsyncExitStack() as lock_stack:
+                    for sender_key in sender_keys:
+                        await lock_stack.enter_async_context(
+                            self.service.sender_lock(sender_key)
+                        )
+                    maintenance = self.store.prune(
+                        self.settings.audit_retention_days,
+                        now,
+                        archived_restriction_retention_days=(
+                            self.settings.archived_restriction_retention_days
+                        ),
+                        lifecycle_sender_keys=sender_keys,
+                    )
+                    for sender_key in sender_keys:
+                        if self.store.active_restriction(sender_key, now=now) is None:
+                            self.cancel_timeout(sender_key)
+                            self._dashboard_backend._identity_cache.pop(
+                                sender_key, None
+                            )
+                            self._forget_sender_runtime_refs(sender_key)
+                LOG.info(
+                    "maintenance_complete:auto_forgotten=%d:"
+                    "auto_forget_skipped=%d:temporary_released=%d",
+                    maintenance["auto_forgotten"],
+                    maintenance["auto_forget_skipped"],
+                    maintenance["temporary_released"],
+                )
                 next_prune = now + PRUNE_INTERVAL_SECONDS
             if time.monotonic() >= self._next_metrics_at:
                 self._log_runtime_metrics()
@@ -1130,6 +1163,16 @@ class TelegramAdapter:
         if task and task is not asyncio.current_task():
             task.cancel()
 
+    def _forget_sender_runtime_refs(self, sender_key: str) -> None:
+        for task in self._sender_cleanup_tasks.pop(sender_key, set()):
+            if task is not asyncio.current_task():
+                task.cancel()
+        self._operator_case_controls = {
+            message_id: control
+            for message_id, control in self._operator_case_controls.items()
+            if control.sender_key != sender_key
+        }
+
     async def _timeout_worker(
         self,
         sender_key: str,
@@ -1161,6 +1204,21 @@ class TelegramAdapter:
         task = asyncio.create_task(coroutine)
         self._maintenance_tasks.add(task)
         task.add_done_callback(self._maintenance_tasks.discard)
+
+    def _track_sender_cleanup_task(self, sender_key: str, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._maintenance_tasks.add(task)
+        self._sender_cleanup_tasks.setdefault(sender_key, set()).add(task)
+
+        def finished(completed: asyncio.Task) -> None:
+            self._maintenance_tasks.discard(completed)
+            tasks = self._sender_cleanup_tasks.get(sender_key)
+            if tasks is not None:
+                tasks.discard(completed)
+                if not tasks:
+                    self._sender_cleanup_tasks.pop(sender_key, None)
+
+        task.add_done_callback(finished)
 
     def schedule_operator_artifact_deletion(self, message_ids: list[int]) -> None:
         unique_ids = tuple(dict.fromkeys(message_ids))
@@ -1218,8 +1276,9 @@ class TelegramAdapter:
     def schedule_test_message_deletion(
         self, peer, sender_key: str, since: int, delete_at: int
     ) -> None:
-        self._track_maintenance_task(
-            self._test_message_deletion_worker(peer, sender_key, since, delete_at)
+        self._track_sender_cleanup_task(
+            sender_key,
+            self._test_message_deletion_worker(peer, sender_key, since, delete_at),
         )
 
     def schedule_verification_message_deletion(
@@ -1229,10 +1288,11 @@ class TelegramAdapter:
         message_ids: tuple[int, ...],
         delete_at: int,
     ) -> None:
-        self._track_maintenance_task(
+        self._track_sender_cleanup_task(
+            sender_key,
             self._verification_message_deletion_worker(
                 peer, sender_key, message_ids, delete_at
-            )
+            ),
         )
 
     async def _verification_message_deletion_worker(
@@ -1273,44 +1333,53 @@ class TelegramAdapter:
         self._track_maintenance_task(self._dialog_deletion_worker(action_id, delete_at))
 
     async def _dialog_deletion_worker(self, action_id: int, delete_at: int) -> None:
-        action = None
         try:
             await asyncio.sleep(max(0, delete_at - int(time.time())))
-            action = self.store.claim_action(action_id)
-            if action is None:
+            sender_key = self.store.pending_action_sender_key(action_id)
+            if sender_key is None:
                 return
-            user_id, access_hash, _ = self.service.protector.open_review_reference(
-                action.reference
-            )
-            peer = types.InputPeerUser(user_id, access_hash)
-            actions = TelegramActions(self, peer, action.sender_key)
-            deleted = await actions.delete_dialog()
-            self.store.finish_action(action_id, "completed" if deleted else "failed")
-            if deleted:
-                self.store.clear_action_reference(
-                    action.sender_key, action.expected_revision
-                )
-            if not deleted:
-                self.store.enqueue_action_failure(action)
-            self.store.audit(
-                action.sender_key,
-                "DIALOG_DELETE",
-                "deleted" if deleted else "action_failed",
-                int(time.time()),
-            )
+            async with self.service.sender_lock(sender_key):
+                action = None
+                try:
+                    action = self.store.claim_action(action_id)
+                    if action is None:
+                        return
+                    user_id, access_hash, _ = self.service.protector.open_review_reference(
+                        action.reference
+                    )
+                    peer = types.InputPeerUser(user_id, access_hash)
+                    actions = TelegramActions(self, peer, action.sender_key)
+                    deleted = await actions.delete_dialog()
+                    self.store.finish_action(
+                        action_id, "completed" if deleted else "failed"
+                    )
+                    if deleted:
+                        self.store.clear_action_reference(
+                            action.sender_key, action.expected_revision
+                        )
+                    else:
+                        self.store.enqueue_action_failure(action)
+                    self.store.audit(
+                        action.sender_key,
+                        "DIALOG_DELETE",
+                        "deleted" if deleted else "action_failed",
+                        int(time.time()),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOG.error("dialog_deletion_failed")
+                    if action is not None:
+                        self.store.finish_action(action_id, "failed")
+                        self.store.enqueue_action_failure(action)
+                        self.store.audit(
+                            action.sender_key,
+                            "DIALOG_DELETE",
+                            "action_failed",
+                            int(time.time()),
+                        )
         except asyncio.CancelledError:
             pass
-        except Exception:
-            LOG.error("dialog_deletion_failed")
-            if action is not None:
-                self.store.finish_action(action_id, "failed")
-                self.store.enqueue_action_failure(action)
-                self.store.audit(
-                    action.sender_key,
-                    "DIALOG_DELETE",
-                    "action_failed",
-                    int(time.time()),
-                )
 
     def schedule_test_state_reset(
         self, sender_key: str, expected_updated_at: int, reset_at: int

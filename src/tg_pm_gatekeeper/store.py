@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 CAMPAIGN_WINDOW_SECONDS = 7 * 24 * 3600
 SENDER_STATUSES = (
     "unknown",
@@ -42,6 +42,7 @@ CREATE TABLE sender_state (
     suppression_reason TEXT,
     suppressed_until INTEGER,
     revision INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER,
     updated_at INTEGER NOT NULL
 );
 """
@@ -171,6 +172,8 @@ CREATE TABLE IF NOT EXISTS enforcement_reviews (
 );
 CREATE INDEX IF NOT EXISTS enforcement_reviews_expiry_idx
     ON enforcement_reviews(expires_at);
+CREATE INDEX IF NOT EXISTS sender_state_archive_idx
+    ON sender_state(status, archived_at, updated_at);
 """
 
 
@@ -237,6 +240,8 @@ class ActiveRestriction:
     envelope: bytes | None
     evidence_created_at: int | None
     evidence_expires_at: int | None
+    archived_at: int | None
+    has_open_actions: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +271,12 @@ class StateStore:
         if not 1 <= pending_review_retention_days <= 7:
             raise ValueError("pending review retention must be between 1 and 7 days")
         self.pending_review_retention_days = pending_review_retention_days
+        self.path = path
+        self._last_maintenance = {
+            "auto_forgotten": 0,
+            "auto_forget_skipped": 0,
+            "temporary_released": 0,
+        }
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._connection = sqlite3.connect(path, timeout=5)
         os.chmod(path, 0o600)
@@ -317,9 +328,35 @@ class StateStore:
         if version == 6:
             self._migrate_v6_to_v7()
             version = 7
+        if version == 7:
+            self._migrate_v7_to_v8()
+            version = 8
         if version != SCHEMA_VERSION:
             raise StoreMigrationError(f"unsupported database schema version: {version}")
         self._connection.executescript(SCHEMA)
+
+    def _migrate_v7_to_v8(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(sender_state)")
+            }
+            if "archived_at" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE sender_state ADD COLUMN archived_at INTEGER"
+                )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS sender_state_archive_idx "
+                "ON sender_state(status, archived_at, updated_at)"
+            )
+            self._connection.execute("PRAGMA user_version=8")
+        except Exception:
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     def _migrate_v0_to_v1(self) -> None:
         active = int(
@@ -780,6 +817,7 @@ class StateStore:
                 "challenge_profile=NULL, challenge_action_reference=NULL, "
                 "restriction_reference=excluded.restriction_reference, guidance_sent=0, "
                 "suppression_reason=NULL, suppressed_until=NULL, "
+                "archived_at=NULL, "
                 "revision=sender_state.revision+1, updated_at=excluded.updated_at",
                 (
                     sender_key,
@@ -823,7 +861,8 @@ class StateStore:
                 "challenge_message_id=NULL, challenge_prompt=NULL, "
                 "challenge_profile=NULL, "
                 "challenge_action_reference=NULL, restriction_reference=NULL, guidance_sent=0, attempts=0, "
-                "suppression_reason=NULL, suppressed_until=NULL, revision=revision+1, "
+                "suppression_reason=NULL, suppressed_until=NULL, archived_at=NULL, "
+                "revision=revision+1, "
                 "updated_at=? WHERE sender_key=? AND updated_at=? "
                 "AND status IN ('provisional', 'quarantined', 'suppressed')",
                 (timestamp, sender_key, expected_updated_at),
@@ -871,7 +910,8 @@ class StateStore:
                 "restriction_reference=COALESCE(excluded.restriction_reference,"
                 "sender_state.restriction_reference),guidance_sent=0,attempts=0,"
                 "suppression_reason=excluded.suppression_reason,"
-                "suppressed_until=excluded.suppressed_until,revision=sender_state.revision+1,"
+                "suppressed_until=excluded.suppressed_until,archived_at=NULL,"
+                "revision=sender_state.revision+1,"
                 "updated_at=excluded.updated_at",
                 (
                     sender_key,
@@ -893,14 +933,28 @@ class StateStore:
                 "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
                 "suppressed_until=NULL,challenge_action_reference=NULL,"
                 "restriction_reference=NULL,revision=revision+1,"
+                "archived_at=NULL,"
                 "updated_at=? WHERE sender_key=? AND status='suppressed' "
                 "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
                 (timestamp, sender_key, timestamp),
             )
-        if cursor.rowcount == 1:
-            self.delete_enforcement_review(sender_key)
-            return True
-        return False
+            if cursor.rowcount == 1:
+                self._connection.execute(
+                    "UPDATE pending_actions SET status='cancelled',finished_at=?,"
+                    "reference=X'' "
+                    "WHERE sender_key=? AND status IN ('pending','failed')",
+                    (timestamp, sender_key),
+                )
+                self._connection.execute(
+                    "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
+                )
+                self._connection.execute(
+                    "DELETE FROM review_queue WHERE sender_key=?", (sender_key,)
+                )
+                self._connection.execute(
+                    "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
+                )
+        return cursor.rowcount == 1
 
     def set_challenge(
         self,
@@ -1179,6 +1233,9 @@ class StateStore:
     def active_restrictions(
         self,
         *,
+        archived: bool | None = None,
+        reason: str | None = None,
+        archived_before: int | None = None,
         limit: int | None = None,
         offset: int = 0,
         now: int | None = None,
@@ -1186,24 +1243,77 @@ class StateStore:
         if offset < 0 or (limit is not None and limit < 1):
             raise ValueError("invalid active restriction page bounds")
         timestamp = int(time.time()) if now is None else now
-        query = (
-            self._active_restriction_select()
-            + " WHERE sender.status IN ('quarantined','suppressed') "
-            "ORDER BY sender.updated_at DESC, sender.sender_key ASC"
-        )
-        parameters: tuple[int, ...] = (timestamp,)
+        if archived is True:
+            partition = (
+                "sender.status='suppressed' AND sender.suppressed_until IS NULL "
+                "AND sender.archived_at IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM pending_actions AS action WHERE "
+                "action.sender_key=sender.sender_key AND "
+                "action.status IN ('pending','failed')) "
+            )
+            ordering = "sender.archived_at DESC, sender.sender_key ASC"
+        elif archived is False:
+            partition = (
+                "sender.status IN ('quarantined','suppressed') AND ("
+                "sender.status='quarantined' OR sender.suppressed_until IS NOT NULL OR "
+                "sender.archived_at IS NULL OR EXISTS (SELECT 1 FROM pending_actions AS action "
+                "WHERE action.sender_key=sender.sender_key AND "
+                "action.status IN ('pending','failed'))) "
+            )
+            ordering = "sender.updated_at DESC, sender.sender_key ASC"
+        else:
+            partition = "sender.status IN ('quarantined','suppressed') "
+            ordering = "sender.updated_at DESC, sender.sender_key ASC"
+        filters = partition
+        parameters: list[object] = [timestamp]
+        if reason is not None:
+            filters += "AND sender.suppression_reason=? "
+            parameters.append(reason)
+        if archived_before is not None:
+            filters += "AND sender.archived_at<=? "
+            parameters.append(archived_before)
+        query = self._active_restriction_select() + f" WHERE {filters}ORDER BY {ordering}"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
-            parameters = (timestamp, limit, offset)
+            parameters.extend((limit, offset))
         with self._lock:
-            rows = self._connection.execute(query, parameters).fetchall()
+            rows = self._connection.execute(query, tuple(parameters)).fetchall()
         return [ActiveRestriction(**dict(row)) for row in rows]
 
-    def active_restriction_count(self) -> int:
+    def active_restriction_count(
+        self,
+        *,
+        archived: bool | None = None,
+        reason: str | None = None,
+        archived_before: int | None = None,
+    ) -> int:
+        if archived is True:
+            where = (
+                "status='suppressed' AND suppressed_until IS NULL "
+                "AND archived_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "
+                "pending_actions AS action WHERE action.sender_key=sender_state.sender_key "
+                "AND action.status IN ('pending','failed'))"
+            )
+        elif archived is False:
+            where = (
+                "status IN ('quarantined','suppressed') AND (status='quarantined' OR "
+                "suppressed_until IS NOT NULL OR archived_at IS NULL OR EXISTS (SELECT 1 "
+                "FROM pending_actions AS action WHERE action.sender_key=sender_state.sender_key "
+                "AND action.status IN ('pending','failed')))"
+            )
+        else:
+            where = "status IN ('quarantined','suppressed')"
+        parameters: list[object] = []
+        if reason is not None:
+            where += " AND suppression_reason=?"
+            parameters.append(reason)
+        if archived_before is not None:
+            where += " AND archived_at<=?"
+            parameters.append(archived_before)
         with self._lock:
             row = self._connection.execute(
-                "SELECT COUNT(*) FROM sender_state "
-                "WHERE status IN ('quarantined','suppressed')"
+                f"SELECT COUNT(*) FROM sender_state WHERE {where}",  # noqa: S608 -- internal clauses
+                tuple(parameters),
             ).fetchone()
         return int(row[0])
 
@@ -1217,7 +1327,10 @@ class StateStore:
             "THEN 'manual_spam' ELSE 'reason_unavailable' END) AS reason,"
             "sender.suppressed_until,sender.updated_at,review.envelope,"
             "review.created_at AS evidence_created_at,"
-            "review.expires_at AS evidence_expires_at FROM sender_state AS sender "
+            "review.expires_at AS evidence_expires_at,sender.archived_at,"
+            "EXISTS (SELECT 1 FROM pending_actions AS action WHERE "
+            "action.sender_key=sender.sender_key AND action.status IN "
+            "('pending','failed')) AS has_open_actions FROM sender_state AS sender "
             "LEFT JOIN enforcement_reviews AS review ON "
             "review.sender_key=sender.sender_key AND review.expires_at>?"
         )
@@ -1308,6 +1421,102 @@ class StateStore:
             {f"reason:{row['reason']}": int(row["count"]) for row in reasons}
         )
         return result
+
+    def archive_restriction(self, sender_key: str, now: int | None = None) -> bool:
+        timestamp = int(time.time()) if now is None else now
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET archived_at=? WHERE sender_key=? "
+                "AND status='suppressed' AND suppressed_until IS NULL",
+                (timestamp, sender_key),
+            )
+        return cursor.rowcount == 1
+
+    def unarchive_restriction(self, sender_key: str) -> bool:
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE sender_state SET archived_at=NULL WHERE sender_key=? "
+                "AND status='suppressed' AND suppressed_until IS NULL "
+                "AND archived_at IS NOT NULL",
+                (sender_key,),
+            )
+        return cursor.rowcount == 1
+
+    def forget_restriction(
+        self, sender_key: str, *, archived_before: int | None = None
+    ) -> bool:
+        """Erase one archived permanent restriction and every sender-linked row."""
+        with self._lock, self._connection:
+            eligible = self._connection.execute(
+                "SELECT 1 FROM sender_state WHERE sender_key=? AND status='suppressed' "
+                "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
+                "AND (? IS NULL OR archived_at<=?) AND NOT EXISTS ("
+                "SELECT 1 FROM pending_actions WHERE sender_key=? AND status IN "
+                "('pending','failed'))",
+                (sender_key, archived_before, archived_before, sender_key),
+            ).fetchone()
+            if eligible is None:
+                return False
+            self._erase_sender_rows(sender_key)
+        return True
+
+    def archived_before_keys(self, cutoff: int) -> list[str]:
+        """Candidates only; every deletion must recheck eligibility in its transaction."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT sender_key FROM sender_state WHERE status='suppressed' "
+                "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
+                "AND archived_at<=? ORDER BY sender_key",
+                (cutoff,),
+            ).fetchall()
+        return [str(row["sender_key"]) for row in rows]
+
+    def maintenance_sender_keys(
+        self, now: int, archived_restriction_retention_days: int | None
+    ) -> list[str]:
+        with self._lock:
+            expired = self._connection.execute(
+                "SELECT sender_key FROM sender_state WHERE status='suppressed' "
+                "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
+                (now,),
+            ).fetchall()
+            keys = {str(row["sender_key"]) for row in expired}
+            if archived_restriction_retention_days is not None:
+                keys.update(
+                    self.archived_before_keys(
+                        now - archived_restriction_retention_days * 86400
+                    )
+                )
+        return sorted(keys)
+
+    def archived_before_count(self, cutoff: int) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) FROM sender_state WHERE status='suppressed' "
+                "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
+                "AND archived_at<=? AND NOT EXISTS (SELECT 1 FROM pending_actions "
+                "WHERE pending_actions.sender_key=sender_state.sender_key "
+                "AND status IN ('pending','failed'))",
+                (cutoff,),
+            ).fetchone()
+        return int(row[0])
+
+    def _erase_sender_rows(self, sender_key: str) -> None:
+        for statement in (
+            "DELETE FROM processed_messages WHERE sender_key=?",
+            "DELETE FROM audit WHERE sender_key=?",
+            "DELETE FROM link_events WHERE sender_key=?",
+            "DELETE FROM outbound_events WHERE sender_key=?",
+            "DELETE FROM automated_messages WHERE sender_key=?",
+            "DELETE FROM dialog_snapshots WHERE sender_key=?",
+            "DELETE FROM review_queue WHERE sender_key=?",
+            "DELETE FROM pending_actions WHERE sender_key=?",
+            "DELETE FROM decision_events WHERE sender_key=?",
+            "DELETE FROM campaign_events WHERE sender_key=?",
+            "DELETE FROM enforcement_reviews WHERE sender_key=?",
+            "DELETE FROM sender_state WHERE sender_key=?",
+        ):
+            self._connection.execute(statement, (sender_key,))
 
     def expire_challenge(
         self,
@@ -1513,7 +1722,18 @@ class StateStore:
             ).fetchall()
         return [PendingAction(**dict(row)) for row in rows]
 
-    def claim_action(self, action_id: int) -> PendingAction | None:
+    def pending_action_sender_key(self, action_id: int) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT sender_key FROM pending_actions WHERE id=? AND status='pending'",
+                (action_id,),
+            ).fetchone()
+        return str(row["sender_key"]) if row is not None else None
+
+    def claim_action(
+        self, action_id: int, now: int | None = None
+    ) -> PendingAction | None:
+        timestamp = int(time.time()) if now is None else now
         with self._lock:
             row = self._connection.execute(
                 "SELECT id,sender_key,action,reason,reference,execute_at,"
@@ -1531,6 +1751,12 @@ class StateStore:
                 "suppressed",
                 "quarantined",
             } or state.revision != int(row["expected_revision"]):
+                return None
+            if (
+                state.status == "suppressed"
+                and state.suppressed_until is not None
+                and state.suppressed_until <= timestamp
+            ):
                 return None
         return PendingAction(**dict(row))
 
@@ -1936,10 +2162,50 @@ class StateStore:
             ).fetchone()
         return row is not None
 
-    def prune(self, retention_days: int, now: int | None = None) -> None:
+    def prune(
+        self,
+        retention_days: int,
+        now: int | None = None,
+        *,
+        archived_restriction_retention_days: int | None = None,
+        lifecycle_sender_keys: list[str] | None = None,
+    ) -> dict[str, int]:
         timestamp = now or int(time.time())
         cutoff = timestamp - retention_days * 86400
+        permitted = None if lifecycle_sender_keys is None else set(lifecycle_sender_keys)
         with self._lock, self._connection:
+            expired = [
+                str(row["sender_key"])
+                for row in self._connection.execute(
+                    "SELECT sender_key FROM sender_state WHERE status='suppressed' "
+                    "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
+                    (timestamp,),
+                )
+                if permitted is None or str(row["sender_key"]) in permitted
+            ]
+            for sender_key in expired:
+                self._connection.execute(
+                    "UPDATE pending_actions SET status='cancelled',finished_at=?,"
+                    "reference=X'' "
+                    "WHERE sender_key=? AND status IN ('pending','failed')",
+                    (timestamp, sender_key),
+                )
+                self._connection.execute(
+                    "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
+                    "suppressed_until=NULL,challenge_action_reference=NULL,"
+                    "restriction_reference=NULL,archived_at=NULL,revision=revision+1,"
+                    "updated_at=? WHERE sender_key=?",
+                    (timestamp, sender_key),
+                )
+                self._connection.execute(
+                    "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
+                )
+                self._connection.execute(
+                    "DELETE FROM review_queue WHERE sender_key=?", (sender_key,)
+                )
+                self._connection.execute(
+                    "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
+                )
             self._connection.execute(
                 "DELETE FROM audit WHERE created_at < ?", (cutoff,)
             )
@@ -1963,7 +2229,11 @@ class StateStore:
                 "DELETE FROM decision_events WHERE created_at < ?", (cutoff,)
             )
             self._connection.execute(
-                "DELETE FROM pending_actions WHERE status!='pending' AND finished_at < ?",
+                "DELETE FROM pending_actions WHERE finished_at < ? "
+                "AND (status IN ('completed','cancelled') OR "
+                "(status='failed' AND NOT EXISTS (SELECT 1 FROM sender_state "
+                "WHERE sender_state.sender_key=pending_actions.sender_key "
+                "AND status IN ('quarantined','suppressed'))))",
                 (cutoff,),
             )
             self._connection.execute(
@@ -1975,6 +2245,65 @@ class StateStore:
             self._connection.execute(
                 "DELETE FROM enforcement_reviews WHERE expires_at <= ?", (timestamp,)
             )
+            auto_forgotten = 0
+            skipped = 0
+            if archived_restriction_retention_days is not None:
+                archive_cutoff = (
+                    timestamp - archived_restriction_retention_days * 86400
+                )
+                skipped = int(
+                    self._connection.execute(
+                        "SELECT COUNT(*) FROM sender_state WHERE status='suppressed' "
+                        "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
+                        "AND archived_at<=? AND EXISTS (SELECT 1 FROM pending_actions "
+                        "WHERE pending_actions.sender_key=sender_state.sender_key "
+                        "AND status IN ('pending','failed'))",
+                        (archive_cutoff,),
+                    ).fetchone()[0]
+                )
+                rows = self._connection.execute(
+                    "SELECT sender_key FROM sender_state WHERE status='suppressed' "
+                    "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
+                    "AND archived_at<=? AND NOT EXISTS (SELECT 1 FROM pending_actions "
+                    "WHERE pending_actions.sender_key=sender_state.sender_key "
+                    "AND status IN ('pending','failed'))",
+                    (archive_cutoff,),
+                ).fetchall()
+                for row in rows:
+                    sender_key = str(row["sender_key"])
+                    if permitted is None or sender_key in permitted:
+                        self._erase_sender_rows(sender_key)
+                        auto_forgotten += 1
+            maintenance = {
+                "auto_forgotten": auto_forgotten,
+                "auto_forget_skipped": skipped,
+                "temporary_released": len(expired),
+            }
+            for key, value in maintenance.items():
+                self._connection.execute(
+                    "INSERT INTO settings(key,value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (f"maintenance_{key}", str(value)),
+                )
+        self._last_maintenance = maintenance
+        return dict(self._last_maintenance)
+
+    def database_statistics(self) -> dict[str, int]:
+        with self._lock:
+            page_count = int(self._connection.execute("PRAGMA page_count").fetchone()[0])
+            freelist_count = int(
+                self._connection.execute("PRAGMA freelist_count").fetchone()[0]
+            )
+            page_size = int(self._connection.execute("PRAGMA page_size").fetchone()[0])
+        return {
+            "database_page_count": page_count,
+            "database_freelist_count": freelist_count,
+            "database_page_size": page_size,
+            "database_logical_bytes": page_count * page_size,
+            "database_freelist_percent": (
+                (freelist_count * 100 // page_count) if page_count else 0
+            ),
+        }
 
     def statistics(self, *, now: int | None = None) -> dict[str, int | str | None]:
         timestamp = int(time.time()) if now is None else now
@@ -2049,6 +2378,7 @@ class StateStore:
                 ).fetchone()[0]
             )
         result: dict[str, int | str | None] = {
+            "schema_version": SCHEMA_VERSION,
             "mode": self.get_mode(),
             "allowed": states.get("allowed", 0),
             "challenged": states.get("challenged", 0),
@@ -2085,4 +2415,21 @@ class StateStore:
             "repeated_campaign_7d": repeated_campaigns,
         }
         result.update(self.outbound_statistics(now=timestamp))
+        result["attention_cases"] = self.active_restriction_count(archived=False)
+        result["archived_restrictions"] = self.active_restriction_count(archived=True)
+        result.update(self.database_statistics())
+        with self._lock:
+            maintenance_rows = self._connection.execute(
+                "SELECT key,value FROM settings WHERE key IN "
+                "('maintenance_auto_forgotten','maintenance_auto_forget_skipped',"
+                "'maintenance_temporary_released')"
+            ).fetchall()
+        result.update({
+            key: int(next(
+                (row["value"] for row in maintenance_rows
+                 if row["key"] == f"maintenance_{key}"),
+                0,
+            ))
+            for key in self._last_maintenance
+        })
         return result

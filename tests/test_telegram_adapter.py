@@ -257,6 +257,8 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         self.adapter._self_user_id = 1000
         self.adapter._operator_case_controls = {}
+        self.adapter._maintenance_tasks = set()
+        self.adapter._sender_cleanup_tasks = {}
         self.adapter._operator_command_lock = asyncio.Lock()
         self.adapter._operator_sync_cursor = 0
         self.adapter._operator_handled_message_ids = {}
@@ -330,6 +332,23 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         await self.adapter._on_operator_message(event)
 
         event.respond.assert_not_awaited()
+
+    async def test_forget_cancels_sender_cleanup_and_operator_controls(self) -> None:
+        sender_key = "a" * 64
+        self.adapter._operator_case_controls[11] = OperatorCaseControl(
+            sender_key, time.monotonic() + 60
+        )
+        waiting = asyncio.Event()
+        self.adapter._track_sender_cleanup_task(sender_key, waiting.wait())
+        task = next(iter(self.adapter._sender_cleanup_tasks[sender_key]))
+        await asyncio.sleep(0)
+
+        self.adapter._forget_sender_runtime_refs(sender_key)
+        await asyncio.sleep(0)
+
+        self.assertTrue(task.cancelled())
+        self.assertNotIn(11, self.adapter._operator_case_controls)
+        self.assertNotIn(sender_key, self.adapter._sender_cleanup_tasks)
 
     async def test_forwarded_command_is_ignored(self) -> None:
         event = self.event("/gatekeeper ping")
@@ -728,7 +747,7 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
                 adapter.client = client
                 adapter.store = store
                 protector = IdentifierProtector(b"k" * 32)
-                adapter.service = SimpleNamespace(protector=protector)
+                adapter.service = GatekeeperService(store, protector)
                 peer = types.InputPeerUser(user_id=123, access_hash=456)
                 reference = protector.seal_review_reference(123, 456, 1)
                 restriction_reference = protector.seal_restriction_reference(123, 456)
@@ -757,6 +776,79 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    async def test_expired_temporary_action_never_deletes_dialog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                protector = IdentifierProtector(b"k" * 32)
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
+                adapter.store = store
+                adapter.service = GatekeeperService(store, protector)
+                reference = protector.seal_review_reference(123, 456, 1)
+                state = store.suppress(
+                    "sender", "challenge_timeout", until=int(time.time()) - 1,
+                    reference=reference,
+                )
+                action_id = store.schedule_action(
+                    "sender", reason="challenge_timeout", reference=reference,
+                    execute_at=0, expected_revision=state.revision,
+                )
+                store.set_mode("protect")
+
+                await adapter._dialog_deletion_worker(action_id, 0)
+
+                adapter.client.delete_dialog.assert_not_awaited()
+                self.assertEqual(store.statistics()["pending_actions"], 1)
+            finally:
+                store.close()
+
+    async def test_temporary_release_waits_for_running_dialog_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.sqlite3")
+            try:
+                started = asyncio.Event()
+                finish = asyncio.Event()
+
+                async def delete_dialog(_peer, *, revoke):
+                    started.set()
+                    await finish.wait()
+
+                protector = IdentifierProtector(b"k" * 32)
+                adapter = TelegramAdapter.__new__(TelegramAdapter)
+                adapter.client = SimpleNamespace(delete_dialog=AsyncMock(side_effect=delete_dialog))
+                adapter.store = store
+                adapter.service = GatekeeperService(store, protector)
+                reference = protector.seal_review_reference(123, 456, 1)
+                now = int(time.time())
+                state = store.suppress(
+                    "sender", "challenge_timeout", until=now + 30,
+                    reference=reference,
+                )
+                action_id = store.schedule_action(
+                    "sender", reason="challenge_timeout", reference=reference,
+                    execute_at=0, expected_revision=state.revision,
+                )
+                store.set_mode("protect")
+                worker = asyncio.create_task(adapter._dialog_deletion_worker(action_id, 0))
+                await started.wait()
+
+                async def release():
+                    async with adapter.service.sender_lock("sender"):
+                        return store.prune(
+                            30, now=now + 60, lifecycle_sender_keys=["sender"]
+                        )
+
+                releasing = asyncio.create_task(release())
+                await asyncio.sleep(0)
+                self.assertFalse(releasing.done())
+                finish.set()
+                await worker
+                self.assertEqual((await releasing)["temporary_released"], 1)
+                self.assertEqual(store.sender("sender").status, "unknown")
+            finally:
+                store.close()
+
     async def test_invalid_persistent_reference_enters_exception_queue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(Path(directory) / "state.sqlite3")
@@ -764,8 +856,8 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
                 adapter = TelegramAdapter.__new__(TelegramAdapter)
                 adapter.client = SimpleNamespace(delete_dialog=AsyncMock())
                 adapter.store = store
-                adapter.service = SimpleNamespace(
-                    protector=IdentifierProtector(b"k" * 32)
+                adapter.service = GatekeeperService(
+                    store, IdentifierProtector(b"k" * 32)
                 )
                 state = store.suppress(
                     "sender", "critical_rule", until=None, reference=b"invalid"

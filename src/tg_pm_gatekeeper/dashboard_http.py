@@ -18,7 +18,7 @@ from importlib.resources import files
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from .dashboard_protocol import DashboardBackend, DashboardBackendError
 from .policy import EvidenceSignal, PolicyEngine
@@ -332,6 +332,30 @@ class DashboardHttpServer:
         if path.startswith("/enforcement/"):
             suffix = path.removeprefix("/enforcement/")
             return 303, {"Location": f"/cases/{suffix}"}, b""
+        if path == "/cases/archive" and method == "GET":
+            page = self._page_number(parsed.query)
+            if page is None:
+                return 404, {}, self._page("Not Found")
+            values = parse_qs(parsed.query)
+            reason = values.get("reason", [None])[0]
+            older_text = values.get("older_days", [None])[0]
+            older_days = int(older_text) if older_text in {"30", "90", "180", "365"} else None
+            if older_text is not None and older_days is None:
+                return 400, {}, self._page("Invalid Archive Filter")
+            try:
+                return 200, {}, await self._enforcement_index_page(
+                    page=page, archived=True, reason=reason, older_days=older_days
+                )
+            except DashboardBackendError:
+                return 404, {}, self._page("Not Found")
+        if path == "/cases/archive/forget":
+            return await self._dispatch_bulk_forget(method, parsed.query, body)
+        if path.endswith("/archive") and path.startswith("/cases/"):
+            sender_key = path.removeprefix("/cases/").removesuffix("/archive")
+            return await self._dispatch_archive_confirmation(method, sender_key, body)
+        if path.endswith("/forget") and path.startswith("/cases/"):
+            sender_key = path.removeprefix("/cases/").removesuffix("/forget")
+            return await self._dispatch_forget_confirmation(method, sender_key, body)
         if path == "/cases" and method == "GET":
             page = self._page_number(parsed.query)
             if page is None:
@@ -387,6 +411,10 @@ class DashboardHttpServer:
                 "Telegram Action Failed; Item Was Not Changed",
             ),
             "restriction_release_failed": (500, "Restriction Release Failed"),
+            "case_not_archived": (409, "This Restriction Is Not Archived"),
+            "case_not_forgettable": (
+                409, "This Restriction Cannot Be Forgotten While Work Is Pending"
+            ),
             "core_unavailable": (503, "Dashboard Core Is Unavailable"),
         }.get(code, (500, "Request Failed"))
         return status, {}, self._page(title)
@@ -789,23 +817,165 @@ class DashboardHttpServer:
             return self._backend_error(exc.code)
         return 303, {"Location": "/cases"}, b""
 
-    async def _enforcement_index_page(self, *, page: int = 1) -> bytes:
-        result = await self.backend.request("cases.list", {"page": page})
+    async def _dispatch_forget_confirmation(
+        self, method: str, sender_key: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        if len(sender_key) != 64 or any(
+            char not in "0123456789abcdef" for char in sender_key
+        ):
+            return 404, {}, self._page("Archived Restriction Not Found")
+        if method == "GET":
+            try:
+                item = await self.backend.request(
+                    "cases.detail", {"sender_key": sender_key}
+                )
+            except DashboardBackendError as exc:
+                return self._backend_error(exc.code)
+            if item.get("archived_at") is None or item.get("suppressed_until") is not None:
+                return self._backend_error("case_not_archived")
+            content = (
+                self._masthead("Forget Restriction", "Confirmation", csrf_token=self._csrf_token)
+                + "<main class='list-main'><section class='queue-intro'>"
+                + "<p class='eyebrow'>Destructive local action</p>"
+                + "<h2>Release and forget this archived restriction?</h2>"
+                + "<p>This removes all local policy, evidence, identity, snapshot, and history data. "
+                + "It does not restore, move, unmute, or delete the Telegram conversation. "
+                + "A future message will be handled as an unknown sender.</p>"
+                + f"<form method='post' action='/cases/{sender_key}/forget'>"
+                + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
+                + "<button class='danger' type='submit'>Release and forget</button></form>"
+                + "<p><a href='/cases/archive'>Cancel</a></p></section></main>"
+            )
+            return 200, {}, self._page(content, raw=True, page_title="Forget Restriction")
+        if method != "POST":
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
+        values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+        if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid Action Token")
+        try:
+            await self.backend.request(
+                "cases.decide", {"sender_key": sender_key, "action": "forget"}
+            )
+        except DashboardBackendError as exc:
+            return self._backend_error(exc.code)
+        return 303, {"Location": "/cases/archive"}, b""
+
+    async def _dispatch_archive_confirmation(
+        self, method: str, sender_key: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        if len(sender_key) != 64 or any(
+            char not in "0123456789abcdef" for char in sender_key
+        ):
+            return 404, {}, self._page("Active Case Not Found")
+        if method == "GET":
+            try:
+                item = await self.backend.request(
+                    "cases.detail", {"sender_key": sender_key}
+                )
+            except DashboardBackendError as exc:
+                return self._backend_error(exc.code)
+            if (
+                item.get("status") != "suppressed"
+                or item.get("suppressed_until") is not None
+                or item.get("archived_at") is not None
+            ):
+                return self._backend_error("case_not_found")
+            content = (
+                self._masthead("Archive Restriction", "Confirmation", csrf_token=self._csrf_token)
+                + "<main class='list-main'><section class='queue-intro'>"
+                + "<h2>Keep this restriction and move it to the archive?</h2>"
+                + "<p>The permanent suppression remains in force. The sender will remain "
+                + "blocked by local policy, while its reviewable evidence keeps the existing "
+                + "expiry. You can move the restriction back to Needs Attention later.</p>"
+                + f"<form method='post' action='/cases/{sender_key}/archive'>"
+                + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
+                + "<button type='submit'>Keep and archive</button></form>"
+                + f"<p><a href='/cases/{sender_key}'>Cancel</a></p></section></main>"
+            )
+            return 200, {}, self._page(content, raw=True, page_title="Archive Restriction")
+        if method != "POST":
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
+        values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+        if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid Action Token")
+        try:
+            await self.backend.request(
+                "cases.decide", {"sender_key": sender_key, "action": "keep"}
+            )
+        except DashboardBackendError as exc:
+            return self._backend_error(exc.code)
+        return 303, {"Location": "/cases/archive"}, b""
+
+    async def _dispatch_bulk_forget(
+        self, method: str, query: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        source = parse_qs(query if method == "GET" else body.decode("utf-8"))
+        raw_days = source.get("days", [""])[0]
+        if raw_days not in {"30", "90", "180", "365"}:
+            return 400, {}, self._page("Invalid Retention Age")
+        days = int(raw_days)
+        if method == "GET":
+            result = await self.backend.request(
+                "cases.forget_preview", {"days": days}
+            )
+            count = int(result["count"])
+            content = (
+                self._masthead("Bulk Forget", f"{count} Eligible", csrf_token=self._csrf_token)
+                + "<main class='list-main'><section class='queue-intro'>"
+                + f"<h2>Release and forget {count} archived restriction{'s' if count != 1 else ''}?</h2>"
+                + f"<p>Only permanent restrictions archived for at least {days} days and with no pending or failed work are eligible. "
+                + "Telegram conversations are not changed.</p>"
+                + "<form method='post' action='/cases/archive/forget'>"
+                + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
+                + f"<input type='hidden' name='days' value='{days}'>"
+                + "<button class='danger' type='submit'>Confirm bulk forget</button></form>"
+                + "<p><a href='/cases/archive'>Cancel</a></p></section></main>"
+            )
+            return 200, {}, self._page(content, raw=True, page_title="Bulk Forget")
+        if method != "POST":
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
+        if not secrets.compare_digest(source.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid Action Token")
+        await self.backend.request("cases.forget_bulk", {"days": days})
+        return 303, {"Location": "/cases/archive"}, b""
+
+    async def _enforcement_index_page(
+        self, *, page: int = 1, archived: bool = False,
+        reason: str | None = None, older_days: int | None = None,
+    ) -> bytes:
+        result = await self.backend.request(
+            "cases.list", {
+                "page": page, "archived": archived,
+                **({"reason": reason} if reason else {}),
+                **({"older_days": older_days} if older_days else {}),
+            }
+        )
         total = int(result["total"])
         items = [SimpleNamespace(**value) for value in result["items"]]
         stats = result["stats"]
+        def sender_cell(item: SimpleNamespace) -> str:
+            if archived:
+                return (
+                    f"<a class='identity-link' href='/cases/{item.sender_key}'>"
+                    "Archived sender</a>"
+                )
+            return self._identity_cell(
+                self._identity_from_value(item.identity),
+                href=f"/cases/{item.sender_key}",
+            )
+
         rows = "".join(
             "<tr>"
-            f"<td data-label='Sender'>{self._identity_cell(self._identity_from_value(item.identity), href=f'/cases/{item.sender_key}')}</td>"
+            f"<td data-label='Sender'>{sender_cell(item)}</td>"
             f"<td data-label='State'><span class='badge'>{html.escape(self._human_label(item.status))}</span>"
             f"<span class='cell-note'>{html.escape(self._restriction_summary(item))}</span></td>"
             f"<td data-label='Trigger'>{html.escape(self._list_reason_label(item.reason))}</td>"
             f"<td data-label='Evidence'><span class='availability{' availability-unavailable' if not item.has_evidence else ''}'>"
             f"{'Ready' if item.has_evidence else 'Unavailable'}</span></td>"
-            f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.updated_at))}</td>"
+            f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.archived_at if archived else item.updated_at))}</td>"
             "</tr>"
             for item in items
-        ) or "<tr class='empty-row'><td colspan='5'>No active restrictions.</td></tr>"
+        ) or f"<tr class='empty-row'><td colspan='5'>No {'archived' if archived else 'active'} restrictions.</td></tr>"
         reason_counts = sorted(
             (key.removeprefix("reason:"), value)
             for key, value in stats.items()
@@ -850,11 +1020,44 @@ class DashboardHttpServer:
                 "<button class='danger' type='submit'>Allow without restore</button>"
                 "</form></div></details>"
             )
+        base = "/cases/archive" if archived else "/cases"
+        filter_values: dict[str, object] = {}
+        if reason:
+            filter_values["reason"] = reason
+        if older_days:
+            filter_values["older_days"] = older_days
+        filtered_base = base + (f"?{urlencode(filter_values)}" if filter_values else "")
+        archive_tools = ""
+        if archived:
+            reason_links = " · ".join(
+                f"<a href='/cases/archive?{urlencode({'reason': item_reason})}'>"
+                f"{html.escape(self._reason_label(item_reason))}</a>"
+                for item_reason, _ in reason_counts
+            ) or "No reasons"
+            archive_tools = (
+                "<section class='queue-intro compact-intro'><p class='eyebrow'>Local cleanup</p>"
+                f"<p>Filter by reason: <a href='/cases/archive'>All</a> · {reason_links}</p>"
+                "<p>Minimum archive age: "
+                + " · ".join(
+                    f"<a href='/cases/archive?older_days={days}'>{days} days</a>"
+                    for days in (30, 90, 180, 365)
+                )
+                + "</p>"
+                "<p>Preview release and forget by minimum archive age:</p><p>"
+                + " · ".join(
+                    f"<a href='/cases/archive/forget?days={days}'>{days} days</a>"
+                    for days in (30, 90, 180, 365)
+                )
+                + "</p></section>"
+            )
         content = (
             self._masthead(
-                "Active Cases", f"{total} Restrictions", csrf_token=self._csrf_token
+                "Archived Restrictions" if archived else "Active Cases",
+                f"{total} Restrictions", csrf_token=self._csrf_token
             )
-            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/review'>Pending Reviews</a></p>"
+            + "<p class='back'><a href='/'>← Operations Dashboard</a> · "
+            + ("<a href='/cases'>Needs Attention</a>" if archived else "<a href='/cases/archive'>Archived Restrictions</a>")
+            + " · <a href='/review'>Pending Reviews</a></p>"
             + "<main class='list-main' data-live-region='active-cases'><section class='queue-intro compact-intro'><p class='eyebrow'>Protect mode state</p>"
             + "<p class='lede'>Review every current restriction. Evidence availability is tracked separately; Telegram block is never used.</p>"
             + "<dl class='metric-grid'>"
@@ -865,8 +1068,9 @@ class DashboardHttpServer:
             + f"<p><strong>State reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></details></section>"
             + "<div class='table-shell'><table class='data-table cases-table'><thead><tr><th>Sender</th><th>State</th><th>Trigger</th><th>Evidence</th><th>Age</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div>"
-            + self._pagination("/cases", page, total)
+            + self._pagination(filtered_base, page, total)
             + "</main>"
+            + archive_tools
             + "<section class='advanced-recovery-wrap' data-live-region='legacy-recovery'>"
             + recovery
             + "</section>"
@@ -874,10 +1078,12 @@ class DashboardHttpServer:
         return self._page(
             content,
             raw=True,
-            page_title="Active Cases",
+            page_title="Archived Restrictions" if archived else "Active Cases",
             live_refresh="replace",
             page_version=await self._backend_page_version(
-                "/cases" if page == 1 else f"/cases?page={page}"
+                filtered_base if page == 1 else (
+                    f"{filtered_base}{'&' if '?' in filtered_base else '?'}page={page}"
+                )
             ),
         )
 
@@ -983,10 +1189,28 @@ class DashboardHttpServer:
                 "No saved dialog state is available. Allow moves the conversation to the main "
                 "folder and enables notifications before changing policy."
             )
-        keep_label = "Keep restriction"
+        archived = item.archived_at is not None
+        if archived:
+            secondary_action = self._action_form(
+                item.sender_key, "unarchive", "Move to needs attention", base="cases"
+            )
+            if not item.has_open_actions:
+                secondary_action += (
+                    f"<a class='danger button-link' href='/cases/{item.sender_key}/forget'>"
+                    "Release and forget…</a>"
+                )
+        elif item.status == "suppressed" and item.suppressed_until is None:
+            secondary_action = (
+                f"<a class='button-link' href='/cases/{item.sender_key}/archive'>"
+                "Keep and archive…</a>"
+            )
+        else:
+            secondary_action = ""
+        back_href = "/cases/archive" if archived else "/cases"
+        back_label = "Archived Restrictions" if archived else "Active Cases"
         content = f"""
         {self._masthead("Active Cases", self._human_label(item.status), csrf_token=self._csrf_token)}
-        <p class="back"><a href="/cases">← Active Cases</a></p>
+        <p class="back"><a href="{back_href}">← {back_label}</a></p>
         {self._change_notice()}
         <main class="review-grid"><section class="message-panel">
           <p class="eyebrow">{evidence_heading}</p>
@@ -1009,7 +1233,7 @@ class DashboardHttpServer:
           <h2>{html.escape(allow_guidance)}</h2>
           <div class="actions two">
             {allow_action}
-            {self._action_form(item.sender_key, "keep", keep_label, base="cases")}
+            {secondary_action}
           </div></section>"""
         return 200, {}, self._page(
             content,
@@ -1120,6 +1344,20 @@ class DashboardHttpServer:
         pending_reviews = int(result["pending_reviews"])
         active_stats = result["active_stats"]
         active_restrictions = active_stats["quarantined"] + active_stats["suppressed"]
+        storage_stats = result.get("storage_stats")
+        if not isinstance(storage_stats, dict):
+            storage_stats = {
+                "attention_cases": active_restrictions,
+                "archived_restrictions": 0,
+                "database_page_count": 0,
+                "database_page_size": 0,
+                "database_logical_bytes": 0,
+                "database_freelist_count": 0,
+                "database_freelist_percent": 0,
+                "temporary_released": 0,
+                "auto_forgotten": 0,
+                "auto_forget_skipped": 0,
+            }
         mode = str(result["mode"])
         content = (
             self._masthead(
@@ -1131,9 +1369,21 @@ class DashboardHttpServer:
             f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
             f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
             f"<div><dt>Pending Reviews</dt><dd class='data-value'>{pending_reviews}</dd></div>"
-            "</dl></section>"
+            "</dl><details class='context-note'><summary>Storage and maintenance</summary>"
+            f"<p>Needs attention: {storage_stats['attention_cases']} · "
+            f"Archived: {storage_stats['archived_restrictions']} · "
+            f"Database: {storage_stats['database_logical_bytes']} bytes "
+            f"({storage_stats['database_page_count']} pages × "
+            f"{storage_stats['database_page_size']} bytes) · "
+            f"Free pages: {storage_stats['database_freelist_count']} "
+            f"({storage_stats['database_freelist_percent']}%).</p>"
+            f"<p>Last maintenance: released {storage_stats['temporary_released']} temporary restrictions, "
+            f"forgot {storage_stats['auto_forgotten']} archived restrictions, "
+            f"skipped {storage_stats['auto_forget_skipped']} with unfinished work.</p>"
+            "</details></section>"
             "<nav class='area-grid' aria-label='Review areas'>"
-            f"<a class='area-card' href='/cases'><span class='eyebrow'>Restrictions</span><strong>Active Cases</strong><span>Review and recover current restrictions.</span><b>{active_restrictions}</b></a>"
+            f"<a class='area-card' href='/cases'><span class='eyebrow'>Restrictions</span><strong>Active Cases · Needs Attention</strong><span>Review unresolved restrictions and failures.</span><b>{storage_stats['attention_cases']}</b></a>"
+            f"<a class='area-card' href='/cases/archive'><span class='eyebrow'>Retained policy</span><strong>Archived Restrictions</strong><span>Review or forget confirmed permanent restrictions.</span><b>{storage_stats['archived_restrictions']}</b></a>"
             f"<a class='area-card' href='/review'><span class='eyebrow'>Decisions</span><strong>Pending Reviews</strong><span>Resolve simulations and exception reviews.</span><b>{pending_reviews}</b></a>"
             "</nav></main>"
         )
@@ -1224,11 +1474,13 @@ class DashboardHttpServer:
         total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         if total_pages == 1:
             return ""
+        separator = "&" if "?" in base else "?"
         previous = (
-            f"<a href='{base}?page={page - 1}'>← Previous</a>" if page > 1 else ""
+            f"<a href='{base}{separator}page={page - 1}'>← Previous</a>"
+            if page > 1 else ""
         )
         following = (
-            f"<a href='{base}?page={page + 1}'>Next →</a>"
+            f"<a href='{base}{separator}page={page + 1}'>Next →</a>"
             if page < total_pages
             else ""
         )

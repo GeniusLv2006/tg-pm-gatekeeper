@@ -331,6 +331,8 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 envelope=None,
                 evidence_created_at=None,
                 evidence_expires_at=None,
+                archived_at=None,
+                has_open_actions=0,
             )
 
         self.assertEqual(
@@ -997,7 +999,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.store.suppress(
             sender_key,
             "attempts_exhausted",
-            until=int(time.time()) + 700,
+            until=None,
             reference=reference,
             restriction_reference=self.protector.seal_restriction_reference(
                 123456789, -987654321
@@ -1041,6 +1043,85 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "allowed")
         self.assertIsNone(self.store.enforcement_review(sender_key))
 
+    async def test_archived_list_defers_identity_and_single_forget_is_confirmed(
+        self,
+    ) -> None:
+        sender_key = "a" * 64
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+        self.store.archive_restriction(sender_key, int(time.time()) - 40 * 86400)
+
+        status, _, page = await self.server._dispatch("GET", "/cases/archive", b"")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Archived Restrictions", page)
+        self.assertIn(b"Archived sender", page)
+        self.assertEqual(self.client.entity_requests, 0)
+
+        status, _, confirmation = await self.server._dispatch(
+            "GET", f"/cases/{sender_key}/forget", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"does not restore, move, unmute, or delete", confirmation)
+        body = urlencode({"token": self.server._csrf_token}).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST", f"/cases/{sender_key}/forget", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases/archive")
+        self.assertEqual(self.store.sender(sender_key).status, "unknown")
+
+    async def test_keep_archive_requires_confirmation_page_and_csrf(self) -> None:
+        sender_key = "d" * 64
+        self.store.suppress(sender_key, "critical_rule", until=None)
+
+        status, _, confirmation = await self.server._dispatch(
+            "GET", f"/cases/{sender_key}/archive", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"permanent suppression remains in force", confirmation)
+        self.assertIsNone(self.store.active_restriction(sender_key).archived_at)
+
+        status, _, _ = await self.server._dispatch(
+            "POST", f"/cases/{sender_key}/archive", b"token=invalid"
+        )
+        self.assertEqual(status, 400)
+        body = urlencode({"token": self.server._csrf_token}).encode()
+        status, headers, _ = await self.server._dispatch(
+            "POST", f"/cases/{sender_key}/archive", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/cases/archive")
+        self.assertIsNotNone(self.store.active_restriction(sender_key).archived_at)
+
+    async def test_bulk_forget_previews_and_rechecks_age(self) -> None:
+        now = int(time.time())
+        for sender_key, age in (("b" * 64, 100), ("c" * 64, 10)):
+            self.store.suppress(
+                sender_key, "critical_rule", until=None, now=now - age * 86400
+            )
+            self.store.archive_restriction(sender_key, now - age * 86400)
+
+        status, _, preview = await self.server._dispatch(
+            "GET", "/cases/archive/forget?days=90", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(b"1 Eligible", preview)
+        body = urlencode(
+            {"token": self.server._csrf_token, "days": "90"}
+        ).encode()
+        status, _, _ = await self.server._dispatch(
+            "POST", "/cases/archive/forget", body
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(self.store.sender("b" * 64).status, "unknown")
+        self.assertEqual(self.store.sender("c" * 64).status, "suppressed")
+
     async def test_expired_suppression_does_not_offer_to_extend_restriction(
         self,
     ) -> None:
@@ -1073,7 +1154,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, 200)
         self.assertIn(b"Release pending", detail)
-        self.assertIn(b"Keep restriction", detail)
+        self.assertNotIn(b"Keep and archive", detail)
 
     async def test_expired_evidence_remains_listed_and_restorable(self) -> None:
         user_id = 123456789
@@ -1368,6 +1449,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             self.client.requests[1], functions.folders.EditPeerFoldersRequest
         )
         self.assertEqual(self.store.sender("sender").status, "suppressed")
+        self.assertIsNotNone(self.store.active_restriction("sender").archived_at)
         self.assertEqual(
             self.store.sender("sender").suppression_reason,
             "manual_permanent_suppression",

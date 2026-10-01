@@ -120,7 +120,7 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_keep_case_waits_for_sender_lock(self) -> None:
         sender_key = "d" * 64
-        self.store.quarantine(sender_key)
+        self.store.suppress(sender_key, "critical_rule", until=None)
         lock = self.service.sender_lock(sender_key)
         await lock.acquire()
         decision = asyncio.create_task(
@@ -132,7 +132,54 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision.done())
 
         lock.release()
-        self.assertEqual(await decision, {"outcome": "kept"})
+        self.assertEqual(await decision, {"outcome": "archived"})
+        self.assertIsNotNone(self.store.active_restriction(sender_key).archived_at)
+
+    async def test_forget_is_local_and_requires_archived_permanent_case(self) -> None:
+        sender_key = "e" * 64
+        forgotten: list[str] = []
+        self.backend.on_sender_forgotten = forgotten.append
+        self.store.suppress(sender_key, "critical_rule", until=None)
+        with self.assertRaisesRegex(DashboardBackendError, "case_not_forgettable"):
+            await self.backend.request(
+                "cases.decide", {"sender_key": sender_key, "action": "forget"}
+            )
+        self.store.archive_restriction(sender_key)
+
+        result = await self.backend.request(
+            "cases.decide", {"sender_key": sender_key, "action": "forget"}
+        )
+
+        self.assertEqual(result, {"outcome": "forgotten"})
+        self.assertEqual(self.store.sender(sender_key).status, "unknown")
+        self.assertEqual(forgotten, [sender_key])
+
+    async def test_bulk_forget_rechecks_eligibility_after_sender_lock(self) -> None:
+        sender_key = "f" * 64
+        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.archive_restriction(sender_key, int(time.time()) - 100 * 86400)
+        lock = self.service.sender_lock(sender_key)
+        await lock.acquire()
+        forgetting = asyncio.create_task(
+            self.backend.request("cases.forget_bulk", {"days": 90})
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(forgetting.done())
+        self.store.unarchive_restriction(sender_key)
+        lock.release()
+        self.assertEqual(
+            await forgetting, {"outcome": "forgotten", "count": 0}
+        )
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
+
+    async def test_archive_page_version_uses_filters(self) -> None:
+        sender_key = "f" * 64
+        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.archive_restriction(sender_key, int(time.time()) - 100 * 86400)
+        self.assertNotEqual(
+            self.backend.page_version("/cases/archive?reason=critical_rule"),
+            self.backend.page_version("/cases/archive?reason=manual_spam"),
+        )
 
     async def test_unknown_method_and_invalid_identifiers_fail_closed(self) -> None:
         with self.assertRaisesRegex(DashboardBackendError, "unknown_method"):

@@ -26,11 +26,13 @@ READ_ONLY_METHODS = {
     "reviews.detail",
     "cases.list",
     "cases.detail",
+    "cases.forget_preview",
 }
 WRITE_METHODS = {
     "reviews.decide",
     "cases.decide",
     "cases.release_legacy",
+    "cases.forget_bulk",
 }
 ALLOWED_METHODS = READ_ONLY_METHODS | WRITE_METHODS
 
