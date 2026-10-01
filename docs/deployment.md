@@ -143,7 +143,7 @@ While the service remains in `monitor`, send a private message from a separate T
 
 ### 4. Confirm the server is not exposing Gatekeeper
 
-Run the checks in [Confirm the security settings](#confirm-the-security-settings). They verify that the dashboard is not public and that the private files have the expected permissions.
+Run the checks in [Confirm the security settings](#confirm-the-security-settings). They verify that the core container publishes no port, that no unexpected TCP listener is open, and that the private files and core socket have the expected permissions. The on-demand dashboard sidecar runs with networking disabled and is reachable only through its Unix socket.
 
 ### 5. Enable protection when ready
 
@@ -152,6 +152,8 @@ Only after the previous checks pass:
 ```shell
 ssh "$DEPLOY_HOST" 'cd /opt/tg-pm-gatekeeper && docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode protect'
 ```
+
+The command refuses to switch and prints the reason when the service heartbeat is stale, the database quick check fails, a challenge is still active, a deletion job has failed, a pending deletion job no longer matches its sender state, or the review key cannot be read. Resolve the reported condition, then run the command again.
 
 Return to the safe observation mode at any time:
 
@@ -187,7 +189,7 @@ When enabled, Gatekeeper accepts a small owner-only command set in the logged-in
 
 `cases` returns at most five current restrictions as separate case cards. Reply to the intended card with `/gatekeeper allow` within 15 minutes. A successful allowance restores the saved Telegram folder and notification settings when available, marks the sender allowed, cancels pending or failed Gatekeeper deletion jobs, and removes the Active Case evidence. The reply-bound control is single-use and kept only in process memory; a restart, a newer `cases` command, or expiry invalidates it.
 
-Commands are ignored outside Saved Messages, including messages sent to private users or groups. Case cards contain the resolved name or username, restriction state, reason, and age. They do not copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved Messages. Telegram may omit real-time outgoing updates created by another client, so Gatekeeper also checks only Saved Messages newer than its startup cursor every three seconds. Commands are deduplicated across both paths and are never replayed from before the current service start. The fallback history query searches only for `/gatekeeper` matches and does not retrieve unrelated Saved Messages.
+Commands are ignored outside Saved Messages, including messages sent to private users or groups. Case cards contain the resolved name or username, restriction state, reason, and age. They do not copy message text, URLs, encrypted evidence, raw Telegram IDs, or internal sender keys into Saved Messages. Telegram may omit real-time outgoing updates created by another client, so Gatekeeper also checks only Saved Messages newer than its startup cursor every three seconds. Commands are deduplicated across both paths and are never replayed from before the current service start. The three-second fallback query searches only for `/gatekeeper` matches. The separate startup cleanup described below uses a broader bounded search but acts only on exact Gatekeeper command and response templates.
 
 Processed command messages and all responses or case cards generated for them are automatically deleted after 15 minutes, matching the reply-control lifetime. Only their Telegram message IDs, deletion deadlines, and retry counts are stored in the local database; no Saved Messages text is persisted. Cleanup resumes after a restart and Telegram deletion failures use capped exponential backoff. On startup, a seven-day bounded reconciliation searches only `/gatekeeper`, `Gatekeeper`, and `restriction`, then retains only exact outgoing, non-forwarded Gatekeeper command or response templates. This removes artifacts orphaned by older process-local cleanup without deleting general Saved Messages or storing fetched text.
 
@@ -300,7 +302,7 @@ Documentation-only or host-script changes may require only `git pull --ff-only`;
 
 ### Advanced: schema-changing updates
 
-Most updates do not require this procedure. Use it only when release notes explicitly identify a state-database migration.
+Most updates do not require this procedure. Use it only when release notes explicitly identify a state-database migration. The commands and version numbers below describe the current migration to schema 8; adjust them to the release notes for any later migration.
 
 1. Switch to `monitor`.
 2. Confirm `challenged`, `challenge_issuing`, and `challenge_archiving` are all zero.
@@ -450,7 +452,7 @@ Everything is correct when:
 - the state directory is mode `700` and owned by `10001:10001`; and
 - the core socket is mode `600` and owned by `10001:10001`; while the sidecar is active, its socket and access token have the same ownership and mode.
 
-Stop and correct any mismatch before enabling `protect`. The dashboard access token is replaced on every service start.
+Stop and correct any mismatch before enabling `protect`. The dashboard access token is replaced whenever the dashboard sidecar starts and after every login.
 
 ## Stop or remove Gatekeeper
 
