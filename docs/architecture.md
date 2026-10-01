@@ -197,24 +197,30 @@ message is no longer available, the detail page still exposes a resolve-only act
 the local review, erases its reference, and cancels pending or failed Gatekeeper deletion jobs
 without changing sender state.
 
-Protect-mode terminal states have a separate **Active Cases** surface. It lists every current
-quarantine and suppression, independent of evidence availability. The service captures the
+Protect-mode terminal states have a restriction-management surface split into **Needs Attention**
+and **Archived Restrictions**. Quarantines, temporary suppressions, unacknowledged automatic
+permanent suppressions, and restrictions with unfinished deletion work remain in Needs Attention.
+Only confirmed permanent suppressions can be archived, and the underlying suppression remains
+active. The service captures the
 original triggering text/caption, Telegram-provided quote and preview, text-link entities, visible
 URL entities, button text, full URLs, normalized domains, URL shape, evidence-signal breakdown, risk
 score, challenge profile, planned action, decision basis, and policy version before a challenge begins,
 encrypts it with the active-case review key, and exposes it only after the sender becomes quarantined
 or suppressed. A correct answer, challenge rollback, or manual allowance erases the evidence.
-Temporary suppression expiry is reconciled only when that sender next messages; otherwise the
-evidence remains until its own deadline. Other evidence expires after the configured Active Case
-retention, capped at 30 days.
+Temporary suppression expiry is reconciled by the twelve-hour maintenance loop or when that sender
+next messages. Maintenance cancels stale deletion work and clears its control data and snapshot; it
+does not change Telegram folder or mute state. Other evidence expires after the configured Active
+Case retention, capped at 30 days.
 
 Each active restriction separately retains an authenticated encrypted control identity containing
 only Telegram user ID and access hash. It contains no message ID or evidence and remains until the
 restriction is allowed, revoked, or automatically released. Active Cases uses it to resolve the live
 identity and restore saved Telegram folder and notification settings even after evidence expires. A
 permanently suppressed case with no dialog snapshot is moved to the main folder and notifications
-are enabled instead; failure leaves policy state unchanged. Leaving the restriction unchanged records an operator
-decision but does not extend a temporary suppression. A manual numeric-ID recovery form is retained
+are enabled instead; failure leaves policy state unchanged. **Keep and archive** is available only
+for permanent suppression and does not change enforcement. Archived permanent restrictions may be
+unarchived or released and forgotten locally; the latter erases every sender-linked local row and
+does not call Telegram. A manual numeric-ID recovery form is retained
 only for legacy states without a control identity; the ID is HMAC-derived in memory and not stored.
 
 When `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true`, the same restriction-release operation is available

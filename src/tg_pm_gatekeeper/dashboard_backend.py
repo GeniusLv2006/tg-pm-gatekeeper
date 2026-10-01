@@ -10,7 +10,7 @@ import logging
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from telethon import functions, types
 
@@ -71,6 +71,8 @@ class InProcessDashboardBackend:
             "cases.list": self._case_list,
             "cases.detail": self._case_detail,
             "cases.decide": self._case_decide,
+            "cases.forget_preview": self._case_forget_preview,
+            "cases.forget_bulk": self._case_forget_bulk,
             "cases.release_legacy": self._release_legacy,
         }
         handler = handlers.get(method)
@@ -80,10 +82,21 @@ class InProcessDashboardBackend:
 
     async def _overview(self, _params: dict[str, object]) -> dict[str, object]:
         stats = self.store.enforcement_statistics()
+        runtime_stats = self.store.statistics()
         return {
             "mode": self.store.get_mode(),
             "pending_reviews": self.store.pending_review_count(),
             "active_stats": stats,
+            "storage_stats": {
+                key: runtime_stats[key]
+                for key in (
+                    "attention_cases", "archived_restrictions",
+                    "database_page_count", "database_freelist_count",
+                    "database_page_size", "database_logical_bytes",
+                    "database_freelist_percent", "auto_forgotten",
+                    "auto_forget_skipped", "temporary_released",
+                )
+            },
         }
 
     async def _page_version_request(
@@ -185,6 +198,7 @@ class InProcessDashboardBackend:
                         self.store.delete_enforcement_review(item.sender_key)
                         raise DashboardBackendError("telegram_action_failed")
                 self.store.decide_sender_reviews(item.sender_key, "spam")
+                now = int(time.time())
                 suppressed = self.store.suppress(
                     item.sender_key,
                     "manual_permanent_suppression",
@@ -194,7 +208,7 @@ class InProcessDashboardBackend:
                         item.reference
                     ),
                 )
-                now = int(time.time())
+                self.store.archive_restriction(item.sender_key, now)
                 self.store.activate_enforcement_review(
                     item.sender_key,
                     "manual_permanent_suppression",
@@ -218,16 +232,28 @@ class InProcessDashboardBackend:
 
     async def _case_list(self, params: dict[str, object]) -> dict[str, object]:
         page = self._page_param(params)
-        total = self.store.active_restriction_count()
+        archived = params.get("archived", False)
+        if not isinstance(archived, bool):
+            raise DashboardBackendError("invalid_request")
+        reason, older_days = self._archive_filters(params) if archived else (None, None)
+        archived_before = (
+            int(time.time()) - older_days * 86400 if older_days is not None else None
+        )
+        total = self.store.active_restriction_count(
+            archived=archived, reason=reason, archived_before=archived_before
+        )
         self._require_page(page, total)
         items = self.store.active_restrictions(
+            archived=archived, reason=reason, archived_before=archived_before,
             limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE
         )
-        identities = await self._case_identities(items)
+        identities = {} if archived else await self._case_identities(items)
         return {
             "page": page,
             "total": total,
             "stats": self.store.enforcement_statistics(),
+            "reason_filter": reason,
+            "older_days": older_days,
             "items": [self._case_value(item, identities.get(item.sender_key)) for item in items],
         }
 
@@ -279,10 +305,32 @@ class InProcessDashboardBackend:
         action = params.get("action")
         if action == "keep":
             async with self.service.sender_lock(sender_key):
-                if self.store.active_restriction(sender_key) is None:
+                item = self.store.active_restriction(sender_key)
+                if (
+                    item is None or item.status != "suppressed"
+                    or item.suppressed_until is not None
+                    or item.archived_at is not None
+                ):
                     raise DashboardBackendError("case_not_found")
+                self.store.archive_restriction(sender_key)
                 self.store.audit(sender_key, "OPERATOR_KEEP", "kept", int(time.time()))
-            return {"outcome": "kept"}
+            return {"outcome": "archived"}
+        if action == "unarchive":
+            async with self.service.sender_lock(sender_key):
+                if not self.store.unarchive_restriction(sender_key):
+                    raise DashboardBackendError("case_not_archived")
+                self.store.audit(
+                    sender_key, "OPERATOR_UNARCHIVE", "unarchived", int(time.time())
+                )
+            return {"outcome": "unarchived"}
+        if action == "forget":
+            async with self.service.sender_lock(sender_key):
+                if not self.store.forget_restriction(sender_key):
+                    raise DashboardBackendError("case_not_forgettable")
+                self.cancel_timeout(sender_key)
+                self._identity_cache.pop(sender_key, None)
+            LOG.info("archived_restrictions_forgotten:count=1")
+            return {"outcome": "forgotten"}
         if action != "allow":
             raise DashboardBackendError("unknown_action")
         result = await self.restriction_actions.allow(sender_key)
@@ -297,6 +345,30 @@ class InProcessDashboardBackend:
             raise DashboardBackendError("restriction_release_failed")
         self._identity_cache.pop(sender_key, None)
         return {"outcome": "allowed"}
+
+    async def _case_forget_preview(
+        self, params: dict[str, object]
+    ) -> dict[str, object]:
+        days = self._forget_days(params)
+        cutoff = int(time.time()) - days * 86400
+        return {"days": days, "count": self.store.archived_before_count(cutoff)}
+
+    async def _case_forget_bulk(
+        self, params: dict[str, object]
+    ) -> dict[str, object]:
+        days = self._forget_days(params)
+        cutoff = int(time.time()) - days * 86400
+        count = 0
+        for sender_key in self.store.archived_before_keys(cutoff):
+            async with self.service.sender_lock(sender_key):
+                if self.store.forget_restriction(
+                    sender_key, archived_before=cutoff
+                ):
+                    self.cancel_timeout(sender_key)
+                    self._identity_cache.pop(sender_key, None)
+                    count += 1
+        LOG.info("archived_restrictions_forgotten:count=%d", count)
+        return {"outcome": "forgotten", "count": count}
 
     async def _release_legacy(self, params: dict[str, object]) -> dict[str, object]:
         user_id = self._positive_int(params, "user_id", maximum=2**63 - 1)
@@ -332,7 +404,8 @@ class InProcessDashboardBackend:
             payload = (
                 self.store.get_mode(),
                 sorted(self.store.enforcement_statistics(now=now).items()),
-                self.store.active_restriction_count(),
+                self.store.active_restriction_count(archived=False),
+                self.store.active_restriction_count(archived=True),
                 self.store.pending_review_count(now=now),
             )
         elif path == "/review":
@@ -343,13 +416,32 @@ class InProcessDashboardBackend:
                 (item.id, item.updated_at, item.message_count, item.classification, item.signals)
                 for item in self.store.review_items(limit=PAGE_SIZE, offset=offset, now=now)
             ]
-        elif path == "/cases":
-            total = self.store.active_restriction_count()
+        elif path in {"/cases", "/cases/archive"}:
+            archived = path == "/cases/archive"
+            filters = parse_qs(parsed.query)
+            try:
+                filter_params: dict[str, object] = {}
+                if "reason" in filters:
+                    filter_params["reason"] = filters["reason"][0]
+                if "older_days" in filters:
+                    filter_params["older_days"] = int(filters["older_days"][0])
+                reason, older_days = (
+                    self._archive_filters(filter_params) if archived else (None, None)
+                )
+            except (DashboardBackendError, ValueError):
+                return None
+            archived_before = (
+                now - older_days * 86400 if older_days is not None else None
+            )
+            total = self.store.active_restriction_count(
+                archived=archived, reason=reason, archived_before=archived_before
+            )
             if not self._page_exists(page, total):
                 return None
             payload = [
                 self._case_version(item, now)
                 for item in self.store.active_restrictions(
+                    archived=archived, reason=reason, archived_before=archived_before,
                     limit=PAGE_SIZE, offset=offset, now=now
                 )
             ]
@@ -566,6 +658,8 @@ class InProcessDashboardBackend:
             "has_evidence": item.envelope is not None,
             "evidence_created_at": item.evidence_created_at,
             "evidence_expires_at": item.evidence_expires_at,
+            "archived_at": item.archived_at,
+            "has_open_actions": bool(item.has_open_actions),
             "has_identity": item.reference is not None,
             "identity": identity,
         }
@@ -581,6 +675,8 @@ class InProcessDashboardBackend:
             item.envelope is not None,
             item.evidence_expires_at,
             item.reference is not None,
+            item.archived_at,
+            item.has_open_actions,
             item.suppressed_until is not None and item.suppressed_until <= now,
         )
 
@@ -655,6 +751,32 @@ class InProcessDashboardBackend:
     @classmethod
     def _page_param(cls, params: dict[str, object]) -> int:
         return cls._positive_int(params, "page", maximum=100_000)
+
+    @classmethod
+    def _forget_days(cls, params: dict[str, object]) -> int:
+        days = cls._positive_int(params, "days", maximum=365)
+        if days not in {30, 90, 180, 365}:
+            raise DashboardBackendError("invalid_request")
+        return days
+
+    @staticmethod
+    def _archive_filters(
+        params: dict[str, object]
+    ) -> tuple[str | None, int | None]:
+        reason = params.get("reason")
+        if reason is not None:
+            if (
+                not isinstance(reason, str) or not 1 <= len(reason) <= 64
+                or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_" for char in reason)
+            ):
+                raise DashboardBackendError("invalid_request")
+        older_days = params.get("older_days")
+        if older_days is not None:
+            if not isinstance(older_days, int) or isinstance(older_days, bool):
+                raise DashboardBackendError("invalid_request")
+            if older_days not in {30, 90, 180, 365}:
+                raise DashboardBackendError("invalid_request")
+        return reason, older_days
 
     @staticmethod
     def _sender_key(params: dict[str, object]) -> str:

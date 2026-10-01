@@ -43,6 +43,7 @@ def render_config(api_id: int, api_hash: str) -> bytes:
         "TG_AUDIT_RETENTION_DAYS=30\n"
         "TG_PENDING_REVIEW_RETENTION_DAYS=7\n"
         "TG_ACTIVE_CASE_RETENTION_DAYS=30\n"
+        "TG_ARCHIVED_RESTRICTION_RETENTION_DAYS=\n"
         "TG_MUTE_DAYS=3650\n"
         "TG_OUTBOUND_LIMIT_PER_HOUR=10\n"
         "TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR=3\n"

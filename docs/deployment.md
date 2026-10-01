@@ -272,13 +272,22 @@ sender from Telegram.
 If the referenced Telegram message has been deleted, use **Dismiss & cancel jobs**. This
 clears the local review without changing the current sender trust or restriction state.
 
-### Active Cases
+### Active Cases and archived restrictions
 
-The table contains every current quarantine and suppression. A separate encrypted control identity
+**Needs Attention** contains quarantines, temporary suppressions, unacknowledged permanent
+suppressions, and restrictions with pending or failed deletion work. **Archived Restrictions**
+contains confirmed permanent suppressions after their deletion work finishes. Archiving changes only
+the dashboard grouping and does not release the sender. A separate encrypted control identity
 keeps each restriction identifiable and reversible for its full lifetime, even after its evidence
 expires. **Allow sender** restores saved dialog settings when available; cases with no saved settings
-are moved to the main folder and notifications are enabled. **Keep restriction** records that the
-restriction was left unchanged and does not extend a temporary suppression.
+are moved to the main folder and notifications are enabled. **Keep and archive** is available only
+for permanent suppression. Archived items can be returned to Needs Attention.
+
+**Release and forget** is available only for archived permanent restrictions with no pending or
+failed deletion work. It erases all sender-linked local state after confirmation but does not restore,
+move, unmute, or delete the Telegram conversation. A later message is treated as coming from an
+unknown sender. The archive page can preview and apply the same action to eligible items older than
+30, 90, 180, or 365 days.
 
 New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Basis**, and
 **Evidence Signals**, including each signal's source, weight, and explanation. Schema 1 through 4
@@ -289,7 +298,8 @@ Evidence snapshots last at most 30 days. Successful verification, rollback, or m
 removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but
 does not remove the row, identity, or **Allow sender** action. The minimal encrypted control identity is
 removed only when the restriction ends. A temporary suppression is released when that sender next
-messages after expiry; the service does not wake up solely to remove it.
+messages after expiry or by the next twelve-hour maintenance pass. Background release changes only
+local state and does not restore Telegram folder or mute settings.
 
 **Advanced recovery** appears only for restrictions created before control identities were retained and
 which cannot be backfilled from an older encrypted reference. Entering a numeric Telegram User ID
@@ -330,6 +340,36 @@ docker compose logs --tail=100 gatekeeper
 
 Use the dashboard rather than CLI `allow` for active challenges, quarantines, or suppressions because
 the CLI cannot restore their Telegram dialog state.
+
+### Compact the SQLite database offline
+
+The status output reports database pages, free pages, logical bytes, and the free-page percentage.
+SQLite reuses free pages without shrinking the file, so routine `VACUUM` is unnecessary. Consider an
+offline compaction only after substantial forgetting when free pages are material and the host has
+temporary disk space at least comparable to the database size.
+
+First record health and mode, switch to monitor, and stop every writer. Then make a private SQLite
+backup, run an integrity check and `VACUUM` through one-shot service containers, and restart:
+
+```shell
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli healthcheck
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli mode monitor
+docker compose down
+docker compose run --rm --no-deps --entrypoint python gatekeeper -c \
+  'import os, sqlite3; path="/var/lib/tg-pm-gatekeeper/state.pre-vacuum.sqlite3"; assert not os.path.exists(path), "backup already exists"; os.umask(0o077); source=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3"); backup=sqlite3.connect(path); source.backup(backup); backup.close(); source.close()'
+docker compose run --rm --no-deps --entrypoint python gatekeeper -c \
+  'import sqlite3; c=sqlite3.connect("/var/lib/tg-pm-gatekeeper/state.sqlite3"); result=c.execute("PRAGMA integrity_check").fetchone()[0]; print(result); assert result == "ok", "integrity check failed"; c.execute("VACUUM"); c.close()'
+docker compose up -d
+docker compose ps
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli healthcheck
+```
+
+The SQLite backup includes committed WAL content; keep it private and verify it exists before
+compaction. The integrity check must print `ok` or the command stops before `VACUUM`. Do not
+schedule this procedure while the service is running. Remove the private backup only after health,
+mode, and schema checks succeed.
 
 ## Update an existing installation
 
@@ -406,17 +446,18 @@ docker compose logs --tail=100 gatekeeper
 '
 ```
 
-For this migration, the first command must print `7`.
+For this migration, the first command must print `8`.
 
-Schema 7 adds the persistent Saved Messages operator-artifact cleanup queue. It stores only Telegram
-message IDs, deletion deadlines, and retry counts. Schema 6 previously added the recoverable
+Schema 8 adds the nullable restriction archive timestamp and its query index. Existing restrictions
+remain unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup
+queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable
 challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table.
 Existing decision rows and schema 1 through 4 Active Case envelopes remain legacy data; they are not
 recalculated and do not schedule a new action.
 
-Schema 7 is not writable by pre-schema-7 code. A code rollback to an earlier commit therefore also
+Schema 8 is not writable by pre-schema-8 code. A code rollback to an earlier commit therefore also
 requires the pre-migration database. Record the earlier commit before updating. If startup or live
-validation fails, keep the schema 7 database for diagnosis and restore both code and data together:
+validation fails, keep the schema 8 database for diagnosis and restore both code and data together:
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -425,11 +466,11 @@ cd /opt/tg-pm-gatekeeper
 previous_commit=REPLACE_WITH_RECORDED_COMMIT
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 docker compose down
-mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v7.$stamp.sqlite3"
+mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v8.$stamp.sqlite3"
 for suffix in -wal -shm; do
     path="/var/lib/tg-pm-gatekeeper/state.sqlite3$suffix"
     if [ -e "$path" ]; then
-        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v7.$stamp.sqlite3$suffix"
+        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v8.$stamp.sqlite3$suffix"
     fi
 done
 cp --preserve=mode,ownership,timestamps /var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3 /var/lib/tg-pm-gatekeeper/state.sqlite3
@@ -441,7 +482,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 ```
 
-Do not substitute the schema 7 database into an older image or delete the failed database before
+Do not substitute the schema 8 database into an older image or delete the failed database before
 diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt;
 do not merge the incompatible database files.
 
@@ -460,6 +501,7 @@ setting. Changing `/etc/tg-pm-gatekeeper/config.env` requires recreating the con
 | `TG_AUDIT_RETENTION_DAYS` | `30` | Local audit-event retention |
 | `TG_PENDING_REVIEW_RETENTION_DAYS` | `7` | Pending Review retention; 1–7 days |
 | `TG_ACTIVE_CASE_RETENTION_DAYS` | `30` | Active Case snapshot retention; 1–30 days |
+| `TG_ARCHIVED_RESTRICTION_RETENTION_DAYS` | empty | Optional local forgetting of archived permanent restrictions; 30–3650 days |
 | `TG_MUTE_DAYS` | `3650` | Quarantine mute duration |
 | `TG_REVIEW_KEY_FILE` | `/run/secrets/review_key` | Active Case snapshot encryption key |
 | `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED` | `false` | Enable owner commands in Telegram Saved Messages |

@@ -549,6 +549,113 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(item.classification, "would_quarantine")
         self.assertEqual(item.reference, b"second")
 
+    def test_archived_permanent_restrictions_are_partitioned_after_work_finishes(
+        self,
+    ) -> None:
+        state = self.store.suppress(
+            "sender", "manual_permanent_suppression", until=None,
+            reference=b"reference", now=100,
+        )
+        self.assertTrue(self.store.archive_restriction("sender", 110))
+        action_id = self.store.schedule_action(
+            "sender", reason="manual_permanent_suppression", reference=b"reference",
+            execute_at=120, expected_revision=state.revision, now=110,
+        )
+        self.assertEqual(self.store.active_restriction_count(archived=False), 1)
+        self.assertEqual(self.store.active_restriction_count(archived=True), 0)
+
+        self.assertTrue(self.store.finish_action(action_id, "completed", 120))
+        self.assertEqual(self.store.active_restriction_count(archived=False), 0)
+        self.assertEqual(self.store.active_restriction_count(archived=True), 1)
+        item = self.store.active_restrictions(archived=True)[0]
+        self.assertEqual(item.archived_at, 110)
+        self.assertFalse(item.has_open_actions)
+
+    def test_forget_archived_restriction_erases_sender_linked_data(self) -> None:
+        self.store.suppress(
+            "sender", "manual_permanent_suppression", until=None,
+            restriction_reference=b"identity", now=100,
+        )
+        self.store.archive_restriction("sender", 110)
+        self.store.audit("sender", "TEST", "recorded", 100)
+        self.store.save_dialog_snapshot(
+            "sender", DialogSnapshot(folder_id=1, silent=True, mute_until=200)
+        )
+        self.store.observe_campaign("fingerprint", "sender", now=100)
+
+        self.assertTrue(self.store.forget_restriction("sender"))
+        self.assertEqual(self.store.sender("sender").status, "unknown")
+        for table, statement in (
+            ("sender_state", "SELECT COUNT(*) FROM sender_state WHERE sender_key=?"),
+            ("audit", "SELECT COUNT(*) FROM audit WHERE sender_key=?"),
+            (
+                "dialog_snapshots",
+                "SELECT COUNT(*) FROM dialog_snapshots WHERE sender_key=?",
+            ),
+            (
+                "campaign_events",
+                "SELECT COUNT(*) FROM campaign_events WHERE sender_key=?",
+            ),
+        ):
+            count = self.store._connection.execute(
+                statement, ("sender",)
+            ).fetchone()[0]
+            self.assertEqual(count, 0, table)
+
+    def test_prune_releases_expired_temporary_and_forgets_old_archive(self) -> None:
+        self.store.suppress(
+            "temporary", "challenge_timeout", until=200,
+            restriction_reference=b"identity", now=100,
+        )
+        self.store.save_dialog_snapshot(
+            "temporary", DialogSnapshot(folder_id=1, silent=True, mute_until=200)
+        )
+        self.store.suppress("old", "critical_rule", until=None, now=100)
+        self.store.archive_restriction("old", 100)
+        self.store.suppress("new", "critical_rule", until=None, now=100)
+        self.store.archive_restriction("new", 150_000)
+
+        metrics = self.store.prune(
+            30, now=200_000, archived_restriction_retention_days=1
+        )
+
+        self.assertEqual(metrics["temporary_released"], 1)
+        self.assertEqual(metrics["auto_forgotten"], 1)
+        self.assertEqual(self.store.sender("temporary").status, "unknown")
+        self.assertIsNone(self.store.dialog_snapshot("temporary"))
+        self.assertEqual(self.store.sender("old").status, "unknown")
+        self.assertEqual(self.store.sender("new").status, "suppressed")
+        second_connection = StateStore(self.store.path)
+        try:
+            self.assertEqual(second_connection.statistics()["auto_forgotten"], 1)
+            self.assertEqual(second_connection.statistics()["temporary_released"], 1)
+        finally:
+            second_connection.close()
+
+    def test_old_failed_action_blocks_auto_forget_after_audit_retention(self) -> None:
+        state = self.store.suppress("sender", "critical_rule", until=None, now=100)
+        self.store.archive_restriction("sender", 100)
+        action_id = self.store.schedule_action(
+            "sender", reason="critical_rule", reference=b"reference",
+            execute_at=110, expected_revision=state.revision, now=100,
+        )
+        self.store.finish_action(action_id, "failed", 110)
+
+        metrics = self.store.prune(
+            1, now=200_000, archived_restriction_retention_days=1
+        )
+
+        self.assertEqual(metrics["auto_forgotten"], 0)
+        self.assertEqual(metrics["auto_forget_skipped"], 1)
+        self.assertEqual(self.store.sender("sender").status, "suppressed")
+        self.assertEqual(self.store.active_restriction_count(archived=False), 1)
+
+    def test_database_statistics_are_aggregate_and_path_free(self) -> None:
+        statistics = self.store.statistics()
+        self.assertGreater(statistics["database_page_count"], 0)
+        self.assertGreater(statistics["database_page_size"], 0)
+        self.assertNotIn(self.temp.name, str(statistics))
+
 
 class StoreMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -591,7 +698,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.get_mode(), "monitor")
             version = store._connection.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 7)
+            self.assertEqual(version, 8)
             columns = {
                 row[1]
                 for row in store._connection.execute("PRAGMA table_info(sender_state)")
@@ -630,7 +737,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(
                 reopened._connection.execute("PRAGMA user_version").fetchone()[0],
-                7,
+                8,
             )
         finally:
             reopened.close()
@@ -664,7 +771,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(store.sender("sender").status, "allowed")
             self.assertEqual(store.sender("sender").revision, 0)
             self.assertEqual(
-                store._connection.execute("PRAGMA user_version").fetchone()[0], 7
+                store._connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
         finally:
             store.close()
@@ -684,7 +791,7 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
         finally:
             reopened.close()
@@ -708,7 +815,7 @@ class StoreMigrationTests(unittest.TestCase):
             }
             self.assertIn("restriction_reference", columns)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
         finally:
             reopened.close()
@@ -742,7 +849,7 @@ class StoreMigrationTests(unittest.TestCase):
                 reopened.outbound_statistics(now=1001)["outbound_total_1h"], 2
             )
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
         finally:
             reopened.close()
@@ -797,7 +904,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertEqual(legacy_state.suppression_reason, "critical_rule")
             self.assertEqual(reopened.pending_actions(), [])
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
         finally:
             reopened.close()
@@ -817,28 +924,74 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 7
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
             )
             self.assertEqual(reopened.due_operator_artifacts(100), [])
         finally:
             reopened.close()
 
+    def test_v7_database_adds_archive_column_without_archiving_existing_rows(self) -> None:
+        store = StateStore(self.path)
+        store.suppress("sender", "critical_rule", until=None, now=100)
+        store._connection.execute("DROP INDEX sender_state_archive_idx")
+        store._connection.execute("ALTER TABLE sender_state DROP COLUMN archived_at")
+        store._connection.execute("PRAGMA user_version=7")
+        store.close()
+
+        reopened = StateStore(self.path)
+        try:
+            columns = {
+                row["name"]
+                for row in reopened._connection.execute(
+                    "PRAGMA table_info(sender_state)"
+                )
+            }
+            self.assertIn("archived_at", columns)
+            self.assertIsNone(reopened.active_restriction("sender").archived_at)
+            self.assertEqual(
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
+            )
+        finally:
+            reopened.close()
+
+    def test_v7_archive_migration_rolls_back_on_index_conflict(self) -> None:
+        store = StateStore(self.path)
+        store._connection.execute("DROP INDEX sender_state_archive_idx")
+        store._connection.execute("ALTER TABLE sender_state DROP COLUMN archived_at")
+        store._connection.execute(
+            "CREATE TABLE sender_state_archive_idx (collision INTEGER)"
+        )
+        store._connection.execute("PRAGMA user_version=7")
+        store.close()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            StateStore(self.path)
+        connection = sqlite3.connect(self.path)
+        try:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(sender_state)")
+            }
+            self.assertNotIn("archived_at", columns)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 7)
+        finally:
+            connection.close()
+
     def test_newer_schema_is_refused_without_mutation(self) -> None:
         store = StateStore(self.path)
         store.close()
         connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA user_version=8")
+        connection.execute("PRAGMA user_version=9")
         connection.close()
 
         with self.assertRaisesRegex(
-            StoreMigrationError, "unsupported database schema version: 8"
+            StoreMigrationError, "unsupported database schema version: 9"
         ):
             StateStore(self.path)
 
         connection = sqlite3.connect(self.path)
         try:
             self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0], 8
+                connection.execute("PRAGMA user_version").fetchone()[0], 9
             )
         finally:
             connection.close()

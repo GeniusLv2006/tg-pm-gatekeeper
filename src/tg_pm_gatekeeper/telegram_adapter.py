@@ -9,6 +9,7 @@ import os
 import time
 import unicodedata
 from collections import OrderedDict
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -451,6 +452,7 @@ class TelegramAdapter:
             schedule_dialog_deletion=self.schedule_dialog_deletion,
             restriction_actions=self._restriction_actions,
         )
+        self._dashboard_backend = dashboard_backend
         self._dashboard_rpc = DashboardRpcServer(
             settings.dashboard_rpc_socket_path, dashboard_backend
         )
@@ -517,7 +519,35 @@ class TelegramAdapter:
             self.store.heartbeat(now)
             write_runtime_heartbeat(HEARTBEAT_PATH, now)
             if now >= next_prune:
-                self.store.prune(self.settings.audit_retention_days, now)
+                sender_keys = self.store.maintenance_sender_keys(
+                    now, self.settings.archived_restriction_retention_days
+                )
+                async with AsyncExitStack() as lock_stack:
+                    for sender_key in sender_keys:
+                        await lock_stack.enter_async_context(
+                            self.service.sender_lock(sender_key)
+                        )
+                    maintenance = self.store.prune(
+                        self.settings.audit_retention_days,
+                        now,
+                        archived_restriction_retention_days=(
+                            self.settings.archived_restriction_retention_days
+                        ),
+                        lifecycle_sender_keys=sender_keys,
+                    )
+                    for sender_key in sender_keys:
+                        if self.store.active_restriction(sender_key, now=now) is None:
+                            self.cancel_timeout(sender_key)
+                            self._dashboard_backend._identity_cache.pop(
+                                sender_key, None
+                            )
+                LOG.info(
+                    "maintenance_complete:auto_forgotten=%d:"
+                    "auto_forget_skipped=%d:temporary_released=%d",
+                    maintenance["auto_forgotten"],
+                    maintenance["auto_forget_skipped"],
+                    maintenance["temporary_released"],
+                )
                 next_prune = now + PRUNE_INTERVAL_SECONDS
             if time.monotonic() >= self._next_metrics_at:
                 self._log_runtime_metrics()

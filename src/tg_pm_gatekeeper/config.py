@@ -68,6 +68,13 @@ def _optional_positive_int(name: str) -> int | None:
     return value
 
 
+def _optional_bounded_int(name: str, minimum: int, maximum: int) -> int | None:
+    value = _optional_positive_int(name)
+    if value is not None and not minimum <= value <= maximum:
+        raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 def _boolean(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, "true" if default else "false").strip().casefold()
     if raw == "true":
@@ -112,6 +119,7 @@ class Settings:
     audit_retention_days: int
     pending_review_retention_days: int
     active_case_retention_days: int
+    archived_restriction_retention_days: int | None
     dashboard_rpc_socket_path: Path
     mute_days: int
     outbound_limit_per_hour: int
@@ -156,6 +164,9 @@ class Settings:
             ),
             active_case_retention_days=_bounded_int(
                 "TG_ACTIVE_CASE_RETENTION_DAYS", 30, 1, 30
+            ),
+            archived_restriction_retention_days=_optional_bounded_int(
+                "TG_ARCHIVED_RESTRICTION_RETENTION_DAYS", 30, 3650
             ),
             dashboard_rpc_socket_path=Path(
                 os.environ.get(

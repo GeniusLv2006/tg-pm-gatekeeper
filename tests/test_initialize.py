@@ -29,6 +29,7 @@ class InitializeTests(unittest.TestCase):
         self.assertIn("TG_REVIEW_KEY_FILE=/run/secrets/review_key", config)
         self.assertIn("TG_PENDING_REVIEW_RETENTION_DAYS=7", config)
         self.assertIn("TG_ACTIVE_CASE_RETENTION_DAYS=30", config)
+        self.assertIn("TG_ARCHIVED_RESTRICTION_RETENTION_DAYS=\n", config)
         self.assertIn("TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR=3", config)
         self.assertIn("TG_OUTBOUND_NOTICE_LIMIT_PER_SENDER_PER_HOUR=3", config)
         self.assertIn("TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false", config)
@@ -102,12 +103,29 @@ class InitializeTests(unittest.TestCase):
         for name, value, expected in (
             ("TG_PENDING_REVIEW_RETENTION_DAYS", "8", "between 1 and 7"),
             ("TG_ACTIVE_CASE_RETENTION_DAYS", "31", "between 1 and 30"),
+            (
+                "TG_ARCHIVED_RESTRICTION_RETENTION_DAYS",
+                "29",
+                "between 30 and 3650",
+            ),
+            (
+                "TG_ARCHIVED_RESTRICTION_RETENTION_DAYS",
+                "3651",
+                "between 30 and 3650",
+            ),
         ):
             with self.subTest(name=name), patch.dict(
                 os.environ, {name: value}, clear=True
             ):
                 with self.assertRaisesRegex(ConfigurationError, expected):
                     Settings.from_environment(require_telegram=False)
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(
+                Settings.from_environment(
+                    require_telegram=False
+                ).archived_restriction_retention_days
+            )
 
     def test_outbound_reserve_configuration_uses_limit_aware_bounds(self) -> None:
         with patch.dict(
