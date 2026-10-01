@@ -193,7 +193,7 @@ Commands are ignored outside Saved Messages, including messages sent to private 
 
 Processed command messages and all responses or case cards generated for them are automatically deleted after 15 minutes, matching the reply-control lifetime. Only their Telegram message IDs, deletion deadlines, and retry counts are stored in the local database; no Saved Messages text is persisted. Cleanup resumes after a restart and Telegram deletion failures use capped exponential backoff. On startup, a seven-day bounded reconciliation searches only `/gatekeeper`, `Gatekeeper`, and `restriction`, then retains only exact outgoing, non-forwarded Gatekeeper command or response templates. This removes artifacts orphaned by older process-local cleanup without deleting general Saved Messages or storing fetched text.
 
-Legacy restrictions without an encrypted control identity cannot be released this way. Use the dashboard's collapsed **Advanced Recovery** path for those cases. Pending Review decisions and detailed evidence inspection also remain dashboard-only.
+Restrictions without an encrypted control identity cannot be released this way. Use the dashboard's collapsed **Advanced Recovery** path for those cases. Pending Review decisions and detailed evidence inspection also remain dashboard-only.
 
 Set `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false` and recreate the service to disable command handling. Disabled deployments do not register the outgoing Telegram event handler.
 
@@ -217,7 +217,7 @@ New `adaptive-v2` cases show **Risk Score**, **Policy Decision**, **Decision Bas
 
 Evidence snapshots last at most 30 days. Successful verification, rollback, or manual allowance removes them sooner. Evidence expiry changes the detail page to an explicit unavailable state but does not remove the row, identity, or **Allow Sender** action. The minimal encrypted control identity is removed only when the restriction ends. A temporary suppression is released when that sender next messages after expiry or by the next twelve-hour maintenance pass. Background release changes only local state and does not restore Telegram folder or mute settings.
 
-**Advanced Recovery** appears only for restrictions created before control identities were retained and which cannot be backfilled from an older encrypted reference. Entering a numeric Telegram User ID HMAC-derives the existing sender key without storing the ID. A matching quarantine or suppression is allowed and pending deletion jobs are cancelled, but Telegram settings cannot be restored without a control identity.
+**Advanced Recovery** appears only for restrictions without a control identity that cannot be backfilled from an encrypted review reference. This affects restrictions created before control identities were retained and the rare cases where Gatekeeper could not keep a Telegram reference, such as an unavailable or invalid message reference. Entering a numeric Telegram User ID HMAC-derives the existing sender key without storing the ID. A matching quarantine or suppression is allowed and pending deletion jobs are cancelled, but Telegram settings cannot be restored without a control identity.
 
 ### Tunnel options
 
@@ -426,7 +426,7 @@ This account runs the real arithmetic and cleanup flow even in `monitor`, bypass
 | Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
 | Dashboard says the message is unavailable | The Telegram message may have been deleted; use **Dismiss & Cancel Jobs** if the sender decision no longer needs the message. |
 | Active Case says evidence is unavailable | The evidence retention window ended; the restriction remains listed and **Allow Sender** still uses its encrypted control identity. |
-| Active Case says identity is unavailable | Open **Advanced Recovery** and enter the numeric Telegram User ID; only pre-control-identity states should need this. |
+| Active Case says identity is unavailable | Open **Advanced Recovery** and enter the numeric Telegram User ID; only restrictions without a control identity should need this. |
 | Mode is still `monitor` after an update | This is expected; mode is stored in the database. Switch explicitly only after checking status. |
 
 If the problem involves a sender action, preserve the current status and logs before changing policy or deleting local state.

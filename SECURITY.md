@@ -56,7 +56,7 @@ This section documents guarantees that contributors must preserve. For the full 
 - The control identity uses keys domain-separated from message-review references. It remains only while the restriction remains active and is erased on allowance, release-and-forget, or temporary suppression release. Evidence expiry does not erase this operator control path.
 - Archiving is a presentation decision and does not weaken suppression. Release-and-forget erases all locally retained rows linked to that derived sender key without calling Telegram; a later message is therefore evaluated as a new unknown sender. Per-sender cleanup is not logged with an identifier.
 - Optional automatic forgetting applies only to archived permanent suppressions, is disabled by default, and skips restrictions with pending or failed deletion work.
-- The owner may enter a raw Telegram user ID only to recover a legacy restriction without a control identity. The value is HMAC-derived in memory, is not persisted, and is accepted only when it matches an existing quarantined or suppressed sender state.
+- The owner may enter a raw Telegram user ID only to recover a restriction without a control identity. The value is HMAC-derived in memory, is not persisted, and is accepted only when it matches an existing quarantined or suppressed sender state.
 
 ### Encrypted review content
 

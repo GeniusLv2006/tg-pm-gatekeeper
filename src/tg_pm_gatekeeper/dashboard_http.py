@@ -970,8 +970,8 @@ class DashboardHttpServer:
             else "Every active restriction currently has reviewable evidence."
         )
         identity_note = (
-            f" {stats['unidentified']} legacy restriction"
-            f"{'s' if stats['unidentified'] != 1 else ''} still require"
+            f" {stats['unidentified']} restriction"
+            f"{'s' if stats['unidentified'] != 1 else ''} without a control identity require"
             f"{'s' if stats['unidentified'] == 1 else ''} manual ID recovery."
             if stats["unidentified"]
             else " Every active restriction has a retained encrypted control identity."
@@ -980,11 +980,12 @@ class DashboardHttpServer:
         if stats["unidentified"]:
             recovery = (
                 "<details class='advanced-recovery'><summary>Advanced Recovery"
-                f" <span>{stats['unidentified']} legacy</span></summary><div class='advanced-recovery-content'>"
-                "<p class='eyebrow'>Legacy Recovery</p>"
+                f" <span>{stats['unidentified']} unidentified</span></summary><div class='advanced-recovery-content'>"
+                "<p class='eyebrow'>Manual Recovery</p>"
                 "<h2>Allow an Unidentified Restricted Sender by Telegram User ID</h2>"
-                "<p>Use this only for a legacy restriction created before encrypted control "
-                "identities were retained. This removes the Gatekeeper restriction and cancels "
+                "<p>Use this only for a restriction without an encrypted control identity, such as "
+                "one created before control identities were retained or when Gatekeeper could "
+                "not keep a Telegram reference. This removes the Gatekeeper restriction and cancels "
                 "pending deletion jobs, but cannot restore saved Telegram folder or notification "
                 "state without a peer reference. The entered ID is used only to derive the "
                 "existing sender key and is not stored.</p>"
