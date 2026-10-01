@@ -75,7 +75,7 @@ This section documents guarantees that contributors must preserve. For the full 
 - Message handling, challenge timeout, recovery, and review transitions are serialized per derived sender identifier.
 - Exhausting the outbound-message limit must not bypass screening.
 - Whole-dialog deletion is represented by a persistent action tied to an expected sender-state revision. Normal deletion jobs run only in `protect`; switching to `monitor` cancels them.
-- `TG_TEST_SENDER_ID` cleanup and an explicit dashboard Spam decision are the only mode-independent deletion paths. Never assign a real correspondent to the test setting; the dashboard action must remain visibly destructive and CSRF-protected.
+- `TG_TEST_SENDER_ID` cleanup and an explicit dashboard **Suppress and Delete** decision are the only mode-independent dialog-deletion paths. Never assign a real correspondent to the test setting; the dashboard action must remain visibly destructive and CSRF-protected.
 - The application must not expose a listening TCP port or mount the Docker socket.
 
 ## Supported versions

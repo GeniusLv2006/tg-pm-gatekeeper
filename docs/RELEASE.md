@@ -29,7 +29,7 @@ A maintainer may commit directly to `main` only when every changed file is limit
 - comments, formatting, spelling, or repository metadata; or
 - `.gitignore` entries that do not hide source, configuration examples, or audit evidence.
 
-Review the complete diff and use a Conventional Commit. After pushing, confirm the `test` and `secrets` GitHub Actions jobs pass before related work continues.
+Review the complete diff and use a Conventional Commit. After pushing, confirm the `test`, `quality`, `dependencies`, and `secrets` GitHub Actions jobs pass before related work continues.
 
 ### Pull requests required
 
@@ -55,11 +55,13 @@ For runtime, configuration, test, executable, Docker, or dependency changes:
 ```shell
 PYTHONPATH=src .venv/bin/python -m unittest discover -v
 PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
+.venv/bin/ruff check src tests scripts
+shellcheck scripts/*.sh deploy/*.sh
 docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
 
-Add checks specific to the changed executable or workflow. Test data must not contain real Telegram identities, messages, credentials, URLs, databases, or logs.
+Install `requirements-quality.txt` as described in [CONTRIBUTING.md](../CONTRIBUTING.md) before running Ruff. Add checks specific to the changed executable or workflow. Test data must not contain real Telegram identities, messages, credentials, URLs, databases, or logs.
 
 ## Publish
 
@@ -68,7 +70,7 @@ Add checks specific to the changed executable or workflow. Test data must not co
 1. Confirm the worktree contains only eligible low-risk changes.
 2. Commit on `main` with a Conventional Commit.
 3. Push `main` over SSH.
-4. Confirm both GitHub Actions jobs pass.
+4. Confirm all GitHub Actions jobs pass.
 
 ### Pull-request path
 

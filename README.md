@@ -89,7 +89,7 @@ scripts/dashboard-tunnel.sh root@server.example
 
 The one-time login creates a browser-bound session protected by both a random, process-local capability path and a path-scoped HttpOnly cookie. Copying the resulting address into another browser does not transfer access. A new login or **Sign Out** immediately invalidates the previous session; sessions also expire after 30 minutes without a dashboard request or eight hours in total. The sidecar itself exits after 10 minutes without authenticated activity. Signing out or closing the tunnel helper stops it immediately without interrupting the Telegram core.
 
-It has two main areas:
+It has three main areas:
 
 - **Active Cases · Needs Attention**: review quarantines, temporary suppressions, automatic permanent suppressions, and restrictions with unfinished deletion work;
 - **Archived Restrictions**: retain confirmed permanent policy decisions outside the working queue; encrypted control identities remain available while evidence is retained for up to 30 days;
@@ -97,11 +97,11 @@ It has two main areas:
 
 All lists are ordered by most recent activity and paginated at 50 rows per page.
 
-Archiving changes only dashboard organization and never releases a sender. Confirmed manual spam is archived after its deletion job finishes; automatic permanent suppression remains in Needs Attention until **Keep and archive** is selected. Archived permanent restrictions can be moved back or released and forgotten after an explicit confirmation. Forgetting is local-only: Telegram folder, mute, and conversation state are not changed, and a future message is treated as coming from an unknown sender. Optional age-based automatic forgetting is disabled by default.
+Archiving changes only dashboard organization and never releases a sender. Confirmed manual spam is archived after its deletion job finishes; automatic permanent suppression remains in Needs Attention until **Keep and Archive** is selected. Archived permanent restrictions can be moved back or released and forgotten after an explicit confirmation. Forgetting is local-only: Telegram folder, mute, and conversation state are not changed, and a future message is treated as coming from an unknown sender. Optional age-based automatic forgetting is disabled by default.
 
 When `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=true`, a quick recovery is available without opening the dashboard: send `/gatekeeper cases` in Telegram Saved Messages. Gatekeeper returns up to five current restrictions. Reply to the intended case card with `/gatekeeper allow` within 15 minutes to restore the dialog, allow the sender, and cancel pending Gatekeeper deletion jobs. The optional commands are accepted only from the logged-in account in its own Saved Messages; case cards contain identity and restriction metadata, not retained message evidence. Responses can take a few seconds when Telegram does not deliver another device's outgoing-message update in real time. Gatekeeper automatically deletes processed commands and all replies or case cards they create after 15 minutes. Cleanup is persisted and resumes after a service restart; Telegram deletion failures are retried automatically.
 
-One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one referenced Telegram message. **Allow sender** allows the sender, **Suppress and delete** records an explicit owner decision and schedules deletion, and **Dismiss & cancel jobs** closes the review and cancels pending Gatekeeper deletion jobs without changing the current trust decision.
+One Pending Reviews row represents one sender, not a conversation history. Opening a row fetches one referenced Telegram message. **Allow Sender** allows the sender, **Suppress and Delete** records an explicit owner decision and schedules deletion, and **Dismiss & Cancel Jobs** closes the review and cancels pending Gatekeeper deletion jobs without changing the current trust decision.
 
 See [Dashboard and daily operation](docs/deployment.md#dashboard-and-daily-operation) for the detailed behavior and tunnel options.
 
@@ -138,7 +138,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli allow USER_ID
 docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli revoke USER_ID
 ```
 
-Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use **Allow sender** in the dashboard instead. If Active Case evidence has expired, the restriction remains listed and **Allow sender** continues to work through a separate encrypted control identity. A manual User ID form remains only for legacy restrictions that predate that identity record. The entered ID is used only to derive the existing sender key and is not stored. A raw user ID supplied on the command line may remain in shell history.
+Returning to `monitor` cancels automatically generated pending destructive jobs. Explicit manual spam decisions and dedicated-test cleanup remain mode-independent. The CLI refuses `allow` for active challenges, quarantines, and suppressions because it cannot safely restore the Telegram dialog; use **Allow Sender** in the dashboard instead. If Active Case evidence has expired, the restriction remains listed and **Allow Sender** continues to work through a separate encrypted control identity. A manual User ID form remains only for legacy restrictions that predate that identity record. The entered ID is used only to derive the existing sender key and is not stored. A raw user ID supplied on the command line may remain in shell history.
 
 ## Optional features
 
@@ -162,14 +162,19 @@ Returning to `monitor` cancels automatically generated pending destructive jobs.
 
 ## Local validation
 
-Maintainers and contributors can run the same checks used by CI:
+Maintainers and contributors can run the local equivalents of the CI test and quality jobs:
 
 ```shell
 PYTHONPATH=src .venv/bin/python -m unittest discover -v
 PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
+.venv/bin/python -m pip install --require-hashes --no-deps -r requirements-quality.txt
+.venv/bin/ruff check src tests scripts
+shellcheck scripts/*.sh deploy/*.sh
 docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
+
+CI additionally audits pinned runtime and build dependencies and scans the Git history for secrets. `git diff --check` is a local check only.
 
 Runtime dependencies and the Python image are pinned. The container runs as UID/GID `10001`, uses a read-only root filesystem, drops all capabilities, and exposes no network port.
 
