@@ -822,7 +822,7 @@ class TelegramAdapter:
             "✅ Restriction removed. The sender is now allowed and pending "
             "Gatekeeper deletion jobs were cancelled.",
             "ℹ️ This restriction was already resolved. No action was taken.",
-            "⚠️ Telegram identity is unavailable. Use Dashboard legacy recovery.",
+            "⚠️ Telegram identity is unavailable. Use Advanced Recovery in the Dashboard.",
             "❌ Telegram restore failed. The restriction was left unchanged.",
         }:
             return True
@@ -845,7 +845,7 @@ class TelegramAdapter:
             in {
                 "Reply to this message with /gatekeeper allow\n"
                 "This control is single-use and expires in 15 minutes.",
-                "Telegram identity is unavailable. Use Dashboard legacy recovery.",
+                "Telegram identity is unavailable. Use Advanced Recovery in the Dashboard.",
             }
         )
 
@@ -873,7 +873,7 @@ class TelegramAdapter:
                 "Reply to this message with /gatekeeper allow\n"
                 "This control is single-use and expires in 15 minutes."
                 if actionable
-                else "Telegram identity is unavailable. Use Dashboard legacy recovery."
+                else "Telegram identity is unavailable. Use Advanced Recovery in the Dashboard."
             )
             message = await self._operator_respond(
                 event,
@@ -922,7 +922,7 @@ class TelegramAdapter:
                 "ℹ️ This restriction was already resolved. No action was taken."
             ),
             RestrictionReleaseResult.IDENTITY_UNAVAILABLE: (
-                "⚠️ Telegram identity is unavailable. Use Dashboard legacy recovery."
+                "⚠️ Telegram identity is unavailable. Use Advanced Recovery in the Dashboard."
             ),
             RestrictionReleaseResult.TELEGRAM_ACTION_FAILED: (
                 "❌ Telegram restore failed. The restriction was left unchanged."

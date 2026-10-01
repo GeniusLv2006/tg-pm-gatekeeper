@@ -1247,6 +1247,10 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"1 restriction has no reviewable evidence", page)
         self.assertIn(b"Identity Unavailable", page)
         self.assertIn(b"Unavailable", page)
+        self.assertIn(
+            b"1 restriction without a control identity requires manual ID recovery.",
+            page,
+        )
         self.assertIn(b"<details class='advanced-recovery'>", page)
         self.assertNotIn(b"<details class='advanced-recovery' open", page)
         self.assertIn(b"Allow an Unidentified Restricted Sender by Telegram User ID", page)
