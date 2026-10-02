@@ -26,7 +26,6 @@ jobs:
       - run: python -m pip install --require-hashes --no-deps --no-build-isolation -r requirements.txt
       - run: PYTHONPATH=src python -m unittest discover -v
       - run: python -m compileall -q src tests scripts
-      - run: docker build --tag tg-pm-gatekeeper:test .
 
   quality:
     if: github.event_name != 'schedule'
@@ -64,6 +63,19 @@ jobs:
           require-hashes: true
           no-deps: true
           vulnerability-service: osv
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - run: docker build --tag tg-pm-gatekeeper:test .
+      - name: Scan image for fixable high-severity vulnerabilities
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: tg-pm-gatekeeper:test
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
 
   secrets:
     if: github.event_name != 'schedule'
