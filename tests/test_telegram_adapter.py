@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import tempfile
 import time
 import unittest
@@ -17,6 +18,7 @@ from telethon.sessions import StringSession
 
 from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
+from tg_pm_gatekeeper.message_facts import LINK_BUTTON_TYPES
 from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
@@ -119,10 +121,14 @@ class TelegramAdapterTests(unittest.TestCase):
         self.assertIn("t.me/spam", facts.urls)
 
     def test_url_button_is_detected_structurally(self) -> None:
-        markup = SimpleNamespace(
+        markup = types.ReplyInlineMarkup(
             rows=[
-                SimpleNamespace(
-                    buttons=[types.KeyboardButtonUrl("open", "https://bad.invalid")]
+                types.KeyboardInlineButtonRow(
+                    buttons=[
+                        types.KeyboardInlineButton(
+                            "open", types.InlineButtonTypeUrl("https://bad.invalid")
+                        )
+                    ]
                 )
             ]
         )
@@ -130,6 +136,69 @@ class TelegramAdapterTests(unittest.TestCase):
         self.assertTrue(facts.has_link_button)
         self.assertEqual(facts.link_button_count, 1)
         self.assertIn("bad.invalid", facts.domains)
+        self.assertEqual(facts.button_urls, ("https://bad.invalid",))
+
+    def test_every_link_button_type_is_detected(self) -> None:
+        inline = types.ReplyInlineMarkup(
+            rows=[
+                types.KeyboardInlineButtonRow(
+                    buttons=[
+                        types.KeyboardInlineButton(
+                            "url", types.InlineButtonTypeUrl("https://url.invalid")
+                        ),
+                        types.KeyboardInlineButton(
+                            "auth",
+                            types.InlineButtonTypeUrlAuth(
+                                "https://auth.invalid", button_id=1
+                            ),
+                        ),
+                        types.KeyboardInlineButton(
+                            "app", types.InlineButtonTypeWebView("https://app.invalid")
+                        ),
+                        types.KeyboardInlineButton(
+                            "callback", types.InlineButtonTypeCallback(b"data")
+                        ),
+                    ]
+                )
+            ]
+        )
+        facts = facts_from_message(self.message(reply_markup=inline))
+        self.assertTrue(facts.has_any_button)
+        self.assertEqual(facts.link_button_count, 3)
+        self.assertEqual(
+            set(facts.domains), {"url.invalid", "auth.invalid", "app.invalid"}
+        )
+        self.assertEqual(
+            set(facts.button_texts), {"url", "auth", "app", "callback"}
+        )
+
+        keyboard = types.ReplyKeyboardMarkup(
+            rows=[
+                types.KeyboardButtonRow(
+                    buttons=[
+                        types.KeyboardButton(
+                            "web", types.ButtonTypeSimpleWebView("https://web.invalid")
+                        ),
+                        types.KeyboardButton("plain", types.ButtonTypeDefault()),
+                    ]
+                )
+            ]
+        )
+        facts = facts_from_message(self.message(reply_markup=keyboard))
+        self.assertEqual(facts.link_button_count, 1)
+        self.assertEqual(facts.domains, ("web.invalid",))
+
+    def test_link_button_types_cover_every_telethon_url_button(self) -> None:
+        # A new Telegram layer must not add a URL-carrying button that screening ignores.
+        url_button_types = {
+            value
+            for name, value in vars(types).items()
+            if (name.startswith("InlineButtonType") or name.startswith("ButtonType"))
+            and isinstance(value, type)
+            and "url" in inspect.signature(value.__init__).parameters
+        }
+        self.assertTrue(url_button_types)
+        self.assertEqual(url_button_types, set(LINK_BUTTON_TYPES))
 
     def test_webpage_preview_text_and_url_are_extracted(self) -> None:
         webpage = SimpleNamespace(
