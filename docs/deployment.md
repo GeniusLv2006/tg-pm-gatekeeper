@@ -36,15 +36,16 @@ python3 -m venv .venv
 .venv/bin/python scripts/initialize.py
 ```
 
-The initializer signs in to Telegram and creates five files:
+The initializer signs in to Telegram and creates six files:
 
+- `telegram.api-hash.secret`: the Telegram application API hash;
 - `telegram.session.secret`: authorization for the Telegram account;
 - `hmac.key`: protects local sender identifiers, review references, and restriction control identities;
 - `review.key`: encrypts Active Case snapshots;
-- `config.env`: the service configuration; and
+- `config.env`: the service configuration, including the API ID but not the API hash; and
 - `deny-domains.txt`: your optional local domain denylist.
 
-The files start with owner-only permissions, and the initializer refuses to overwrite them. Transfer them only to the intended server over a trusted channel. The review key encrypts Active Case snapshots and must remain separate from the HMAC key. See [deny-domains.example.txt](../deny-domains.example.txt) for the denylist format.
+The files start with owner-only permissions, and the initializer refuses to overwrite them. Transfer them only to the intended server over a trusted channel. The review key encrypts Active Case snapshots and must remain separate from the HMAC key. The API hash is mounted as a file rather than passed through `config.env`, so anything that can inspect containers through the Docker API, such as a read-only monitoring socket proxy, sees only its path. See [deny-domains.example.txt](../deny-domains.example.txt) for the denylist format.
 
 ### 2. Prepare the server
 
@@ -62,7 +63,7 @@ The bootstrap script creates a non-login service user with UID/GID `10001`. It d
 Copy the generated files to a temporary root-only location:
 
 ```shell
-scp telegram.session.secret hmac.key review.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
+scp telegram.api-hash.secret telegram.session.secret hmac.key review.key config.env deny-domains.txt "$DEPLOY_HOST":/tmp/
 ```
 
 Install them with the ownership expected by Compose, then remove the temporary copies:
@@ -70,12 +71,13 @@ Install them with the ownership expected by Compose, then remove the temporary c
 ```shell
 ssh "$DEPLOY_HOST" '
 set -eu
+install -o 10001 -g 10001 -m 0600 /tmp/telegram.api-hash.secret /etc/tg-pm-gatekeeper/telegram.api-hash.secret
 install -o 10001 -g 10001 -m 0600 /tmp/telegram.session.secret /etc/tg-pm-gatekeeper/telegram.session.secret
 install -o 10001 -g 10001 -m 0600 /tmp/hmac.key /etc/tg-pm-gatekeeper/hmac.key
 install -o 10001 -g 10001 -m 0600 /tmp/review.key /etc/tg-pm-gatekeeper/review.key
 install -o root -g 10001 -m 0640 /tmp/config.env /etc/tg-pm-gatekeeper/config.env
 install -o root -g 10001 -m 0640 /tmp/deny-domains.txt /etc/tg-pm-gatekeeper/deny-domains.txt
-rm -f /tmp/telegram.session.secret /tmp/hmac.key /tmp/review.key /tmp/config.env /tmp/deny-domains.txt
+rm -f /tmp/telegram.api-hash.secret /tmp/telegram.session.secret /tmp/hmac.key /tmp/review.key /tmp/config.env /tmp/deny-domains.txt
 '
 ```
 
@@ -300,6 +302,34 @@ Check the logs after the update. The mode stored in the existing database is pre
 
 Documentation-only or host-script changes may require only `git pull --ff-only`; do not restart a healthy container unless runtime, configuration, Docker, or dependency inputs changed. Project maintainers can use [RELEASE.md](RELEASE.md) for the exact classification.
 
+### One-time update: move the API hash out of `config.env`
+
+Installations created before the API hash moved to a private file still have a `TG_API_HASH=` line in `config.env`. The updated service refuses to start while that variable is present, and it needs the new file before Compose creates the container; otherwise Docker would create a directory at the missing mount path. Run this once, in this order, when updating past that change:
+
+```shell
+ssh "$DEPLOY_HOST" '
+set -eu
+cd /etc/tg-pm-gatekeeper
+test ! -e telegram.api-hash.secret
+umask 077
+sed -n "s/^TG_API_HASH=//p" config.env > telegram.api-hash.secret.new
+test "$(wc -l < telegram.api-hash.secret.new)" -eq 1
+grep -Eqx "[0-9A-Fa-f]{32}" telegram.api-hash.secret.new
+chown 10001:10001 telegram.api-hash.secret.new
+chmod 0600 telegram.api-hash.secret.new
+mv telegram.api-hash.secret.new telegram.api-hash.secret
+sed -i "/^TG_API_HASH=/d" config.env
+cd /opt/tg-pm-gatekeeper
+git pull --ff-only origin main
+git rev-parse HEAD
+docker compose up -d --build
+docker compose ps
+docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
+'
+```
+
+The commands stop without changing `config.env` if the file already exists or the extracted value is not exactly one 32-character hexadecimal hash; in that case, remove any `telegram.api-hash.secret.new` file and correct the cause before retrying. The running container keeps its existing environment until it is recreated. Then confirm that `docker inspect tg-gatekeeper --format "{{json .Config.Env}}"` no longer contains `TG_API_HASH=` and that the new file appears in the security checks below. To roll back to a version from before this change, restore the `TG_API_HASH=` line in `config.env` before recreating the container.
+
 ### Advanced: schema-changing updates
 
 Most updates do not require this procedure. Use it only when release notes explicitly identify a state-database migration. The commands and version numbers below describe the current migration to schema 8; adjust them to the release notes for any later migration.
@@ -393,6 +423,7 @@ Once the operator explicitly closes the rollback window, confirm current health 
 | `TG_ACTIVE_CASE_RETENTION_DAYS` | `30` | Active Case snapshot retention; 1–30 days |
 | `TG_ARCHIVED_RESTRICTION_RETENTION_DAYS` | empty | Optional local forgetting of archived permanent restrictions; 30–3650 days |
 | `TG_MUTE_DAYS` | `3650` | Quarantine mute duration |
+| `TG_API_HASH_FILE` | `/run/secrets/telegram_api_hash` | Telegram API hash; `TG_API_HASH` is rejected |
 | `TG_REVIEW_KEY_FILE` | `/run/secrets/review_key` | Active Case snapshot encryption key |
 | `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED` | `false` | Enable owner commands in Telegram Saved Messages |
 | `TG_TEST_SENDER_ID` | empty | Dedicated arithmetic-flow test account |
@@ -417,8 +448,8 @@ This account runs the real arithmetic and cleanup flow even in `monitor`, bypass
 | --- | --- |
 | `docker compose` is not found | Install Docker Engine and the Compose plugin; the legacy `docker-compose` command is not used. |
 | Container stays unhealthy | Run `docker compose logs --tail=100 gatekeeper`; check for a missing private file, broad permissions, or an unauthorized Telegram session. |
-| `startup_configuration_failed` | Check required `config.env` values and documented numeric bounds. |
-| `startup_private_file_failed` | Confirm the five private files exist, are regular files, and have the documented ownership and permissions. |
+| `startup_configuration_failed` | Check required `config.env` values and documented numeric bounds. Remove any `TG_API_HASH=` line; the hash belongs only in `telegram.api-hash.secret`. |
+| `startup_private_file_failed` | Confirm the six private files exist, are regular files, and have the documented ownership and permissions; the API hash file must contain exactly one 32-character hexadecimal value. |
 | `startup_database_migration_failed` | Keep the database and any pre-migration backup intact; verify the current schema and follow the schema-update procedure. |
 | `startup_telegram_session_failed` | Confirm the Telegram session is still authorized from an official client and reprovision it if revoked. |
 | `startup_runtime_failed` | Inspect the immediately preceding privacy-safe events and container state; a supervised heartbeat or pruning failure intentionally exits for restart. |
@@ -438,7 +469,7 @@ Run these checks once after installation and after changes to Docker, paths, per
 ```shell
 ssh "$DEPLOY_HOST" 'docker inspect tg-gatekeeper --format "user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} caps={{json .HostConfig.CapDrop}} ports={{json .HostConfig.PortBindings}} security={{json .HostConfig.SecurityOpt}}"'
 ssh "$DEPLOY_HOST" 'ss -lnt'
-ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/review.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
+ssh "$DEPLOY_HOST" 'stat -c "%a %u:%g %n" /etc/tg-pm-gatekeeper/telegram.api-hash.secret /etc/tg-pm-gatekeeper/telegram.session.secret /etc/tg-pm-gatekeeper/hmac.key /etc/tg-pm-gatekeeper/review.key /etc/tg-pm-gatekeeper/config.env /etc/tg-pm-gatekeeper/deny-domains.txt /var/lib/tg-pm-gatekeeper'
 ssh "$DEPLOY_HOST" 'stat -c "%F %a %u:%g %n" /run/tg-pm-gatekeeper/core.sock'
 ```
 
@@ -447,7 +478,7 @@ Everything is correct when:
 - the container user is `10001:10001`;
 - the root filesystem is read-only, all capabilities are dropped, and `no-new-privileges` is set;
 - Docker shows no Gatekeeper port bindings;
-- session and key files are mode `600`;
+- the API hash, session, and key files are mode `600` and owned by `10001:10001`;
 - `config.env` and the denylist are mode `640` and owned by `root:10001`;
 - the state directory is mode `700` and owned by `10001:10001`; and
 - the core socket is mode `600` and owned by `10001:10001`; while the sidecar is active, its socket and access token have the same ownership and mode.
