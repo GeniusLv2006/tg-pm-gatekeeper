@@ -23,6 +23,8 @@ WORKDIR /app
 COPY --from=builder /install /usr/local/lib/python3.14/site-packages
 COPY pyproject.toml ./
 COPY src ./src
+# Do not inherit restrictive modes from the host checkout (for example a umask of 077).
+RUN chmod -R a+rX,go-w /app
 
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "tg_pm_gatekeeper.main"]

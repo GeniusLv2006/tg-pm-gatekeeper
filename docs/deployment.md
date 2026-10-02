@@ -311,12 +311,10 @@ ssh "$DEPLOY_HOST" '
 set -eu
 cd /etc/tg-pm-gatekeeper
 test ! -e telegram.api-hash.secret
-umask 077
+install -o 10001 -g 10001 -m 0600 /dev/null telegram.api-hash.secret.new
 sed -n "s/^TG_API_HASH=//p" config.env > telegram.api-hash.secret.new
 test "$(wc -l < telegram.api-hash.secret.new)" -eq 1
 grep -Eqx "[0-9A-Fa-f]{32}" telegram.api-hash.secret.new
-chown 10001:10001 telegram.api-hash.secret.new
-chmod 0600 telegram.api-hash.secret.new
 mv telegram.api-hash.secret.new telegram.api-hash.secret
 sed -i "/^TG_API_HASH=/d" config.env
 cd /opt/tg-pm-gatekeeper
@@ -328,7 +326,7 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 ```
 
-The commands stop without changing `config.env` if the file already exists or the extracted value is not exactly one 32-character hexadecimal hash; in that case, remove any `telegram.api-hash.secret.new` file and correct the cause before retrying. The running container keeps its existing environment until it is recreated. Then confirm that `docker inspect tg-gatekeeper --format "{{json .Config.Env}}"` no longer contains `TG_API_HASH=` and that the new file appears in the security checks below. To roll back to a version from before this change, restore the `TG_API_HASH=` line in `config.env` before recreating the container.
+The commands stop without changing `config.env` if the file already exists or the extracted value is not exactly one 32-character hexadecimal hash; in that case, remove any `telegram.api-hash.secret.new` file and correct the cause before retrying. The new file is created with mode `0600` before the hash is written, so the procedure does not change the shell's `umask`; a restrictive `umask` left active during `git pull` would make updated source files unreadable to the service user. The running container keeps its existing environment until it is recreated. Then confirm that `docker inspect tg-gatekeeper --format "{{json .Config.Env}}"` no longer contains `TG_API_HASH=` and that the new file appears in the security checks below. To roll back to a version from before this change, restore the `TG_API_HASH=` line in `config.env` before recreating the container.
 
 ### Advanced: schema-changing updates
 
