@@ -29,7 +29,7 @@ A maintainer may commit directly to `main` only when every changed file is limit
 - comments, formatting, spelling, or repository metadata; or
 - `.gitignore` entries that do not hide source, configuration examples, or audit evidence.
 
-Review the complete diff and use a Conventional Commit. After pushing, confirm the `test`, `quality`, `dependencies`, and `secrets` GitHub Actions jobs pass before related work continues.
+Review the complete diff and use a Conventional Commit. After pushing, confirm the `test`, `quality`, `dependencies`, `image`, and `secrets` GitHub Actions jobs pass before related work continues.
 
 ### Pull requests required
 
@@ -89,7 +89,7 @@ Never bypass a failing check.
 
 Dependabot opens weekly pull requests for pinned Python requirements, the Docker base image digest, and GitHub Actions. Version updates wait seven days after an upstream release before they are proposed; security updates are not delayed. Dependabot pull requests are security-sensitive dependency changes: review the upstream changes and the regenerated hashes, keep the files consistent where a version is pinned in more than one place, and never enable auto-merge for them.
 
-The CI workflow also runs the `dependencies` job every Monday and can be started manually. A scheduled failure means a newly published advisory affects a pinned dependency even though no code changed; treat it as a security fix and resolve it through a pull request.
+The CI workflow also runs the `dependencies` and `image` jobs every Monday and can be started manually. The `image` job builds the Docker image and scans it with Grype, failing on high or critical vulnerabilities that have a published fix in the base image's operating-system packages or the installed Python packages. A scheduled failure means a newly published advisory affects a pinned dependency or the base image even though no code changed; treat it as a security fix and resolve it through a pull request, usually by updating the pinned version or base image digest. Do not add a Grype ignore rule unless the pull request documents why the finding does not affect Gatekeeper.
 
 ## Deploy a merged change
 
