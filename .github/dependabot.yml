@@ -21,6 +21,9 @@ updates:
         exclude-patterns:
           - ruff
           - setuptools
+          # Telegram layer changes can silently alter message parsing; review alone.
+          - telethon
+          - Telethon
     open-pull-requests-limit: 5
 
   - package-ecosystem: docker
@@ -30,6 +33,12 @@ updates:
       day: monday
     cooldown:
       default-days: 7
+    ignore:
+      # Python minor upgrades (including pre-releases) must also change requires-python.
+      - dependency-name: python
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
     commit-message:
       prefix: build
       include: scope
