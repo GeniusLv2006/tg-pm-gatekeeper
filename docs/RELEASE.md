@@ -85,6 +85,12 @@ Install `requirements-quality.txt` as described in [CONTRIBUTING.md](../CONTRIBU
 
 Never bypass a failing check.
 
+### Dependency updates and scheduled audits
+
+Dependabot opens weekly pull requests for pinned Python requirements, the Docker base image digest, and GitHub Actions. Version updates wait seven days after an upstream release before they are proposed; security updates are not delayed. Dependabot pull requests are security-sensitive dependency changes: review the upstream changes and the regenerated hashes, keep the files consistent where a version is pinned in more than one place, and never enable auto-merge for them.
+
+The CI workflow also runs the `dependencies` job every Monday and can be started manually. A scheduled failure means a newly published advisory affects a pinned dependency even though no code changed; treat it as a security fix and resolve it through a pull request.
+
 ## Deploy a merged change
 
 No deployment is needed for changes limited to documentation, tests, license text, source notices, `.gitignore`, or repository metadata. Pulling those changes to the server is optional and must not restart a healthy container.

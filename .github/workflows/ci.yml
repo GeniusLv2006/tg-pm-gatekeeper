@@ -4,12 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly audit so new advisories for pinned dependencies surface without a code change.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -24,6 +29,7 @@ jobs:
       - run: docker build --tag tg-pm-gatekeeper:test .
 
   quality:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -60,6 +66,7 @@ jobs:
           vulnerability-service: osv
 
   secrets:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
