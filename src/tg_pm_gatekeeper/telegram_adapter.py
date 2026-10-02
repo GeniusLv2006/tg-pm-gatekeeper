@@ -18,7 +18,7 @@ from telethon import TelegramClient, events, functions, types, utils
 from telethon.sessions import StringSession
 from telethon.tl import TLObject
 
-from .config import ConfigurationError, Settings, read_private_file
+from .config import ConfigurationError, Settings, read_api_hash, read_private_file
 from .dashboard_backend import InProcessDashboardBackend
 from .dashboard_rpc import DashboardRpcServer
 from .message_facts import facts_from_message
@@ -421,7 +421,7 @@ class TelegramAdapter:
         self.client = TelegramClient(
             self.session,
             settings.api_id,
-            settings.api_hash,
+            read_api_hash(settings.api_hash_file),
             flood_sleep_threshold=60,
             auto_reconnect=True,
             receive_updates=True,

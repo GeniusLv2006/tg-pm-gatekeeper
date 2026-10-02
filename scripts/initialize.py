@@ -14,6 +14,7 @@ from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
 
 TARGETS = (
+    Path("telegram.api-hash.secret"),
     Path("telegram.session.secret"),
     Path("hmac.key"),
     Path("review.key"),
@@ -29,11 +30,11 @@ def write_private_file(path: Path, value: bytes) -> None:
         output.write(value)
 
 
-def render_config(api_id: int, api_hash: str) -> bytes:
+def render_config(api_id: int) -> bytes:
     return (
         f"TG_API_ID={api_id}\n"
-        f"TG_API_HASH={api_hash}\n"
         "TG_DB_PATH=/var/lib/tg-pm-gatekeeper/state.sqlite3\n"
+        "TG_API_HASH_FILE=/run/secrets/telegram_api_hash\n"
         "TG_SESSION_FILE=/run/secrets/telegram_session\n"
         "TG_HMAC_KEY_FILE=/run/secrets/hmac_key\n"
         "TG_REVIEW_KEY_FILE=/run/secrets/review_key\n"
@@ -81,11 +82,12 @@ def main() -> None:
         client.disconnect()
 
     values = {
-        TARGETS[0]: session,
-        TARGETS[1]: secrets.token_bytes(32),
+        TARGETS[0]: api_hash.encode("ascii") + b"\n",
+        TARGETS[1]: session,
         TARGETS[2]: secrets.token_bytes(32),
-        TARGETS[3]: render_config(api_id, api_hash),
-        TARGETS[4]: b"# One normalized denied domain per line.\n",
+        TARGETS[3]: secrets.token_bytes(32),
+        TARGETS[4]: render_config(api_id),
+        TARGETS[5]: b"# One normalized denied domain per line.\n",
     }
     created: list[Path] = []
     try:

@@ -11,7 +11,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.initialize import render_config, write_private_file
-from tg_pm_gatekeeper.config import ConfigurationError, Settings
+from tg_pm_gatekeeper.config import (
+    ConfigurationError,
+    PrivateFileError,
+    Settings,
+    read_api_hash,
+)
 
 
 class InitializeTests(unittest.TestCase):
@@ -23,8 +28,10 @@ class InitializeTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"value")
 
     def test_config_contains_runtime_paths(self) -> None:
-        config = render_config(1, "TEST_API_HASH_DO_NOT_USE").decode("ascii")
+        config = render_config(1).decode("ascii")
         self.assertIn("TG_API_ID=1", config)
+        self.assertIn("TG_API_HASH_FILE=/run/secrets/telegram_api_hash", config)
+        self.assertNotIn("TG_API_HASH=", config)
         self.assertIn("TG_SESSION_FILE=/run/secrets/telegram_session", config)
         self.assertIn("TG_REVIEW_KEY_FILE=/run/secrets/review_key", config)
         self.assertIn("TG_PENDING_REVIEW_RETENTION_DAYS=7", config)
@@ -37,7 +44,7 @@ class InitializeTests(unittest.TestCase):
         self.assertNotIn("REPLACE_WITH_", config)
 
     def test_public_example_matches_generated_config_keys(self) -> None:
-        generated = render_config(1, "TEST_API_HASH_DO_NOT_USE").decode("ascii")
+        generated = render_config(1).decode("ascii")
         example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(
             encoding="utf-8"
         )
@@ -50,6 +57,48 @@ class InitializeTests(unittest.TestCase):
             }
 
         self.assertEqual(keys(example), keys(generated))
+
+    def test_api_hash_is_rejected_from_the_environment(self) -> None:
+        for value in ("0123456789abcdef0123456789abcdef", ""):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"TG_API_HASH": value}, clear=True
+            ):
+                with self.assertRaisesRegex(ConfigurationError, "TG_API_HASH_FILE"):
+                    Settings.from_environment(require_telegram=False)
+
+    def test_api_hash_file_uses_fixed_default_and_must_be_separate(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings.from_environment(require_telegram=False)
+        self.assertEqual(
+            settings.api_hash_file, Path("/run/secrets/telegram_api_hash")
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "TG_API_HASH_FILE": "/tmp/shared.secret",
+                "TG_SESSION_FILE": "/tmp/shared.secret",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ConfigurationError, "must be separate"):
+                Settings.from_environment(require_telegram=False)
+
+    def test_api_hash_file_is_private_and_well_formed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api-hash"
+            write_private_file(path, b"0123456789ABCDEF0123456789abcdef\n")
+            self.assertEqual(
+                read_api_hash(path), "0123456789ABCDEF0123456789abcdef"
+            )
+            path.chmod(0o640)
+            with self.assertRaisesRegex(PrivateFileError, "too broad"):
+                read_api_hash(path)
+            for value in (b"not-a-hash", b"0123456789abcdef" * 3, b"\xff" * 32):
+                with self.subTest(value=value):
+                    path.unlink()
+                    write_private_file(path, value)
+                    with self.assertRaisesRegex(PrivateFileError, "is invalid"):
+                        read_api_hash(path)
 
     def test_challenge_configuration_is_bounded(self) -> None:
         with patch.dict("os.environ", {"TG_CHALLENGE_TTL_SECONDS": "10"}, clear=True):

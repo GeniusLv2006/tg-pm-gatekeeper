@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,9 @@ class ConfigurationError(RuntimeError):
 
 class PrivateFileError(ConfigurationError):
     """Raised when a required private file cannot be read safely."""
+
+
+API_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{32}")
 
 
 def _required(name: str) -> str:
@@ -106,10 +110,21 @@ def read_private_file(
     return value
 
 
+def read_api_hash(path: Path) -> str:
+    value = read_private_file(path, strip=True)
+    try:
+        api_hash = value.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise PrivateFileError(f"Telegram API hash file is invalid: {path}") from exc
+    if not API_HASH_PATTERN.fullmatch(api_hash):
+        raise PrivateFileError(f"Telegram API hash file is invalid: {path}")
+    return api_hash
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     api_id: int
-    api_hash: str
+    api_hash_file: Path
     database_path: Path
     session_file: Path
     hmac_key_file: Path
@@ -131,12 +146,15 @@ class Settings:
 
     @classmethod
     def from_environment(cls, *, require_telegram: bool = True) -> "Settings":
+        # Container inspection exposes environment variables, so the hash is file-only.
+        if "TG_API_HASH" in os.environ:
+            raise ConfigurationError(
+                "TG_API_HASH is not accepted; provide TG_API_HASH_FILE instead"
+            )
         if require_telegram:
             raw_api_id = _required("TG_API_ID")
-            api_hash = _required("TG_API_HASH")
         else:
             raw_api_id = os.environ.get("TG_API_ID", "1")
-            api_hash = os.environ.get("TG_API_HASH", "not-used-by-cli")
         try:
             api_id = int(raw_api_id)
         except ValueError as exc:
@@ -145,7 +163,9 @@ class Settings:
         outbound_limit = _bounded_int("TG_OUTBOUND_LIMIT_PER_HOUR", 10, 1, 100)
         settings = cls(
             api_id=api_id,
-            api_hash=api_hash,
+            api_hash_file=Path(
+                os.environ.get("TG_API_HASH_FILE", "/run/secrets/telegram_api_hash")
+            ),
             database_path=Path(
                 os.environ.get("TG_DB_PATH", "/var/lib/tg-pm-gatekeeper/state.sqlite3")
             ),
@@ -194,12 +214,13 @@ class Settings:
             ),
         )
         private_paths = {
+            settings.api_hash_file,
             settings.session_file,
             settings.hmac_key_file,
             settings.review_key_file,
         }
-        if len(private_paths) != 3:
+        if len(private_paths) != 4:
             raise ConfigurationError(
-                "session, state HMAC, and review keys must be separate"
+                "API hash, session, state HMAC, and review keys must be separate"
             )
         return settings
