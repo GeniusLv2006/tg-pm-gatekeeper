@@ -7,11 +7,12 @@ from telethon import types
 
 from .rules import URL_RE, MessageFacts, normalized_domain
 
+# Since Telegram layer 229 a button carries its behavior, including any URL, in `type`.
 LINK_BUTTON_TYPES = (
-    types.KeyboardButtonUrl,
-    types.KeyboardButtonUrlAuth,
-    types.KeyboardButtonWebView,
-    types.KeyboardButtonSimpleWebView,
+    types.InlineButtonTypeUrl,
+    types.InlineButtonTypeUrlAuth,
+    types.InlineButtonTypeWebView,
+    types.ButtonTypeSimpleWebView,
 )
 
 
@@ -52,8 +53,9 @@ def facts_from_message(message: types.Message) -> MessageFacts:
             text_value = getattr(button, "text", None)
             if isinstance(text_value, str) and text_value.strip():
                 button_texts.add(text_value.strip())
-            url = getattr(button, "url", None)
-            if isinstance(button, LINK_BUTTON_TYPES) or isinstance(url, str):
+            button_type = getattr(button, "type", None)
+            url = getattr(button_type, "url", None)
+            if isinstance(button_type, LINK_BUTTON_TYPES) or isinstance(url, str):
                 has_link_button = True
                 link_button_count += 1
                 if url:

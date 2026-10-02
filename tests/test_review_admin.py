@@ -1414,7 +1414,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                         buttons=[
                             SimpleNamespace(
                                 text="Open private offer",
-                                url="https://button.invalid/start?token=button-secret",
+                                type=SimpleNamespace(
+                                    url="https://button.invalid/start?token=button-secret"
+                                ),
                             )
                         ]
                     )
