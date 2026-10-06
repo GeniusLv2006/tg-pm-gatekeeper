@@ -13,6 +13,7 @@ from pathlib import Path
 
 from tg_pm_gatekeeper.store import (
     CAMPAIGN_WINDOW_SECONDS,
+    SENDER_LINKED_TABLES,
     DialogSnapshot,
     StateStore,
     StoreMigrationError,
@@ -646,6 +647,65 @@ class StoreTests(unittest.TestCase):
                 statement, ("sender",)
             ).fetchone()[0]
             self.assertEqual(count, 0, table)
+
+    def test_forget_covers_every_sender_linked_table(self) -> None:
+        tables = [
+            str(row[0])
+            for row in self.store._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        ]
+        linked = {
+            table
+            for table in tables
+            if any(
+                column[1] == "sender_key"
+                for column in self.store._connection.execute(
+                    f"PRAGMA table_info({table})"
+                )
+            )
+        }
+        self.assertEqual(linked, set(SENDER_LINKED_TABLES))
+        self.assertEqual(SENDER_LINKED_TABLES[-1], "sender_state")
+
+    def test_release_expired_suppression_clears_restriction_data(self) -> None:
+        state = self.store.suppress(
+            "sender", "challenge_timeout", until=200,
+            restriction_reference=b"identity", now=100,
+        )
+        self.store.enqueue_review(
+            "sender", b"review-reference", "would_quarantine", "[]", "{}",
+            expires_at=500_000, now=100,
+        )
+        self.store.save_enforcement_review(
+            "sender", reference=b"reference", envelope=b"envelope",
+            reason="challenge_timeout", expires_at=500_000, now=100,
+        )
+        self.store.save_dialog_snapshot(
+            "sender", DialogSnapshot(folder_id=1, silent=True, mute_until=200)
+        )
+        action_id = self.store.schedule_action(
+            "sender", reason="challenge_timeout", reference=b"action-reference",
+            execute_at=150, expected_revision=state.revision, now=100,
+        )
+
+        self.assertFalse(self.store.release_expired_suppression("sender", 199))
+        self.assertTrue(self.store.release_expired_suppression("sender", 200))
+
+        released = self.store.sender("sender")
+        self.assertEqual(released.status, "unknown")
+        self.assertEqual(released.revision, state.revision + 1)
+        self.assertIsNone(released.restriction_reference)
+        for table in ("enforcement_reviews", "review_queue", "dialog_snapshots"):
+            count = self.store._connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE sender_key='sender'"  # noqa: S608
+            ).fetchone()[0]
+            self.assertEqual(count, 0, table)
+        action = self.store._connection.execute(
+            "SELECT status,reference FROM pending_actions WHERE id=?", (action_id,)
+        ).fetchone()
+        self.assertEqual(tuple(action), ("cancelled", b""))
+        self.assertFalse(self.store.release_expired_suppression("sender", 300))
 
     def test_prune_releases_expired_temporary_and_forgets_old_archive(self) -> None:
         temporary_state = self.store.suppress(
