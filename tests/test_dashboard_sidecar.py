@@ -7,7 +7,8 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from tg_pm_gatekeeper.dashboard_http import DashboardHttpServer
 from tg_pm_gatekeeper.dashboard_main import DashboardSidecar
@@ -92,15 +93,22 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(sidecar._last_authenticated_activity, before)
 
     async def test_recent_activity_prevents_stale_idle_deadline(self) -> None:
-        sidecar = self.make_sidecar(idle_seconds=0.05)
-        task = asyncio.create_task(sidecar.run())
-        await asyncio.sleep(0.04)
-        sidecar.note_authenticated_activity()
-        await asyncio.sleep(0.02)
-        self.assertFalse(task.done())
+        # Idle decisions read a controlled clock, so scheduler delays cannot change the outcome.
+        clock = [100.0]
+        # Replace only the module's reference; the event loop keeps the real clock.
+        fake_time = SimpleNamespace(monotonic=lambda: clock[0])
+        with patch("tg_pm_gatekeeper.dashboard_main.time", fake_time):
+            sidecar = self.make_sidecar(idle_seconds=0.05)
+            task = asyncio.create_task(sidecar.run())
+            clock[0] = 100.04
+            sidecar.note_authenticated_activity()
+            # Past the deadline computed at start, but within the window since activity.
+            clock[0] = 100.06
+            await asyncio.sleep(0.15)
+            self.assertFalse(task.done())
 
-        sidecar.request_shutdown("test_complete")
-        self.assertEqual(await task, "test_complete")
+            clock[0] = 100.2
+            self.assertEqual(await asyncio.wait_for(task, timeout=5), "idle_timeout")
 
     async def test_invalid_authenticated_requests_do_not_extend_idle_lifetime(
         self,
