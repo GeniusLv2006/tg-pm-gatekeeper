@@ -56,12 +56,13 @@ For runtime, configuration, test, executable, Docker, or dependency changes:
 PYTHONPATH=src .venv/bin/python -m unittest discover -v
 PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
 .venv/bin/ruff check src tests scripts
+.venv/bin/mypy
 shellcheck scripts/*.sh deploy/*.sh
 docker build --tag tg-pm-gatekeeper:test .
 git diff --check
 ```
 
-Install `requirements-quality.txt` as described in [CONTRIBUTING.md](../CONTRIBUTING.md) before running Ruff. Add checks specific to the changed executable or workflow. Test data must not contain real Telegram identities, messages, credentials, URLs, databases, or logs.
+Install `requirements-quality.txt` as described in [CONTRIBUTING.md](../CONTRIBUTING.md) before running Ruff and mypy. Add checks specific to the changed executable or workflow. Test data must not contain real Telegram identities, messages, credentials, URLs, databases, or logs.
 
 ## Publish
 

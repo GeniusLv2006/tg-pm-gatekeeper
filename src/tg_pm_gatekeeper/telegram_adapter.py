@@ -31,6 +31,7 @@ from .service import (
     IncomingMessage,
     TextStyleSpan,
 )
+from .states import ActionStatus, SenderStatus
 from .store import DialogSnapshot, StateStore
 
 LOG = logging.getLogger("gatekeeper.telegram")
@@ -175,7 +176,7 @@ class BoundedStringSession(StringSession):
         return self._entity_evictions
 
     def process_entities(self, tlo: TLObject) -> None:
-        values = []
+        values: list[object] = []
         if isinstance(tlo, TLObject):
             for attribute in ("user", "chat", "chats", "users"):
                 value = getattr(tlo, attribute, None)
@@ -595,7 +596,7 @@ class TelegramAdapter:
             trusted_history = False
             if (
                 sender_id != self.settings.test_sender_id
-                and state.status in {"unknown", "provisional"}
+                and state.status in {SenderStatus.UNKNOWN, SenderStatus.PROVISIONAL}
                 and not getattr(sender, "bot", False)
                 and not getattr(sender, "contact", False)
                 and sender_id not in SERVICE_USER_IDS
@@ -605,7 +606,7 @@ class TelegramAdapter:
                         event,
                         sender_key,
                         since=(
-                            state.updated_at if state.status == "provisional" else None
+                            state.updated_at if state.status == SenderStatus.PROVISIONAL else None
                         ),
                     )
                 except Exception:
@@ -1029,7 +1030,7 @@ class TelegramAdapter:
 
     async def _recover_challenges(self) -> None:
         for sender_key, state in self.store.challenge_states():
-            if state.status == "challenged":
+            if state.status == SenderStatus.CHALLENGED:
                 if state.challenge_expires_at is not None:
                     peer = None
                     if state.challenge_action_reference is not None:
@@ -1067,7 +1068,7 @@ class TelegramAdapter:
                 continue
             peer = types.InputPeerUser(user_id=user_id, access_hash=access_hash)
             recovered_message_id = None
-            if state.status == "challenge_issuing" and state.challenge_prompt:
+            if state.status == SenderStatus.CHALLENGE_ISSUING and state.challenge_prompt:
                 async for outgoing in self.client.iter_messages(
                     peer, limit=10, from_user="me"
                 ):
@@ -1092,9 +1093,9 @@ class TelegramAdapter:
         if sender_id is None or sender_key is None:
             return
         state = self.store.sender(sender_key)
-        if state.status not in {"provisional", "quarantined"}:
+        if state.status not in {SenderStatus.PROVISIONAL, SenderStatus.QUARANTINED}:
             return
-        if state.status == "quarantined":
+        if state.status == SenderStatus.QUARANTINED:
             try:
                 reference = (
                     state.restriction_reference
@@ -1354,7 +1355,7 @@ class TelegramAdapter:
                     actions = TelegramActions(self, peer, action.sender_key)
                     deleted = await actions.delete_dialog()
                     self.store.finish_action(
-                        action_id, "completed" if deleted else "failed"
+                        action_id, ActionStatus.COMPLETED if deleted else ActionStatus.FAILED
                     )
                     if deleted:
                         self.store.clear_action_reference(
@@ -1373,7 +1374,7 @@ class TelegramAdapter:
                 except Exception:
                     LOG.error("dialog_deletion_failed")
                     if action is not None:
-                        self.store.finish_action(action_id, "failed")
+                        self.store.finish_action(action_id, ActionStatus.FAILED)
                         self.store.enqueue_action_failure(action)
                         self.store.audit(
                             action.sender_key,

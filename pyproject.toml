@@ -27,6 +27,18 @@ select = ["E4", "E7", "E9", "F", "I", "B", "S"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S108", "S603"]
 
+[tool.mypy]
+python_version = "3.14"
+files = ["src"]
+check_untyped_defs = true
+strict_equality = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["pyaes", "telethon", "telethon.*"]
+ignore_missing_imports = true
+
 [project.scripts]
 tg-pm-gatekeeper = "tg_pm_gatekeeper.main:main"
 tg-pm-gatekeeper-cli = "tg_pm_gatekeeper.cli:main"

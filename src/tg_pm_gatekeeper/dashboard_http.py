@@ -11,6 +11,7 @@ import os
 import secrets
 import stat
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.cookies import CookieError, SimpleCookie
@@ -22,6 +23,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 from .dashboard_protocol import DashboardBackend, DashboardBackendError
 from .policy import EvidenceSignal, PolicyEngine
+from .states import SenderStatus
 
 LOG = logging.getLogger("gatekeeper.dashboard_http")
 MAX_HEADER_BYTES = 16 * 1024
@@ -677,7 +679,7 @@ class DashboardHttpServer:
             risk_score = None
         else:
             try:
-                risk_score = int(raw_score)  # type: ignore[arg-type]
+                risk_score = int(raw_score)  # type: ignore[call-overload]
             except (TypeError, ValueError):
                 risk_score = None
         if risk_score is None:
@@ -1007,7 +1009,7 @@ class DashboardHttpServer:
             except DashboardBackendError as exc:
                 return self._backend_error(exc.code)
             if (
-                item.get("status") != "suppressed"
+                item.get("status") != SenderStatus.SUPPRESSED
                 or item.get("suppressed_until") is not None
                 or item.get("archived_at") is not None
             ):
@@ -1185,7 +1187,7 @@ class DashboardHttpServer:
         archive_tools = ""
         if archived:
 
-            def filter_link(label: str, values: dict[str, object], current: bool) -> str:
+            def filter_link(label: str, values: Mapping[str, object], current: bool) -> str:
                 query = f"?{urlencode(values)}" if values else ""
                 marker = " aria-current='true'" if current else ""
                 return f"<a href='/cases/archive{query}'{marker}>{html.escape(label)}</a>"
@@ -1373,7 +1375,7 @@ class DashboardHttpServer:
                     f"<a class='btn btn-block-outline' href='/cases/{item.sender_key}/forget'>"
                     "Release and Forget…</a>"
                 )
-        elif item.status == "suppressed" and item.suppressed_until is None:
+        elif item.status == SenderStatus.SUPPRESSED and item.suppressed_until is None:
             secondary_action = (
                 f"<a class='btn' href='/cases/{item.sender_key}/archive'>"
                 "Keep and Archive…</a>"
@@ -1880,7 +1882,7 @@ class DashboardHttpServer:
 
     @staticmethod
     def _remaining(item: Any) -> str:
-        if item.status == "quarantined":
+        if item.status == SenderStatus.QUARANTINED:
             return "Manual review required"
         if item.suppressed_until is None:
             return "No automatic release"
@@ -1895,7 +1897,7 @@ class DashboardHttpServer:
 
     @staticmethod
     def _restriction_summary(item: Any) -> str:
-        if item.status == "quarantined":
+        if item.status == SenderStatus.QUARANTINED:
             return "Review needed"
         if item.suppressed_until is None:
             return "No automatic release"

@@ -10,18 +10,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .states import (
+    FINISHED_ACTION_STATUSES,
+    RESTRICTED_STATUSES,
+    REVIEW_DECISIONS,
+    ActionStatus,
+    ReviewStatus,
+    SenderStatus,
+)
+
 SCHEMA_VERSION = 8
 CAMPAIGN_WINDOW_SECONDS = 7 * 24 * 3600
-SENDER_STATUSES = (
-    "unknown",
-    "challenge_issuing",
-    "challenge_archiving",
-    "challenged",
-    "provisional",
-    "allowed",
-    "quarantined",
-    "suppressed",
-)
+SENDER_STATUSES = tuple(SenderStatus)
 SENDER_STATE_SCHEMA = """
 CREATE TABLE sender_state (
     sender_key TEXT PRIMARY KEY,
@@ -207,7 +207,7 @@ OPEN_ACTION_SQL = (
 
 @dataclass(frozen=True, slots=True)
 class SenderState:
-    status: str
+    status: SenderStatus
     challenge_id: str | None
     answer_digest: str | None
     challenge_expires_at: int | None
@@ -223,6 +223,9 @@ class SenderState:
     revision: int
     updated_at: int
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", SenderStatus(self.status))
+
 
 class StoreMigrationError(RuntimeError):
     """Raised when an existing state database cannot be migrated safely."""
@@ -236,12 +239,15 @@ class ReviewItem:
     classification: str
     signals: str
     features: str
-    status: str
+    status: ReviewStatus
     message_count: int
     created_at: int
     updated_at: int
     expires_at: int
     reviewed_at: int | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", ReviewStatus(self.status))
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,15 +259,18 @@ class EnforcementReview:
     created_at: int
     updated_at: int
     expires_at: int
-    status: str
+    status: SenderStatus
     suppressed_until: int | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", SenderStatus(self.status))
 
 
 @dataclass(frozen=True, slots=True)
 class ActiveRestriction:
     sender_key: str
     reference: bytes | None
-    status: str
+    status: SenderStatus
     reason: str
     suppressed_until: int | None
     updated_at: int
@@ -270,6 +279,9 @@ class ActiveRestriction:
     evidence_expires_at: int | None
     archived_at: int | None
     has_open_actions: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", SenderStatus(self.status))
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,9 +301,18 @@ class PendingAction:
     execute_at: int
     expected_revision: int
     mode_independent: int
-    status: str
+    status: ActionStatus
     created_at: int
     finished_at: int | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", ActionStatus(self.status))
+
+
+def _inserted_id(cursor: sqlite3.Cursor) -> int:
+    if cursor.lastrowid is None:
+        raise RuntimeError("insert did not produce a row id")
+    return cursor.lastrowid
 
 
 class StateStore:
@@ -533,7 +554,7 @@ class StateStore:
             ).fetchone()
         if not row:
             return SenderState(
-                "unknown",
+                SenderStatus.UNKNOWN,
                 None,
                 None,
                 None,
@@ -570,7 +591,7 @@ class StateStore:
     def _set_state(
         self,
         sender_key: str,
-        status: str,
+        status: SenderStatus,
         *,
         challenge_id: str | None = None,
         answer_digest: str | None = None,
@@ -611,12 +632,12 @@ class StateStore:
             )
 
     def allow(self, sender_key: str, now: int | None = None) -> None:
-        self._set_state(sender_key, "allowed", now=now)
+        self._set_state(sender_key, SenderStatus.ALLOWED, now=now)
         self.resolve_sender_actions(sender_key, now)
         self.delete_enforcement_review(sender_key)
 
     def revoke(self, sender_key: str, now: int | None = None) -> None:
-        self._set_state(sender_key, "unknown", now=now)
+        self._set_state(sender_key, SenderStatus.UNKNOWN, now=now)
         self.resolve_sender_actions(sender_key, now)
 
     def resolve_sender_actions(self, sender_key: str, now: int | None = None) -> int:
@@ -660,7 +681,7 @@ class StateStore:
     ) -> None:
         self._set_state(
             sender_key,
-            "quarantined",
+            SenderStatus.QUARANTINED,
             restriction_reference=restriction_reference,
             now=now,
         )
@@ -859,7 +880,7 @@ class StateStore:
         return False
 
     def mark_provisional(self, sender_key: str, now: int | None = None) -> None:
-        self._set_state(sender_key, "provisional", now=now)
+        self._set_state(sender_key, SenderStatus.PROVISIONAL, now=now)
         self.delete_enforcement_review(sender_key)
 
     def mark_challenge_guidance_sent(self, sender_key: str) -> bool:
@@ -1417,7 +1438,7 @@ class StateStore:
                     timestamp,
                 ),
             )
-        return int(cursor.lastrowid)
+        return _inserted_id(cursor)
 
     def schedule_operator_artifacts(
         self, message_ids: list[int] | tuple[int, ...], delete_at: int
@@ -1515,13 +1536,10 @@ class StateStore:
             if self.get_mode() != "protect" and not bool(row["mode_independent"]):
                 return None
             state = self.sender(str(row["sender_key"]))
-            if state.status not in {
-                "suppressed",
-                "quarantined",
-            } or state.revision != int(row["expected_revision"]):
+            if state.status not in RESTRICTED_STATUSES or state.revision != int(row["expected_revision"]):
                 return None
             if (
-                state.status == "suppressed"
+                state.status == SenderStatus.SUPPRESSED
                 and state.suppressed_until is not None
                 and state.suppressed_until <= timestamp
             ):
@@ -1529,13 +1547,13 @@ class StateStore:
         return PendingAction(**dict(row))
 
     def finish_action(
-        self, action_id: int, status: str, now: int | None = None
+        self, action_id: int, status: ActionStatus, now: int | None = None
     ) -> bool:
-        if status not in {"completed", "failed", "cancelled"}:
+        if status not in FINISHED_ACTION_STATUSES:
             raise ValueError("invalid action status")
         timestamp = int(time.time()) if now is None else now
         with self._lock, self._connection:
-            if status == "completed":
+            if status == ActionStatus.COMPLETED:
                 cursor = self._connection.execute(
                     "UPDATE pending_actions SET status=?,finished_at=?,reference=X'' "
                     "WHERE id=? AND status='pending'",
@@ -1640,7 +1658,7 @@ class StateStore:
                     expires_at,
                 ),
             )
-        return int(cursor.lastrowid)
+        return _inserted_id(cursor)
 
     def review_items(
         self, *, limit: int = 50, offset: int = 0, now: int | None = None
@@ -1681,9 +1699,9 @@ class StateStore:
         return ReviewItem(**dict(row)) if row else None
 
     def decide_review(
-        self, review_id: int, status: str, now: int | None = None
+        self, review_id: int, status: ReviewStatus, now: int | None = None
     ) -> bool:
-        if status not in {"legitimate", "spam", "dismissed"}:
+        if status not in REVIEW_DECISIONS:
             raise ValueError("invalid review decision")
         timestamp = now or int(time.time())
         with self._lock, self._connection:
@@ -1695,9 +1713,9 @@ class StateStore:
         return cursor.rowcount == 1
 
     def decide_sender_reviews(
-        self, sender_key: str, status: str, now: int | None = None
+        self, sender_key: str, status: ReviewStatus, now: int | None = None
     ) -> int:
-        if status not in {"legitimate", "spam", "dismissed"}:
+        if status not in REVIEW_DECISIONS:
             raise ValueError("invalid review decision")
         timestamp = now or int(time.time())
         with self._lock, self._connection:

@@ -10,17 +10,10 @@ import sys
 
 from .config import ConfigurationError, Settings, read_private_file
 from .crypto import IdentifierProtector
+from .states import CHALLENGE_STARTING_STATUSES, GATEKEEPER_ARCHIVED_STATUSES
 from .store import StateStore, StoreMigrationError
 
-DASHBOARD_ONLY_STATUSES = frozenset(
-    {
-        "challenge_issuing",
-        "challenge_archiving",
-        "challenged",
-        "quarantined",
-        "suppressed",
-    }
-)
+DASHBOARD_ONLY_STATUSES = CHALLENGE_STARTING_STATUSES | GATEKEEPER_ARCHIVED_STATUSES
 
 
 def parser() -> argparse.ArgumentParser:

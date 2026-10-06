@@ -9,7 +9,9 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
+from typing import TypedDict
 from urllib.parse import parse_qs, urlsplit
 
 from telethon import functions, types
@@ -19,6 +21,12 @@ from .message_facts import facts_from_message
 from .restriction_actions import RestrictionActions, RestrictionReleaseResult
 from .rules import url_evidence, url_shape
 from .service import GatekeeperService
+from .states import (
+    GATEKEEPER_ARCHIVED_STATUSES,
+    RESTRICTED_STATUSES,
+    ReviewStatus,
+    SenderStatus,
+)
 from .store import ActiveRestriction, DialogSnapshot, ReviewItem, StateStore
 
 LOG = logging.getLogger("gatekeeper.dashboard_backend")
@@ -27,6 +35,12 @@ IDENTITY_CACHE_LIMIT = 256
 IDENTITY_CACHE_SECONDS = 5 * 60
 IDENTITY_FAILURE_CACHE_SECONDS = 30
 IDENTITY_BATCH_SIZE = 100
+
+
+class IdentityValue(TypedDict):
+    user_id: int
+    name: str | None
+    username: str | None
 
 
 class InProcessDashboardBackend:
@@ -137,9 +151,9 @@ class InProcessDashboardBackend:
         review_id = self._positive_int(params, "review_id")
         item = self.store.review_item(review_id)
         now = int(time.time())
-        if item is None or (item.status == "pending" and item.expires_at <= now):
+        if item is None or (item.status == ReviewStatus.PENDING and item.expires_at <= now):
             raise DashboardBackendError("review_not_found")
-        if item.status != "pending" or item.reference is None:
+        if item.status != ReviewStatus.PENDING or item.reference is None:
             raise DashboardBackendError("review_not_pending")
         user_id, access_hash, message_id = self.service.protector.open_review_reference(
             item.reference
@@ -168,12 +182,12 @@ class InProcessDashboardBackend:
         review_id = self._positive_int(params, "review_id")
         item = self.store.review_item(review_id)
         if item is None or (
-            item.status == "pending" and item.expires_at <= int(time.time())
+            item.status == ReviewStatus.PENDING and item.expires_at <= int(time.time())
         ):
             raise DashboardBackendError("review_not_found")
         async with self.service.sender_lock(item.sender_key):
             item = self.store.review_item(review_id)
-            if item is None or item.status != "pending" or item.reference is None:
+            if item is None or item.status != ReviewStatus.PENDING or item.reference is None:
                 raise DashboardBackendError("review_already_decided")
             if item.expires_at <= int(time.time()):
                 raise DashboardBackendError("review_not_found")
@@ -182,7 +196,7 @@ class InProcessDashboardBackend:
                 raise DashboardBackendError("unknown_action")
             state = self.store.sender(item.sender_key)
             if action == "legitimate":
-                if state.status in {"challenged", "quarantined", "suppressed"}:
+                if state.status in GATEKEEPER_ARCHIVED_STATUSES:
                     peer = self._peer_from_review(item)
                     if not await self.restriction_actions.restore_dialog(
                         peer, item.sender_key
@@ -190,16 +204,16 @@ class InProcessDashboardBackend:
                         raise DashboardBackendError("telegram_action_failed")
                 self.store.allow(item.sender_key)
                 self.cancel_timeout(item.sender_key)
-                self.store.decide_sender_reviews(item.sender_key, "legitimate")
+                self.store.decide_sender_reviews(item.sender_key, ReviewStatus.LEGITIMATE)
             elif action == "spam":
                 peer = self._peer_from_review(item)
-                if state.status != "suppressed":
+                if state.status != SenderStatus.SUPPRESSED:
                     await self._capture_manual_enforcement(item, peer)
-                if state.status not in {"challenged", "quarantined", "suppressed"}:
+                if state.status not in GATEKEEPER_ARCHIVED_STATUSES:
                     if not await self._archive_and_mute(peer, item.sender_key):
                         self.store.delete_enforcement_review(item.sender_key)
                         raise DashboardBackendError("telegram_action_failed")
-                self.store.decide_sender_reviews(item.sender_key, "spam")
+                self.store.decide_sender_reviews(item.sender_key, ReviewStatus.SPAM)
                 now = int(time.time())
                 suppressed = self.store.suppress(
                     item.sender_key,
@@ -228,7 +242,7 @@ class InProcessDashboardBackend:
                 self.schedule_dialog_deletion(action_id, now)
                 self.cancel_timeout(item.sender_key)
             else:
-                self.store.decide_sender_reviews(item.sender_key, "dismissed")
+                self.store.decide_sender_reviews(item.sender_key, ReviewStatus.DISMISSED)
             self._identity_cache.pop(item.sender_key, None)
         return {"outcome": "completed"}
 
@@ -311,7 +325,7 @@ class InProcessDashboardBackend:
             async with self.service.sender_lock(sender_key):
                 item = self.store.active_restriction(sender_key)
                 if (
-                    item is None or item.status != "suppressed"
+                    item is None or item.status != SenderStatus.SUPPRESSED
                     or item.suppressed_until is not None
                     or item.archived_at is not None
                 ):
@@ -381,7 +395,7 @@ class InProcessDashboardBackend:
         sender_key = self.service.protector.sender_key(user_id)
         async with self.service.sender_lock(sender_key):
             state = self.store.sender(sender_key)
-            if state.status not in {"quarantined", "suppressed"}:
+            if state.status not in RESTRICTED_STATUSES:
                 raise DashboardBackendError("restricted_sender_not_found")
             if state.restriction_reference is not None:
                 raise DashboardBackendError("use_active_case")
@@ -472,8 +486,10 @@ class InProcessDashboardBackend:
             sender_key = path.removeprefix("/cases/")
             if not sender_key or "/" in sender_key:
                 return None
-            item = self.store.active_restriction(sender_key, now=now)
-            payload = None if item is None else self._case_version(item, now)
+            restriction = self.store.active_restriction(sender_key, now=now)
+            payload = (
+                None if restriction is None else self._case_version(restriction, now)
+            )
         else:
             return None
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
@@ -481,9 +497,9 @@ class InProcessDashboardBackend:
 
     async def _review_identities(
         self, items: list[ReviewItem]
-    ) -> dict[str, dict[str, object]]:
+    ) -> dict[str, IdentityValue]:
         peers: list[tuple[ReviewItem, types.InputPeerUser, int]] = []
-        identities: dict[str, dict[str, object]] = {}
+        identities: dict[str, IdentityValue] = {}
         now = time.monotonic()
         self._expire_identities(now)
         for item in items:
@@ -507,9 +523,9 @@ class InProcessDashboardBackend:
 
     async def _case_identities(
         self, items: list[ActiveRestriction]
-    ) -> dict[str, dict[str, object]]:
-        peers: list[tuple[object, types.InputPeerUser, int]] = []
-        identities: dict[str, dict[str, object]] = {}
+    ) -> dict[str, IdentityValue]:
+        peers: list[tuple[ActiveRestriction, types.InputPeerUser, int]] = []
+        identities: dict[str, IdentityValue] = {}
         now = time.monotonic()
         self._expire_identities(now)
         for item in items:
@@ -533,8 +549,10 @@ class InProcessDashboardBackend:
 
     async def _resolve_identities(
         self,
-        pending: list[tuple[object, types.InputPeerUser, int]],
-        identities: dict[str, dict[str, object]],
+        pending: Sequence[
+            tuple[ReviewItem | ActiveRestriction, types.InputPeerUser, int]
+        ],
+        identities: dict[str, IdentityValue],
     ) -> None:
         for start in range(0, len(pending), IDENTITY_BATCH_SIZE):
             batch = pending[start : start + IDENTITY_BATCH_SIZE]
@@ -657,7 +675,7 @@ class InProcessDashboardBackend:
 
     @staticmethod
     def _case_value(
-        item: ActiveRestriction, identity: dict[str, object] | None
+        item: ActiveRestriction, identity: IdentityValue | None
     ) -> dict[str, object]:
         return {
             "sender_key": item.sender_key,
@@ -691,7 +709,7 @@ class InProcessDashboardBackend:
         )
 
     @staticmethod
-    def _identity_value(user_id: int, sender) -> dict[str, object]:
+    def _identity_value(user_id: int, sender) -> IdentityValue:
         name = " ".join(
             str(value)
             for value in (
@@ -710,17 +728,15 @@ class InProcessDashboardBackend:
     def _cache_identity(
         self,
         sender_key: str,
-        value: dict[str, object],
+        value: IdentityValue,
         *,
         ttl: int = IDENTITY_CACHE_SECONDS,
     ) -> None:
         self._identity_cache[sender_key] = (
             time.monotonic() + ttl,
-            int(value["user_id"]),
-            value.get("name") if isinstance(value.get("name"), str) else None,
-            value.get("username")
-            if isinstance(value.get("username"), str)
-            else None,
+            value["user_id"],
+            value["name"],
+            value["username"],
         )
         self._identity_cache.move_to_end(sender_key)
         while len(self._identity_cache) > IDENTITY_CACHE_LIMIT:
@@ -736,7 +752,7 @@ class InProcessDashboardBackend:
     @staticmethod
     def _cached_identity(
         value: tuple[float, int, str | None, str | None]
-    ) -> dict[str, object]:
+    ) -> IdentityValue:
         return {"user_id": value[1], "name": value[2], "username": value[3]}
 
     def _peer_from_review(self, item: ReviewItem) -> types.InputPeerUser:
