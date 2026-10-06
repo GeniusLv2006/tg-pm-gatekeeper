@@ -565,6 +565,57 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(item.archived_at, 110)
         self.assertFalse(item.has_open_actions)
 
+    def test_enforcement_statistics_follow_list_partitions(self) -> None:
+        self.store.quarantine("attention-quarantine", 100)
+        self.store.suppress(
+            "attention-temporary", "challenge_timeout", until=900, now=100,
+            restriction_reference=b"identity",
+        )
+        self.store.suppress(
+            "archived", "permanent_suppression", until=None, now=100,
+        )
+        self.assertTrue(self.store.archive_restriction("archived", 110))
+
+        attention = self.store.enforcement_statistics(archived=False, now=200)
+        archived = self.store.enforcement_statistics(archived=True, now=200)
+        everything = self.store.enforcement_statistics(now=200)
+
+        self.assertEqual((attention["quarantined"], attention["suppressed"]), (1, 1))
+        self.assertEqual((archived["quarantined"], archived["suppressed"]), (0, 1))
+        self.assertEqual((everything["quarantined"], everything["suppressed"]), (1, 2))
+        self.assertEqual(
+            attention["quarantined"] + attention["suppressed"],
+            self.store.active_restriction_count(archived=False),
+        )
+        self.assertEqual(
+            archived["suppressed"], self.store.active_restriction_count(archived=True)
+        )
+        self.assertNotIn("reason:permanent_suppression", attention)
+        self.assertEqual(archived["reason:permanent_suppression"], 1)
+        self.assertEqual(attention["unidentified"], 1)
+        self.assertEqual(archived["unidentified"], 1)
+        self.assertEqual(everything["unidentified"], 2)
+
+    def test_reason_filter_matches_displayed_derived_reason(self) -> None:
+        review_id = self.store.enqueue_review(
+            "legacy", b"reference", "would_quarantine", "[]", "{}", 800, 100
+        )
+        self.store.quarantine("legacy", 200)
+        self.assertTrue(self.store.decide_review(review_id, "spam", 200))
+        self.store.quarantine("unknown-reason", 200)
+
+        for reason, sender_key in (
+            ("manual_spam", "legacy"),
+            ("reason_unavailable", "unknown-reason"),
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.store.active_restriction_count(archived=False, reason=reason), 1
+                )
+                items = self.store.active_restrictions(archived=False, reason=reason)
+                self.assertEqual([item.sender_key for item in items], [sender_key])
+                self.assertEqual(items[0].reason, reason)
+
     def test_forget_archived_restriction_erases_sender_linked_data(self) -> None:
         self.store.suppress(
             "sender", "manual_permanent_suppression", until=None,
