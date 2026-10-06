@@ -206,7 +206,6 @@ a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visibl
 .telegram-link { color: var(--monitor); font-weight: 600; text-decoration: none; }
 .telegram-link:hover { text-decoration: underline; }
 
-.stat-caption { margin: 0 0 4px; color: var(--muted); font-size: 12px; text-align: right; }
 .stat-strip { display: flex; margin: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .stat-strip > div { min-width: 0; padding: 8px 18px; }
 .stat-strip > div + div { border-left: 1px solid var(--line); }
@@ -546,7 +545,6 @@ pre.message.quote { border-style: dashed; background: var(--surface); color: var
   .primary-nav a { min-height: 40px; }
   .connection small { display: none; }
   .page-header { flex-direction: column; align-items: flex-start; }
-  .stat-caption { text-align: left; }
   .queue-grid, .detail-grid, .threshold-scale { grid-template-columns: minmax(0, 1fr); }
   .decision-rail { position: static; max-height: none; margin: 0; padding: 0; overflow: visible; }
   .archive-tools { grid-template-columns: minmax(0, 1fr); }

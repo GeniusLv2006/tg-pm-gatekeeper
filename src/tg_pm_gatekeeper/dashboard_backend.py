@@ -253,7 +253,9 @@ class InProcessDashboardBackend:
         return {
             "page": page,
             "total": total,
-            "stats": self.store.enforcement_statistics(),
+            "stats": self.store.enforcement_statistics(archived=archived),
+            # Manual recovery covers every restriction without a control identity.
+            "unidentified_total": self.store.enforcement_statistics()["unidentified"],
             "reason_filter": reason,
             "older_days": older_days,
             "items": [self._case_value(item, identities.get(item.sender_key)) for item in items],
@@ -442,13 +444,17 @@ class InProcessDashboardBackend:
             )
             if not self._page_exists(page, total):
                 return None
-            payload = [
-                self._case_version(item, now)
-                for item in self.store.active_restrictions(
-                    archived=archived, reason=reason, archived_before=archived_before,
-                    limit=PAGE_SIZE, offset=offset, now=now
-                )
-            ]
+            payload = (
+                sorted(self.store.enforcement_statistics(archived=archived, now=now).items()),
+                self.store.enforcement_statistics(now=now)["unidentified"],
+                [
+                    self._case_version(item, now)
+                    for item in self.store.active_restrictions(
+                        archived=archived, reason=reason, archived_before=archived_before,
+                        limit=PAGE_SIZE, offset=offset, now=now
+                    )
+                ],
+            )
         elif path.startswith("/review/"):
             try:
                 item = self.store.review_item(int(path.removeprefix("/review/")))

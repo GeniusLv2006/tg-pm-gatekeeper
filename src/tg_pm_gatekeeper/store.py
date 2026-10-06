@@ -994,31 +994,15 @@ class StateStore:
         if offset < 0 or (limit is not None and limit < 1):
             raise ValueError("invalid active restriction page bounds")
         timestamp = int(time.time()) if now is None else now
-        if archived is True:
-            partition = (
-                "sender.status='suppressed' AND sender.suppressed_until IS NULL "
-                "AND sender.archived_at IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM pending_actions AS action WHERE "
-                "action.sender_key=sender.sender_key AND "
-                "action.status IN ('pending','failed')) "
-            )
-            ordering = "sender.archived_at DESC, sender.sender_key ASC"
-        elif archived is False:
-            partition = (
-                "sender.status IN ('quarantined','suppressed') AND ("
-                "sender.status='quarantined' OR sender.suppressed_until IS NOT NULL OR "
-                "sender.archived_at IS NULL OR EXISTS (SELECT 1 FROM pending_actions AS action "
-                "WHERE action.sender_key=sender.sender_key AND "
-                "action.status IN ('pending','failed'))) "
-            )
-            ordering = "sender.updated_at DESC, sender.sender_key ASC"
-        else:
-            partition = "sender.status IN ('quarantined','suppressed') "
-            ordering = "sender.updated_at DESC, sender.sender_key ASC"
-        filters = partition
+        ordering = (
+            "sender.archived_at DESC, sender.sender_key ASC"
+            if archived is True
+            else "sender.updated_at DESC, sender.sender_key ASC"
+        )
+        filters = self._restriction_partition(archived) + " "
         parameters: list[object] = [timestamp]
         if reason is not None:
-            filters += "AND sender.suppression_reason=? "
+            filters += f"AND {self._restriction_reason_sql()}=? "
             parameters.append(reason)
         if archived_before is not None:
             filters += "AND sender.archived_at<=? "
@@ -1037,45 +1021,67 @@ class StateStore:
         archived: bool | None = None,
         reason: str | None = None,
         archived_before: int | None = None,
+        now: int | None = None,
     ) -> int:
-        if archived is True:
-            where = (
-                "status='suppressed' AND suppressed_until IS NULL "
-                "AND archived_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "
-                "pending_actions AS action WHERE action.sender_key=sender_state.sender_key "
-                "AND action.status IN ('pending','failed'))"
-            )
-        elif archived is False:
-            where = (
-                "status IN ('quarantined','suppressed') AND (status='quarantined' OR "
-                "suppressed_until IS NOT NULL OR archived_at IS NULL OR EXISTS (SELECT 1 "
-                "FROM pending_actions AS action WHERE action.sender_key=sender_state.sender_key "
-                "AND action.status IN ('pending','failed')))"
-            )
-        else:
-            where = "status IN ('quarantined','suppressed')"
-        parameters: list[object] = []
+        timestamp = int(time.time()) if now is None else now
+        where = self._restriction_partition(archived)
+        parameters: list[object] = [timestamp]
         if reason is not None:
-            where += " AND suppression_reason=?"
+            where += f" AND {self._restriction_reason_sql()}=?"
             parameters.append(reason)
         if archived_before is not None:
-            where += " AND archived_at<=?"
+            where += " AND sender.archived_at<=?"
             parameters.append(archived_before)
         with self._lock:
             row = self._connection.execute(
-                f"SELECT COUNT(*) FROM sender_state WHERE {where}",  # noqa: S608 -- internal clauses
+                "SELECT COUNT(*) FROM sender_state AS sender "  # noqa: S608 -- internal clauses
+                "LEFT JOIN enforcement_reviews AS review ON "
+                "review.sender_key=sender.sender_key AND review.expires_at>? "
+                f"WHERE {where}",
                 tuple(parameters),
             ).fetchone()
         return int(row[0])
 
     @staticmethod
-    def _active_restriction_select() -> str:
+    def _restriction_partition(archived: bool | None) -> str:
+        """Return the WHERE clause shared by restriction lists, counts, and statistics.
+
+        Archived restrictions are confirmed permanent suppressions with no open work;
+        everything else that is still restricted needs attention.
+        """
+        if archived is True:
+            return (
+                "sender.status='suppressed' AND sender.suppressed_until IS NULL "
+                "AND sender.archived_at IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM pending_actions AS action WHERE "
+                "action.sender_key=sender.sender_key AND "
+                "action.status IN ('pending','failed'))"
+            )
+        if archived is False:
+            return (
+                "sender.status IN ('quarantined','suppressed') AND ("
+                "sender.status='quarantined' OR sender.suppressed_until IS NOT NULL OR "
+                "sender.archived_at IS NULL OR EXISTS (SELECT 1 FROM pending_actions AS action "
+                "WHERE action.sender_key=sender.sender_key AND "
+                "action.status IN ('pending','failed')))"
+            )
+        return "sender.status IN ('quarantined','suppressed')"
+
+    @staticmethod
+    def _restriction_reason_sql() -> str:
+        """Return the displayed restriction reason; filters must match what lists show."""
         return (
-            "SELECT sender.sender_key,sender.restriction_reference AS reference,"
-            "sender.status,COALESCE(sender.suppression_reason,review.reason,"
+            "COALESCE(sender.suppression_reason,review.reason,"
             "CASE WHEN EXISTS (SELECT 1 FROM review_queue AS verdict "
             "WHERE verdict.sender_key=sender.sender_key AND verdict.status='spam') "
-            "THEN 'manual_spam' ELSE 'reason_unavailable' END) AS reason,"
+            "THEN 'manual_spam' ELSE 'reason_unavailable' END)"
+        )
+
+    @classmethod
+    def _active_restriction_select(cls) -> str:
+        return (
+            "SELECT sender.sender_key,sender.restriction_reference AS reference,"  # noqa: S608 -- internal clauses
+            f"sender.status,{cls._restriction_reason_sql()} AS reason,"
             "sender.suppressed_until,sender.updated_at,review.envelope,"
             "review.created_at AS evidence_created_at,"
             "review.expires_at AS evidence_expires_at,sender.archived_at,"
@@ -1121,38 +1127,37 @@ class StateStore:
             )
         return cursor.rowcount == 1
 
-    def enforcement_statistics(self, *, now: int | None = None) -> dict[str, int]:
+    def enforcement_statistics(
+        self, *, archived: bool | None = None, now: int | None = None
+    ) -> dict[str, int]:
+        """Count restrictions in the same partition the restriction lists use."""
         timestamp = int(time.time()) if now is None else now
+        partition = self._restriction_partition(archived)
+        source = (
+            "FROM sender_state AS sender LEFT JOIN enforcement_reviews AS review "
+            "ON review.sender_key=sender.sender_key AND review.expires_at>? "
+            f"WHERE {partition}"
+        )
         with self._lock:
             rows = self._connection.execute(
-                "SELECT status,COUNT(*) AS count FROM sender_state "
-                "WHERE status IN ('quarantined','suppressed') GROUP BY status"
+                f"SELECT sender.status,COUNT(*) AS count {source} GROUP BY sender.status",  # noqa: S608 -- internal clauses
+                (timestamp,),
             ).fetchall()
             reasons = self._connection.execute(
-                "SELECT COALESCE(sender.suppression_reason,review.reason,"
-                "CASE WHEN EXISTS (SELECT 1 FROM review_queue AS verdict "
-                "WHERE verdict.sender_key=sender.sender_key AND verdict.status='spam') "
-                "THEN 'manual_spam' ELSE 'reason_unavailable' END) "
-                "AS reason,COUNT(*) AS count FROM sender_state AS sender "
-                "LEFT JOIN enforcement_reviews AS review "
-                "ON review.sender_key=sender.sender_key AND review.expires_at>? "
-                "WHERE sender.status IN ('quarantined','suppressed') GROUP BY reason"
-                ,
+                f"SELECT {self._restriction_reason_sql()} AS reason,COUNT(*) AS count "  # noqa: S608 -- internal clauses
+                f"{source} GROUP BY reason",
                 (timestamp,),
             ).fetchall()
             reviewable = int(
                 self._connection.execute(
-                    "SELECT COUNT(*) FROM enforcement_reviews AS review "
-                    "JOIN sender_state AS sender ON sender.sender_key=review.sender_key "
-                    "WHERE review.expires_at>? "
-                    "AND sender.status IN ('quarantined','suppressed')",
+                    f"SELECT COUNT(review.sender_key) {source}",  # noqa: S608 -- internal clauses
                     (timestamp,),
                 ).fetchone()[0]
             )
             identifiable = int(
                 self._connection.execute(
-                    "SELECT COUNT(*) FROM sender_state WHERE status IN "
-                    "('quarantined','suppressed') AND restriction_reference IS NOT NULL"
+                    f"SELECT COUNT(*) {source} AND sender.restriction_reference IS NOT NULL",  # noqa: S608 -- internal clauses
+                    (timestamp,),
                 ).fetchone()[0]
             )
         result = {

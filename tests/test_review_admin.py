@@ -410,6 +410,29 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         _, _, css = await self.server._dispatch("GET", "/dashboard.css", b"")
         self.assertIn(b':root[data-theme="dark"]', css)
 
+    async def test_list_statistics_and_reason_filters_match_each_list(self) -> None:
+        attention_key = self.protector.sender_key(123456789)
+        self.store.suppress(
+            attention_key, "challenge_timeout", until=int(time.time()) + 700,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+        self.store.suppress("a" * 64, "permanent_suppression", until=None)
+        self.assertTrue(self.store.archive_restriction("a" * 64))
+
+        cases = await self.server._enforcement_index_page()
+        archive = await self.server._enforcement_index_page(archived=True)
+
+        self.assertIn(b"<dt>Suppressed</dt><dd class='data-value'>1</dd>", cases)
+        self.assertIn(b"Challenge Timeout 1", cases)
+        self.assertNotIn(b"Permanent Suppression 1", cases)
+        self.assertIn(b"<dt>Evidence Unavailable</dt><dd class='data-value'>1</dd>", archive)
+        self.assertIn(b"reason=permanent_suppression", archive)
+        self.assertNotIn(b"reason=challenge_timeout", archive)
+        # The archived restriction has no control identity, so recovery stays offered.
+        self.assertIn(b"<details class='advanced-recovery'>", cases)
+
     async def test_dashboard_css_keeps_accessibility_rules(self) -> None:
         status, headers, page = await self.server._dispatch("GET", "/dashboard.css", b"")
         self.assertEqual(status, 200)

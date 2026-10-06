@@ -1070,6 +1070,7 @@ class DashboardHttpServer:
             "<tr class='empty-row'><td colspan='5'>"
             f"No {'archived' if archived else 'active'} restrictions.</td></tr>"
         )
+        scope = "archived" if archived else "active"
         reason_counts = sorted(
             (key.removeprefix("reason:"), value)
             for key, value in stats.items()
@@ -1078,27 +1079,29 @@ class DashboardHttpServer:
         reasons = " · ".join(
             f"{html.escape(self._reason_label(reason))} {count}"
             for reason, count in reason_counts
-        ) or "No active reasons"
+        ) or f"No {scope} reasons"
         snapshot_note = (
             f"{stats['unreviewable']} restriction"
             f"{'s' if stats['unreviewable'] != 1 else ''} "
             f"{'have' if stats['unreviewable'] != 1 else 'has'} no reviewable evidence; "
             "the restriction remains visible and manageable."
             if stats["unreviewable"]
-            else "Every active restriction currently has reviewable evidence."
+            else f"Every {scope} restriction currently has reviewable evidence."
         )
         identity_note = (
             f" {stats['unidentified']} restriction"
             f"{'s' if stats['unidentified'] != 1 else ''} without a control identity require"
             f"{'s' if stats['unidentified'] == 1 else ''} manual ID recovery."
             if stats["unidentified"]
-            else " Every active restriction has a retained encrypted control identity."
+            else f" Every {scope} restriction has a retained encrypted control identity."
         )
+        # Recovery spans both lists, so an archived restriction without identity stays reachable.
+        unidentified_total = int(result.get("unidentified_total", stats["unidentified"]))
         recovery = ""
-        if stats["unidentified"]:
+        if unidentified_total:
             recovery = (
                 "<details class='advanced-recovery'><summary>Advanced Recovery"
-                f" <span class='summary-note'>{stats['unidentified']} unidentified</span></summary>"
+                f" <span class='summary-note'>{unidentified_total} unidentified</span></summary>"
                 "<div class='advanced-recovery-content'>"
                 "<h2>Allow an Unidentified Restricted Sender by Telegram User ID</h2>"
                 "<p>Use this only for a restriction without an encrypted control identity, such as "
@@ -1170,13 +1173,25 @@ class DashboardHttpServer:
                 "Review every current restriction. Evidence availability is tracked "
                 "separately; Telegram block is never used."
             )
+        # Statistics cover exactly the restrictions this list shows.
+        if archived:
+            stat_items = [
+                ("Reviewable Evidence", stats["reviewable"]),
+                ("Evidence Unavailable", stats["unreviewable"]),
+            ]
+        else:
+            stat_items = [
+                ("Quarantined", stats["quarantined"]),
+                ("Suppressed", stats["suppressed"]),
+                ("Reviewable Evidence", stats["reviewable"]),
+            ]
         stat_strip = (
-            "<div class='stat-block'><p class='stat-caption'>All enforced restrictions, "
-            "including archived</p><dl class='stat-strip'>"
-            f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
-            f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
-            f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div>"
-            "</dl></div>"
+            "<dl class='stat-strip'>"
+            + "".join(
+                f"<div><dt>{label}</dt><dd class='data-value'>{value}</dd></div>"
+                for label, value in stat_items
+            )
+            + "</dl>"
         )
         live_region = "archived-restrictions" if archived else "active-cases"
         content = (
