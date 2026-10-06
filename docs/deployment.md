@@ -206,7 +206,7 @@ Set `TG_TELEGRAM_OPERATOR_CONTROLS_ENABLED=false` and recreate the service to di
 One row represents one sender. The row contains a consolidated message count and one encrypted reference, not a stored conversation history. Opening it fetches one referenced message and the sender from Telegram.
 
 - **Allow Sender** restores a Gatekeeper-managed archive when needed and allows the sender.
-- **Suppress and Delete** records an explicit manual permanent suppression and schedules whole-dialog deletion.
+- **Suppress and Delete** opens a confirmation page that states the consequences. Confirming records an explicit manual permanent suppression and schedules whole-dialog deletion for both sides, which runs immediately in either mode and cannot be undone. The decision is accepted only from that page.
 - **Dismiss & Cancel Jobs** records no classification, performs no immediate Telegram action, and cancels pending or failed Gatekeeper deletion jobs for that sender.
 
 If the referenced Telegram message has been deleted, use **Dismiss & Cancel Jobs**. This clears the local review without changing the current sender trust or restriction state.

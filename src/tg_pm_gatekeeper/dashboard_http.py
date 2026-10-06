@@ -370,6 +370,10 @@ class DashboardHttpServer:
             return await self._dispatch_enforcement(method, path, body)
         if not path.startswith("/review/"):
             return 404, {}, self._page("Not Found")
+        if path.endswith("/spam"):
+            return await self._dispatch_spam_confirmation(
+                method, path.removeprefix("/review/").removesuffix("/spam"), body
+            )
         try:
             review_id = int(path.removeprefix("/review/"))
         except ValueError:
@@ -386,6 +390,9 @@ class DashboardHttpServer:
         action = values.get("action", [""])[0]
         if not secrets.compare_digest(token, self._csrf_token):
             return 400, {}, self._page("Invalid Action Token")
+        if action == "spam":
+            # Deleting the conversation is irreversible; it is accepted only after confirmation.
+            return 400, {}, self._page("Confirmation Required")
         try:
             await self.backend.request(
                 "reviews.decide", {"review_id": review_id, "action": action}
@@ -935,6 +942,56 @@ class DashboardHttpServer:
             return self._backend_error(exc.code)
         return 303, {"Location": "/cases/archive"}, b""
 
+    async def _dispatch_spam_confirmation(
+        self, method: str, raw_review_id: str, body: bytes
+    ) -> tuple[int, dict[str, str], bytes]:
+        if not raw_review_id.isascii() or not raw_review_id.isdecimal():
+            return 404, {}, self._page("Not Found")
+        review_id = int(raw_review_id)
+        if method == "GET":
+            try:
+                item = await self.backend.request(
+                    "reviews.detail", {"review_id": review_id}
+                )
+            except DashboardBackendError as exc:
+                return self._backend_error(exc.code)
+            identity_value = self._identity_from_value(item.get("identity"))
+            identity = "this sender"
+            if identity_value is not None:
+                identity = identity_value.name or f"ID {identity_value.user_id}"
+                if identity_value.username:
+                    identity += f" (@{identity_value.username})"
+            return 200, {}, self._confirmation_page(
+                nav="reviews",
+                title=f"Suppress {identity} and Delete the Conversation?",
+                body=(
+                    "This permanently suppresses the sender and deletes the whole Telegram "
+                    "conversation for both sides. Gatekeeper archives and mutes the dialog "
+                    "first if needed, then runs the deletion immediately, including in "
+                    "Monitor mode. Every pending review for this sender is resolved as spam. "
+                    "Deleted messages cannot be recovered; allowing the sender later only "
+                    "lifts the restriction."
+                ),
+                action=f"/review/{review_id}/spam",
+                button="Suppress and Delete",
+                tone="block",
+                cancel_href=f"/review/{review_id}",
+                page_title="Suppress and Delete",
+                warning="Irreversible Telegram Action",
+            )
+        if method != "POST":
+            return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
+        values = parse_qs(body.decode("utf-8"), strict_parsing=True)
+        if not secrets.compare_digest(values.get("token", [""])[0], self._csrf_token):
+            return 400, {}, self._page("Invalid Action Token")
+        try:
+            await self.backend.request(
+                "reviews.decide", {"review_id": review_id, "action": "spam"}
+            )
+        except DashboardBackendError as exc:
+            return self._backend_error(exc.code)
+        return 303, {"Location": "/review"}, b""
+
     async def _dispatch_archive_confirmation(
         self, method: str, sender_key: str, body: bytes
     ) -> tuple[int, dict[str, str], bytes]:
@@ -1466,7 +1523,7 @@ class DashboardHttpServer:
                 "<p class='rail-help'>This decision applies to all pending entries for this "
                 "sender.</p><div class='action-stack'>"
                 + self._action_form(item.id, "legitimate", "Allow Sender", tone="allow")
-                + self._action_form(item.id, "spam", "Suppress and Delete", tone="block")
+                + f"<a class='btn btn-block' href='/review/{item.id}/spam'>Suppress and Delete…</a>"
                 + self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")
                 + "</div></section>"
             )
@@ -1945,6 +2002,10 @@ class DashboardHttpServer:
                 "Dashboard Signed Out": (
                     "This browser session has been revoked. Run the tunnel helper again when "
                     "you need to reopen the dashboard."
+                ),
+                "Confirmation Required": (
+                    "Suppress and Delete deletes the Telegram conversation, so it must be "
+                    "confirmed on its own page. Nothing was changed."
                 ),
                 "Request Failed": (
                     "The request could not be completed. No dashboard action was confirmed."
