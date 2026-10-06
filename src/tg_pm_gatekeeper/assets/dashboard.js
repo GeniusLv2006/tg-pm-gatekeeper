@@ -207,7 +207,9 @@
   });
   refreshButton?.addEventListener('click', () => {
     const changeNotice = document.querySelector('[data-change-notice]');
-    if (root.dataset.liveRefresh === 'notice' && changeNotice && !changeNotice.hidden) {
+    // Pages without live updates (confirmations) reload in place, so the control behaves the same everywhere.
+    if (!root.dataset.liveRefresh ||
+        (root.dataset.liveRefresh === 'notice' && changeNotice && !changeNotice.hidden)) {
       navigate(location.href, {pop: true, scroll: [window.scrollX, window.scrollY]});
       return;
     }

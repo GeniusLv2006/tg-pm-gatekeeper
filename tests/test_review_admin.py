@@ -253,9 +253,11 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_archive_cleanup_is_inside_main_and_live_region(self) -> None:
         page = await self.server._enforcement_index_page(archived=True)
-        main_start = page.index(b"<main class='list-main' data-live-region=")
-        cleanup = page.index(b"class='queue-intro compact-intro archive-tools'")
-        main_end = page.index(b"</main>", main_start)
+        main_start = page.index(
+            b"<main class='page'><div class='live-region' data-live-region="
+        )
+        cleanup = page.index(b"<section class='archive-tools'")
+        main_end = page.index(b"</div><section class='advanced-recovery-wrap'", main_start)
         self.assertLess(main_start, cleanup)
         self.assertLess(cleanup, main_end)
         self.assertIn(b"Preview release and forget", page[cleanup:main_end])
@@ -333,6 +335,55 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"First explanation", queue)
         self.assertIn(b"First explanation", detail)
         self.assertIn(b"Second explanation", detail)
+
+    async def test_review_detail_recomputes_policy_from_signal_weights(self) -> None:
+        self.store._connection.execute(
+            "UPDATE review_queue SET signals=? WHERE id=?",
+            (
+                '[{"code":"MULTIPLE_LINK_BUTTONS","source":"button","weight":25},'
+                '{"code":"PROMOTIONAL_LANGUAGE","source":"authored","weight":20}]',
+                self.review_id,
+            ),
+        )
+        _, _, detail = await self.server._dispatch(
+            "GET", f"/review/{self.review_id}", b""
+        )
+
+        self.assertIn(b"<strong>45</strong><small>Additive points", detail)
+        self.assertIn(b"<strong>Strict Challenge</strong>", detail)
+        self.assertIn(b"Recomputed from the recorded signal weights", detail)
+
+    async def test_review_detail_skips_policy_for_legacy_rule_codes(self) -> None:
+        _, _, detail = await self.server._dispatch(
+            "GET", f"/review/{self.review_id}", b""
+        )
+
+        self.assertNotIn(b"policy-map", detail)
+        self.assertIn(b"Multiple Link Buttons", detail)
+
+    async def test_overview_shows_policy_thresholds(self) -> None:
+        page = await self.server._dashboard_page()
+
+        self.assertIn(b"Scoring Policy", page)
+        self.assertIn(b"<b>30+</b><span>Strict Challenge</span>", page)
+        self.assertIn(b"<b>70+</b><span>Permanent Suppression", page)
+
+    async def test_theme_script_loads_before_paint_and_is_served(self) -> None:
+        page = await self.server._dashboard_page()
+        self.assertIn(
+            b'<script src="/dashboard-theme.js"></script>'
+            b'<script src="/dashboard.js" defer></script></head>',
+            page,
+        )
+        self.assertIn(b"data-theme-toggle", page)
+        status, headers, script = await self.server._dispatch(
+            "GET", "/dashboard-theme.js", b""
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+        self.assertIn(b"prefers-color-scheme: dark", script)
+        _, _, css = await self.server._dispatch("GET", "/dashboard.css", b"")
+        self.assertIn(b':root[data-theme="dark"]', css)
 
     async def test_dashboard_css_keeps_accessibility_rules(self) -> None:
         status, headers, page = await self.server._dispatch("GET", "/dashboard.css", b"")
@@ -898,7 +949,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(status, 200)
-        self.assertIn(b"class=\"policy-map\"", detail)
+        self.assertIn(b"class=\"rail-card policy-map\"", detail)
         self.assertIn(b"Risk score 30; strict challenge starts at 30", detail)
         self.assertIn(b"<strong>30</strong><small>Additive points", detail)
         self.assertIn(b"<span class=\"policy-version\">adaptive-v2</span>", detail)
@@ -1089,7 +1140,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "GET", "/cases/archive/forget?days=90", b""
         )
         self.assertEqual(status, 200)
-        self.assertIn(b"1 Eligible", preview)
+        self.assertIn(b"Release and Forget 1 Archived Restriction?", preview)
         body = urlencode(
             {"token": self.server._csrf_token, "days": "90"}
         ).encode()
