@@ -176,6 +176,34 @@ CREATE INDEX IF NOT EXISTS sender_state_archive_idx
     ON sender_state(status, archived_at, updated_at);
 """
 
+# Every table holding sender_key rows. Forgetting a sender erases each one, so a new
+# sender-linked table must be added here; sender_state stays last.
+SENDER_LINKED_TABLES = (
+    "processed_messages",
+    "audit",
+    "link_events",
+    "outbound_events",
+    "automated_messages",
+    "dialog_snapshots",
+    "review_queue",
+    "pending_actions",
+    "decision_events",
+    "campaign_events",
+    "enforcement_reviews",
+    "sender_state",
+)
+# Restriction data that no longer applies once a temporary suppression expires.
+RELEASED_RESTRICTION_TABLES = ("enforcement_reviews", "review_queue", "dialog_snapshots")
+
+ARCHIVED_PERMANENT_SQL = (
+    "status='suppressed' AND suppressed_until IS NULL AND archived_at IS NOT NULL"
+)
+OPEN_ACTION_SQL = (
+    "EXISTS (SELECT 1 FROM pending_actions "
+    "WHERE pending_actions.sender_key=sender_state.sender_key "
+    "AND pending_actions.status IN ('pending','failed'))"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SenderState:
@@ -680,32 +708,33 @@ class StateStore:
     ) -> bool:
         timestamp = int(time.time()) if now is None else now
         with self._lock, self._connection:
-            cursor = self._connection.execute(
-                "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
-                "suppressed_until=NULL,challenge_action_reference=NULL,"
-                "restriction_reference=NULL,revision=revision+1,"
-                "archived_at=NULL,"
-                "updated_at=? WHERE sender_key=? AND status='suppressed' "
-                "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
-                (timestamp, sender_key, timestamp),
+            return self._release_expired_suppression(sender_key, timestamp)
+
+    def _release_expired_suppression(self, sender_key: str, timestamp: int) -> bool:
+        """Release one expired temporary suppression inside the caller's transaction."""
+        cursor = self._connection.execute(
+            "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
+            "suppressed_until=NULL,challenge_action_reference=NULL,"
+            "restriction_reference=NULL,revision=revision+1,"
+            "archived_at=NULL,"
+            "updated_at=? WHERE sender_key=? AND status='suppressed' "
+            "AND suppressed_until IS NOT NULL AND suppressed_until<=?",
+            (timestamp, sender_key, timestamp),
+        )
+        if cursor.rowcount != 1:
+            return False
+        self._connection.execute(
+            "UPDATE pending_actions SET status='cancelled',finished_at=?,"
+            "reference=X'' "
+            "WHERE sender_key=? AND status IN ('pending','failed')",
+            (timestamp, sender_key),
+        )
+        for table in RELEASED_RESTRICTION_TABLES:
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE sender_key=?",  # noqa: S608
+                (sender_key,),
             )
-            if cursor.rowcount == 1:
-                self._connection.execute(
-                    "UPDATE pending_actions SET status='cancelled',finished_at=?,"
-                    "reference=X'' "
-                    "WHERE sender_key=? AND status IN ('pending','failed')",
-                    (timestamp, sender_key),
-                )
-                self._connection.execute(
-                    "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
-                )
-                self._connection.execute(
-                    "DELETE FROM review_queue WHERE sender_key=?", (sender_key,)
-                )
-                self._connection.execute(
-                    "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
-                )
-        return cursor.rowcount == 1
+        return True
 
     def set_challenge(
         self,
@@ -1204,12 +1233,9 @@ class StateStore:
         """Erase one archived permanent restriction and every sender-linked row."""
         with self._lock, self._connection:
             eligible = self._connection.execute(
-                "SELECT 1 FROM sender_state WHERE sender_key=? AND status='suppressed' "
-                "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
-                "AND (? IS NULL OR archived_at<=?) AND NOT EXISTS ("
-                "SELECT 1 FROM pending_actions WHERE sender_key=? AND status IN "
-                "('pending','failed'))",
-                (sender_key, archived_before, archived_before, sender_key),
+                f"SELECT 1 FROM sender_state WHERE sender_key=? AND {ARCHIVED_PERMANENT_SQL} "  # noqa: S608
+                f"AND (? IS NULL OR archived_at<=?) AND NOT {OPEN_ACTION_SQL}",
+                (sender_key, archived_before, archived_before),
             ).fetchone()
             if eligible is None:
                 return False
@@ -1220,8 +1246,7 @@ class StateStore:
         """Candidates only; every deletion must recheck eligibility in its transaction."""
         with self._lock:
             rows = self._connection.execute(
-                "SELECT sender_key FROM sender_state WHERE status='suppressed' "
-                "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
+                f"SELECT sender_key FROM sender_state WHERE {ARCHIVED_PERMANENT_SQL} "  # noqa: S608
                 "AND archived_at<=? ORDER BY sender_key",
                 (cutoff,),
             ).fetchall()
@@ -1248,31 +1273,18 @@ class StateStore:
     def archived_before_count(self, cutoff: int) -> int:
         with self._lock:
             row = self._connection.execute(
-                "SELECT COUNT(*) FROM sender_state WHERE status='suppressed' "
-                "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
-                "AND archived_at<=? AND NOT EXISTS (SELECT 1 FROM pending_actions "
-                "WHERE pending_actions.sender_key=sender_state.sender_key "
-                "AND status IN ('pending','failed'))",
+                f"SELECT COUNT(*) FROM sender_state WHERE {ARCHIVED_PERMANENT_SQL} "  # noqa: S608
+                f"AND archived_at<=? AND NOT {OPEN_ACTION_SQL}",
                 (cutoff,),
             ).fetchone()
         return int(row[0])
 
     def _erase_sender_rows(self, sender_key: str) -> None:
-        for statement in (
-            "DELETE FROM processed_messages WHERE sender_key=?",
-            "DELETE FROM audit WHERE sender_key=?",
-            "DELETE FROM link_events WHERE sender_key=?",
-            "DELETE FROM outbound_events WHERE sender_key=?",
-            "DELETE FROM automated_messages WHERE sender_key=?",
-            "DELETE FROM dialog_snapshots WHERE sender_key=?",
-            "DELETE FROM review_queue WHERE sender_key=?",
-            "DELETE FROM pending_actions WHERE sender_key=?",
-            "DELETE FROM decision_events WHERE sender_key=?",
-            "DELETE FROM campaign_events WHERE sender_key=?",
-            "DELETE FROM enforcement_reviews WHERE sender_key=?",
-            "DELETE FROM sender_state WHERE sender_key=?",
-        ):
-            self._connection.execute(statement, (sender_key,))
+        for table in SENDER_LINKED_TABLES:
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE sender_key=?",  # noqa: S608
+                (sender_key,),
+            )
 
     def expire_challenge(
         self,
@@ -1939,29 +1951,10 @@ class StateStore:
                 )
                 if permitted is None or str(row["sender_key"]) in permitted
             ]
-            for sender_key in expired:
-                self._connection.execute(
-                    "UPDATE pending_actions SET status='cancelled',finished_at=?,"
-                    "reference=X'' "
-                    "WHERE sender_key=? AND status IN ('pending','failed')",
-                    (timestamp, sender_key),
-                )
-                self._connection.execute(
-                    "UPDATE sender_state SET status='unknown',suppression_reason=NULL,"
-                    "suppressed_until=NULL,challenge_action_reference=NULL,"
-                    "restriction_reference=NULL,archived_at=NULL,revision=revision+1,"
-                    "updated_at=? WHERE sender_key=?",
-                    (timestamp, sender_key),
-                )
-                self._connection.execute(
-                    "DELETE FROM enforcement_reviews WHERE sender_key=?", (sender_key,)
-                )
-                self._connection.execute(
-                    "DELETE FROM review_queue WHERE sender_key=?", (sender_key,)
-                )
-                self._connection.execute(
-                    "DELETE FROM dialog_snapshots WHERE sender_key=?", (sender_key,)
-                )
+            temporary_released = sum(
+                self._release_expired_suppression(sender_key, timestamp)
+                for sender_key in expired
+            )
             self._connection.execute(
                 "DELETE FROM audit WHERE created_at < ?", (cutoff,)
             )
@@ -2009,20 +2002,14 @@ class StateStore:
                 )
                 skipped = int(
                     self._connection.execute(
-                        "SELECT COUNT(*) FROM sender_state WHERE status='suppressed' "
-                        "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
-                        "AND archived_at<=? AND EXISTS (SELECT 1 FROM pending_actions "
-                        "WHERE pending_actions.sender_key=sender_state.sender_key "
-                        "AND status IN ('pending','failed'))",
+                        f"SELECT COUNT(*) FROM sender_state WHERE {ARCHIVED_PERMANENT_SQL} "  # noqa: S608
+                        f"AND archived_at<=? AND {OPEN_ACTION_SQL}",
                         (archive_cutoff,),
                     ).fetchone()[0]
                 )
                 rows = self._connection.execute(
-                    "SELECT sender_key FROM sender_state WHERE status='suppressed' "
-                    "AND suppressed_until IS NULL AND archived_at IS NOT NULL "
-                    "AND archived_at<=? AND NOT EXISTS (SELECT 1 FROM pending_actions "
-                    "WHERE pending_actions.sender_key=sender_state.sender_key "
-                    "AND status IN ('pending','failed'))",
+                    f"SELECT sender_key FROM sender_state WHERE {ARCHIVED_PERMANENT_SQL} "  # noqa: S608
+                    f"AND archived_at<=? AND NOT {OPEN_ACTION_SQL}",
                     (archive_cutoff,),
                 ).fetchall()
                 for row in rows:
@@ -2033,7 +2020,7 @@ class StateStore:
             maintenance = {
                 "auto_forgotten": auto_forgotten,
                 "auto_forget_skipped": skipped,
-                "temporary_released": len(expired),
+                "temporary_released": temporary_released,
             }
             for key, value in maintenance.items():
                 self._connection.execute(
