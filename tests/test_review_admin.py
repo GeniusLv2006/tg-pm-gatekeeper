@@ -1522,9 +1522,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
         )
-        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
+        body = urlencode({"token": self.server._csrf_token}).encode()
         status, _, _ = await self.server._dispatch(
-            "POST", f"/review/{self.review_id}", body
+            "POST", f"/review/{self.review_id}/spam", body
         )
         self.assertEqual(status, 303)
         self.assertEqual(len(self.client.requests), 3)
@@ -1563,11 +1563,54 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.scheduled_deletions), 1)
         self.assertTrue(self.store.pending_actions()[0].mode_independent)
 
+    async def test_spam_decision_requires_confirmation_page(self) -> None:
+        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
+        status, _, response = await self.server._dispatch(
+            "POST", f"/review/{self.review_id}", body
+        )
+
+        self.assertEqual(status, 400)
+        self.assertIn(b"Confirmation Required", response)
+        self.assertEqual(self.store.review_item(self.review_id).status, "pending")
+        self.assertEqual(self.store.sender("sender").status, "unknown")
+        self.assertEqual(self.scheduled_deletions, [])
+
+    async def test_spam_confirmation_page_states_irreversible_deletion(self) -> None:
+        _, _, detail = await self.server._dispatch("GET", f"/review/{self.review_id}", b"")
+        status, _, page = await self.server._dispatch(
+            "GET", f"/review/{self.review_id}/spam", b""
+        )
+
+        self.assertIn(f"href='/review/{self.review_id}/spam'".encode(), detail)
+        self.assertNotIn(b"name='action' value='spam'", detail)
+        self.assertEqual(status, 200)
+        self.assertIn(b"Irreversible Telegram Action", page)
+        self.assertIn(b"Suppress Test Sender (@testsender) and Delete the Conversation?", page)
+        self.assertIn(b"for both sides", page)
+        self.assertIn(b"including in Monitor mode", page)
+        self.assertIn(f"action='/review/{self.review_id}/spam'".encode(), page)
+        self.assertIn(f"href='/review/{self.review_id}'>Cancel".encode(), page)
+        self.assertEqual(self.store.review_item(self.review_id).status, "pending")
+
+    async def test_spam_confirmation_rejects_invalid_token_and_review_id(self) -> None:
+        status, _, response = await self.server._dispatch(
+            "POST",
+            f"/review/{self.review_id}/spam",
+            urlencode({"token": "invalid"}).encode(),
+        )
+        self.assertEqual(status, 400)
+        self.assertIn(b"Invalid Action Token", response)
+        self.assertEqual(self.store.review_item(self.review_id).status, "pending")
+        self.assertEqual(self.scheduled_deletions, [])
+
+        status, _, _ = await self.server._dispatch("GET", "/review/abc/spam", b"")
+        self.assertEqual(status, 404)
+
     async def test_spam_decision_converts_existing_quarantine_to_suppression(self) -> None:
         self.store.quarantine("sender", 150)
-        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
+        body = urlencode({"token": self.server._csrf_token}).encode()
         status, _, _ = await self.server._dispatch(
-            "POST", f"/review/{self.review_id}", body
+            "POST", f"/review/{self.review_id}/spam", body
         )
         self.assertEqual(status, 303)
         self.assertEqual(self.client.requests, [])
@@ -1577,9 +1620,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_spam_partial_archive_failure_is_compensated(self) -> None:
         self.client.fail_next_mute = True
-        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
+        body = urlencode({"token": self.server._csrf_token}).encode()
         status, _, _ = await self.server._dispatch(
-            "POST", f"/review/{self.review_id}", body
+            "POST", f"/review/{self.review_id}/spam", body
         )
         self.assertEqual(status, 500)
         folder_requests = [
