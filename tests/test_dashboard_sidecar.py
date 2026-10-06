@@ -79,15 +79,15 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authenticated_page_extends_idle_lifetime(self) -> None:
         sidecar = self.make_sidecar(idle_seconds=1)
-        sidecar.server._activate_session()
+        sidecar.server.credentials.activate_session()
         before = sidecar._last_authenticated_activity
         await asyncio.sleep(0)
         headers = {
             "host": "127.0.0.1:8765",
-            "cookie": f"tg_pm_gatekeeper_session={sidecar.server._session_token}",
+            "cookie": f"tg_pm_gatekeeper_session={sidecar.server.credentials.session_token}",
         }
         status, _, _ = await sidecar.server._dispatch(
-            "GET", f"/{sidecar.server._capability_token}/", b"", request_headers=headers
+            "GET", f"/{sidecar.server.credentials.capability_token}/", b"", request_headers=headers
         )
         self.assertEqual(status, 200)
         self.assertGreaterEqual(sidecar._last_authenticated_activity, before)
@@ -114,16 +114,16 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         sidecar = self.make_sidecar(idle_seconds=1)
-        sidecar.server._activate_session()
+        sidecar.server.credentials.activate_session()
         started = sidecar._last_authenticated_activity
         headers = {
             "host": "127.0.0.1:8765",
-            "cookie": f"tg_pm_gatekeeper_session={sidecar.server._session_token}",
+            "cookie": f"tg_pm_gatekeeper_session={sidecar.server.credentials.session_token}",
         }
 
         status, _, _ = await sidecar.server._dispatch(
             "GET",
-            f"/{sidecar.server._capability_token}/missing",
+            f"/{sidecar.server.credentials.capability_token}/missing",
             b"",
             request_headers=headers,
         )
@@ -133,7 +133,7 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
 
         status, _, _ = await sidecar.server._dispatch(
             "POST",
-            f"/{sidecar.server._capability_token}/logout",
+            f"/{sidecar.server.credentials.capability_token}/logout",
             b"token=invalid",
             request_headers=headers,
         )
@@ -142,15 +142,15 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_logout_requests_shutdown_after_response(self) -> None:
         sidecar = self.make_sidecar(idle_seconds=1)
-        sidecar.server._activate_session()
+        sidecar.server.credentials.activate_session()
         headers = {
             "host": "127.0.0.1:8765",
-            "cookie": f"tg_pm_gatekeeper_session={sidecar.server._session_token}",
+            "cookie": f"tg_pm_gatekeeper_session={sidecar.server.credentials.session_token}",
         }
-        body = f"token={sidecar.server._csrf_token}".encode()
+        body = f"token={sidecar.server.credentials.csrf_token}".encode()
         status, _, _ = await sidecar.server._dispatch(
             "POST",
-            f"/{sidecar.server._capability_token}/logout",
+            f"/{sidecar.server.credentials.capability_token}/logout",
             body,
             request_headers=headers,
         )
@@ -170,9 +170,9 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
     def test_each_starting_process_has_fresh_capabilities_and_cookie_secret(self) -> None:
         first = self.make_sidecar(idle_seconds=1)
         second = self.make_sidecar(idle_seconds=1)
-        self.assertNotEqual(first.server._access_token, second.server._access_token)
-        self.assertNotEqual(first.server._capability_token, second.server._capability_token)
-        self.assertNotEqual(first.server._csrf_token, second.server._csrf_token)
+        self.assertNotEqual(first.server.credentials.access_token, second.server.credentials.access_token)
+        self.assertNotEqual(first.server.credentials.capability_token, second.server.credentials.capability_token)
+        self.assertNotEqual(first.server.credentials.csrf_token, second.server.credentials.csrf_token)
 
     async def test_real_sidecar_idle_exit_removes_socket_and_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -202,14 +202,14 @@ class DashboardSidecarTests(unittest.IsolatedAsyncioTestCase):
             backend = SlowWriteBackend()
             server = DashboardHttpServer(socket_path, backend)
             await server.start()
-            server._activate_session()
+            server.credentials.activate_session()
             reader, writer = await asyncio.open_unix_connection(socket_path)
-            body = f"token={server._csrf_token}&action=dismiss".encode()
+            body = f"token={server.credentials.csrf_token}&action=dismiss".encode()
             writer.write(
                 (
-                    f"POST /{server._capability_token}/review/1 HTTP/1.1\r\n"
+                    f"POST /{server.credentials.capability_token}/review/1 HTTP/1.1\r\n"
                     "Host: 127.0.0.1:8765\r\n"
-                    f"Cookie: tg_pm_gatekeeper_session={server._session_token}\r\n"
+                    f"Cookie: tg_pm_gatekeeper_session={server.credentials.session_token}\r\n"
                     f"Content-Length: {len(body)}\r\n\r\n"
                 ).encode()
                 + body

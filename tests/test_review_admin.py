@@ -15,6 +15,9 @@ from urllib.parse import urlencode
 from telethon import functions, types
 
 from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
+from tg_pm_gatekeeper.dashboard_views.components import render_page
+from tg_pm_gatekeeper.dashboard_views.evidence import policy_decision_panel
+from tg_pm_gatekeeper.dashboard_views.labels import restriction_summary
 from tg_pm_gatekeeper.message_facts import facts_from_message
 from tg_pm_gatekeeper.review_admin import (
     DASHBOARD_SESSION_ABSOLUTE_SECONDS,
@@ -103,12 +106,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def authenticated_headers(self, **extra: str) -> dict[str, str]:
-        if self.server._session_token is None:
-            self.server._activate_session()
+        if self.server.credentials.session_token is None:
+            self.server.credentials.activate_session()
         return {
             "host": "127.0.0.1:8765",
             "cookie": (
-                f"{DASHBOARD_SESSION_COOKIE}={self.server._session_token}"
+                f"{DASHBOARD_SESSION_COOKIE}={self.server.credentials.session_token}"
             ),
             **extra,
         }
@@ -156,7 +159,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Telegram and trust state are unchanged", response)
 
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "dismiss"}
+            {"token": self.server.credentials.csrf_token, "action": "dismiss"}
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
@@ -172,11 +175,11 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_deleted_review_resolves_through_authenticated_post(self) -> None:
         self.client.message = None
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "dismiss"}
+            {"token": self.server.credentials.csrf_token, "action": "dismiss"}
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
-            f"/{self.server._capability_token}/review/{self.review_id}",
+            f"/{self.server.credentials.capability_token}/review/{self.review_id}",
             body,
             request_headers=self.authenticated_headers(
                 origin="http://127.0.0.1:8765"
@@ -184,40 +187,40 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 303)
         self.assertEqual(
-            headers["Location"], f"/{self.server._capability_token}/review"
+            headers["Location"], f"/{self.server.credentials.capability_token}/review"
         )
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_accepts_missing_origin(self) -> None:
         self.client.message = None
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "dismiss"}
+            {"token": self.server.credentials.csrf_token, "action": "dismiss"}
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
-            f"/{self.server._capability_token}/review/{self.review_id}",
+            f"/{self.server.credentials.capability_token}/review/{self.review_id}",
             body,
             request_headers=self.authenticated_headers(),
         )
         self.assertEqual(status, 303)
         self.assertEqual(
-            headers["Location"], f"/{self.server._capability_token}/review"
+            headers["Location"], f"/{self.server.credentials.capability_token}/review"
         )
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
     async def test_authenticated_post_accepts_noncanonical_origin(self) -> None:
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "dismiss"}
+            {"token": self.server.credentials.csrf_token, "action": "dismiss"}
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
-            f"/{self.server._capability_token}/review/{self.review_id}",
+            f"/{self.server.credentials.capability_token}/review/{self.review_id}",
             body,
             request_headers=self.authenticated_headers(origin="null"),
         )
         self.assertEqual(status, 303)
         self.assertEqual(
-            headers["Location"], f"/{self.server._capability_token}/review"
+            headers["Location"], f"/{self.server.credentials.capability_token}/review"
         )
         self.assertEqual(self.store.review_item(self.review_id).status, "dismissed")
 
@@ -227,7 +230,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(origin=origin):
                 status, _, response = await self.server._dispatch(
                     "POST",
-                    f"/{self.server._capability_token}/review/{self.review_id}",
+                    f"/{self.server.credentials.capability_token}/review/{self.review_id}",
                     body,
                     request_headers=self.authenticated_headers(origin=origin),
                 )
@@ -282,7 +285,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"data-dashboard-content", page)
         self.assertIn(b'<script src="/dashboard.js" defer></script>', page)
         self.assertNotIn(b"data-live-refresh=", page)
-        error = self.server._page("Not Found")
+        error = render_page("Not Found")
         self.assertNotIn(b"data-dashboard-page", error)
         self.assertNotIn(b"dashboard.js", error)
 
@@ -462,20 +465,20 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(
-            self.server._restriction_summary(restriction("quarantined", None)),
+            restriction_summary(restriction("quarantined", None)),
             "Review needed",
         )
         self.assertEqual(
-            self.server._restriction_summary(restriction("suppressed", None)),
+            restriction_summary(restriction("suppressed", None)),
             "No automatic release",
         )
         self.assertEqual(
-            self.server._restriction_summary(restriction("suppressed", now - 1)),
+            restriction_summary(restriction("suppressed", now - 1)),
             "Awaiting next message",
         )
         self.assertIn(
             "remaining",
-            self.server._restriction_summary(restriction("suppressed", now + 700)),
+            restriction_summary(restriction("suppressed", now + 700)),
         )
 
     async def test_dashboard_script_pauses_hidden_tabs_and_keeps_logout_enabled(self) -> None:
@@ -543,7 +546,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.entity_requests, 1)
 
     async def test_error_page_uses_dashboard_layout_and_actionable_copy(self) -> None:
-        response = self.server._page("Invalid Access Token")
+        response = render_page("Invalid Access Token")
         self.assertIn(b'href="/dashboard-error.css"', response)
         status, headers, _ = await self.server._dispatch(
             "GET",
@@ -615,13 +618,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 stat.S_IMODE(self.server.socket_path.stat().st_mode), 0o600
             )
             reader, writer = await asyncio.open_unix_connection(self.server.socket_path)
-            self.server._activate_session()
+            self.server.credentials.activate_session()
             writer.write(
                 (
-                    f"GET /{self.server._capability_token}/dashboard.js HTTP/1.1\r\n"
+                    f"GET /{self.server.credentials.capability_token}/dashboard.js HTTP/1.1\r\n"
                     "Host: 127.0.0.1:8765\r\n"
                     f"Cookie: {DASHBOARD_SESSION_COOKIE}="
-                    f"{self.server._session_token}\r\n\r\n"
+                    f"{self.server.credentials.session_token}\r\n\r\n"
                 ).encode("ascii")
             )
             await writer.drain()
@@ -658,7 +661,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 request_headers={"host": "127.0.0.1:8765"},
             )
             self.assertEqual(protected_status, 404)
-        login_token = self.server._access_token
+        login_token = self.server.credentials.access_token
         status, headers, _ = await self.server._dispatch(
             "GET",
             f"/login?token={login_token}",
@@ -666,9 +669,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             request_headers={"host": "127.0.0.1:8765"},
         )
         self.assertEqual(status, 303)
-        self.assertNotEqual(self.server._access_token, login_token)
-        capability = self.server._capability_token
-        session_token = self.server._session_token
+        self.assertNotEqual(self.server.credentials.access_token, login_token)
+        capability = self.server.credentials.capability_token
+        session_token = self.server.credentials.session_token
         self.assertEqual(headers["Location"], f"/{capability}/")
         self.assertIsNotNone(session_token)
         self.assertEqual(
@@ -725,7 +728,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(protected_status, 200)
 
-        next_login_token = self.server._access_token
+        next_login_token = self.server.credentials.access_token
         status, next_headers, _ = await self.server._dispatch(
             "GET",
             f"/login?token={next_login_token}",
@@ -733,9 +736,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             request_headers={"host": "127.0.0.1:8765"},
         )
         self.assertEqual(status, 303)
-        self.assertNotEqual(self.server._capability_token, capability)
+        self.assertNotEqual(self.server.credentials.capability_token, capability)
         self.assertEqual(
-            next_headers["Location"], f"/{self.server._capability_token}/"
+            next_headers["Location"], f"/{self.server.credentials.capability_token}/"
         )
         stale_status, _, _ = await self.server._dispatch(
             "GET",
@@ -749,43 +752,43 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stale_status, 404)
 
     async def test_dashboard_session_enforces_idle_and_absolute_timeouts(self) -> None:
-        self.server._activate_session()
+        self.server.credentials.activate_session()
         headers = self.authenticated_headers()
         now = time.monotonic()
 
-        self.server._session_started_at = now - DASHBOARD_SESSION_IDLE_SECONDS + 5
-        self.server._session_last_seen_at = now - DASHBOARD_SESSION_IDLE_SECONDS + 5
+        self.server.credentials.session_started_at = now - DASHBOARD_SESSION_IDLE_SECONDS + 5
+        self.server.credentials.session_last_seen_at = now - DASHBOARD_SESSION_IDLE_SECONDS + 5
         status, _, _ = await self.server._dispatch(
-            "GET", f"/{self.server._capability_token}/", b"", request_headers=headers
+            "GET", f"/{self.server.credentials.capability_token}/", b"", request_headers=headers
         )
         self.assertEqual(status, 200)
 
-        self.server._session_last_seen_at = (
+        self.server.credentials.session_last_seen_at = (
             time.monotonic() - DASHBOARD_SESSION_IDLE_SECONDS
         )
         status, _, response = await self.server._dispatch(
-            "GET", f"/{self.server._capability_token}/", b"", request_headers=headers
+            "GET", f"/{self.server.credentials.capability_token}/", b"", request_headers=headers
         )
         self.assertEqual(status, 404)
         self.assertIn(b"Dashboard Access Missing", response)
 
-        self.server._activate_session()
+        self.server.credentials.activate_session()
         headers = self.authenticated_headers()
-        self.server._session_started_at = (
+        self.server.credentials.session_started_at = (
             time.monotonic() - DASHBOARD_SESSION_ABSOLUTE_SECONDS
         )
         status, _, response = await self.server._dispatch(
-            "GET", f"/{self.server._capability_token}/", b"", request_headers=headers
+            "GET", f"/{self.server.credentials.capability_token}/", b"", request_headers=headers
         )
         self.assertEqual(status, 404)
         self.assertIn(b"Dashboard Access Missing", response)
 
     async def test_logout_revokes_session_capability_and_login_token(self) -> None:
-        self.server._activate_session()
-        capability = self.server._capability_token
-        session_token = self.server._session_token
-        access_token = self.server._access_token
-        body = urlencode({"token": self.server._csrf_token}).encode()
+        self.server.credentials.activate_session()
+        capability = self.server.credentials.capability_token
+        session_token = self.server.credentials.session_token
+        access_token = self.server.credentials.access_token
+        body = urlencode({"token": self.server.credentials.csrf_token}).encode()
         status, headers, _ = await self.server._dispatch(
             "POST",
             f"/{capability}/logout",
@@ -799,9 +802,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             f"{DASHBOARD_SESSION_COOKIE}=; Path=/{capability}/; Max-Age=0; "
             "HttpOnly; SameSite=Strict",
         )
-        self.assertIsNone(self.server._session_token)
-        self.assertNotEqual(self.server._capability_token, capability)
-        self.assertNotEqual(self.server._access_token, access_token)
+        self.assertIsNone(self.server.credentials.session_token)
+        self.assertNotEqual(self.server.credentials.capability_token, capability)
+        self.assertNotEqual(self.server.credentials.access_token, access_token)
         stale_status, _, _ = await self.server._dispatch(
             "GET",
             f"/{capability}/",
@@ -822,14 +825,14 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Dashboard Signed Out", signed_out_page)
 
     async def test_logout_requires_post_and_valid_csrf(self) -> None:
-        self.server._activate_session()
-        path = f"/{self.server._capability_token}/logout"
+        self.server.credentials.activate_session()
+        path = f"/{self.server.credentials.capability_token}/logout"
         status, headers, _ = await self.server._dispatch(
             "GET", path, b"", request_headers=self.authenticated_headers()
         )
         self.assertEqual(status, 405)
         self.assertEqual(headers["Allow"], "POST")
-        session_token = self.server._session_token
+        session_token = self.server.credentials.session_token
         status, _, response = await self.server._dispatch(
             "POST",
             path,
@@ -838,7 +841,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn(b"Invalid Action Token", response)
-        self.assertEqual(self.server._session_token, session_token)
+        self.assertEqual(self.server.credentials.session_token, session_token)
 
     async def test_pending_reviews_are_paginated_with_stable_page_links(self) -> None:
         now = int(time.time())
@@ -1014,7 +1017,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(explanation.encode(), detail)
 
     def test_policy_decision_panel_explains_both_permanent_gates(self) -> None:
-        no_destructive_gate = self.server._policy_decision_panel(
+        no_destructive_gate = policy_decision_panel(
             {
                 "risk_score": 70,
                 "planned_action": "strict_challenge",
@@ -1032,7 +1035,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("score reached 70, but permanent suppression", no_destructive_gate)
         self.assertIn("<strong>Strict Challenge</strong>", no_destructive_gate)
 
-        permanent = self.server._policy_decision_panel(
+        permanent = policy_decision_panel(
             {
                 "risk_score": 100,
                 "planned_action": "permanent_suppression",
@@ -1090,7 +1093,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"State reasons:", index)
         self.assertIn(b"Every active restriction currently has reviewable evidence", index)
         self.assertNotIn(b"enforcement-private-canary", index)
-        status, _, detail = await self.server._dispatch_enforcement(
+        status, _, detail = await self.server._dispatch(
             "GET", f"/cases/{sender_key}", b""
         )
         self.assertEqual(status, 200)
@@ -1100,9 +1103,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"No saved dialog state is available", detail)
 
         keep_body = urlencode(
-            {"token": self.server._csrf_token, "action": "keep"}
+            {"token": self.server.credentials.csrf_token, "action": "keep"}
         ).encode()
-        status, _, _ = await self.server._dispatch_enforcement(
+        status, _, _ = await self.server._dispatch(
             "POST", f"/cases/{sender_key}", keep_body
         )
         self.assertEqual(status, 303)
@@ -1110,9 +1113,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.store.enforcement_review(sender_key))
 
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "allow"}
+            {"token": self.server.credentials.csrf_token, "action": "allow"}
         ).encode()
-        status, headers, _ = await self.server._dispatch_enforcement(
+        status, headers, _ = await self.server._dispatch(
             "POST", f"/cases/{sender_key}", body
         )
         self.assertEqual(status, 303)
@@ -1145,7 +1148,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 200)
         self.assertIn(b"does not restore, move, unmute, or delete", confirmation)
-        body = urlencode({"token": self.server._csrf_token}).encode()
+        body = urlencode({"token": self.server.credentials.csrf_token}).encode()
         status, headers, _ = await self.server._dispatch(
             "POST", f"/cases/{sender_key}/forget", body
         )
@@ -1168,7 +1171,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "POST", f"/cases/{sender_key}/archive", b"token=invalid"
         )
         self.assertEqual(status, 400)
-        body = urlencode({"token": self.server._csrf_token}).encode()
+        body = urlencode({"token": self.server.credentials.csrf_token}).encode()
         status, headers, _ = await self.server._dispatch(
             "POST", f"/cases/{sender_key}/archive", body
         )
@@ -1190,7 +1193,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIn(b"Release and Forget 1 Archived Restriction?", preview)
         body = urlencode(
-            {"token": self.server._csrf_token, "days": "90"}
+            {"token": self.server.credentials.csrf_token, "days": "90"}
         ).encode()
         status, _, _ = await self.server._dispatch(
             "POST", "/cases/archive/forget", body
@@ -1262,7 +1265,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Unavailable", index)
         self.assertNotIn(b"expired-private-canary", index)
 
-        status, _, detail = await self.server._dispatch_enforcement(
+        status, _, detail = await self.server._dispatch(
             "GET", f"/cases/{sender_key}", b""
         )
         self.assertEqual(status, 200)
@@ -1271,9 +1274,9 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"expired-private-canary", detail)
 
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "allow"}
+            {"token": self.server.credentials.csrf_token, "action": "allow"}
         ).encode()
-        status, headers, _ = await self.server._dispatch_enforcement(
+        status, headers, _ = await self.server._dispatch(
             "POST", f"/cases/{sender_key}", body
         )
         self.assertEqual(status, 303)
@@ -1378,7 +1381,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         )
 
         body = urlencode(
-            {"token": self.server._csrf_token, "user_id": str(user_id)}
+            {"token": self.server.credentials.csrf_token, "user_id": str(user_id)}
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST", "/cases/release", body
@@ -1399,7 +1402,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.protector.sender_key(user_id)
         self.store.quarantine(sender_key)
         body = urlencode(
-            {"token": self.server._csrf_token, "user_id": str(user_id)}
+            {"token": self.server.credentials.csrf_token, "user_id": str(user_id)}
         ).encode()
 
         status, headers, _ = await self.server._dispatch(
@@ -1412,7 +1415,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_release_by_user_id_requires_existing_restriction(self) -> None:
         body = urlencode(
-            {"token": self.server._csrf_token, "user_id": "771234570"}
+            {"token": self.server.credentials.csrf_token, "user_id": "771234570"}
         ).encode()
 
         status, _, response = await self.server._dispatch(
@@ -1432,7 +1435,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             sender_key, restriction_reference=restriction_reference
         )
         body = urlencode(
-            {"token": self.server._csrf_token, "user_id": str(user_id)}
+            {"token": self.server.credentials.csrf_token, "user_id": str(user_id)}
         ).encode()
 
         status, _, response = await self.server._dispatch(
@@ -1448,7 +1451,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_release_by_user_id_rejects_invalid_input(self) -> None:
         for value in ("not-a-number", "0", "-1", "+1", "１"):
             body = urlencode(
-                {"token": self.server._csrf_token, "user_id": value}
+                {"token": self.server.credentials.csrf_token, "user_id": value}
             ).encode()
             status, _, response = await self.server._dispatch(
                 "POST", "/cases/release", body
@@ -1472,7 +1475,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legitimate_decision_allows_and_erases_reference(self) -> None:
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "legitimate"}
+            {"token": self.server.credentials.csrf_token, "action": "legitimate"}
         ).encode()
         status, headers, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
@@ -1522,7 +1525,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
         )
-        body = urlencode({"token": self.server._csrf_token}).encode()
+        body = urlencode({"token": self.server.credentials.csrf_token}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}/spam", body
         )
@@ -1564,7 +1567,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.store.pending_actions()[0].mode_independent)
 
     async def test_spam_decision_requires_confirmation_page(self) -> None:
-        body = urlencode({"token": self.server._csrf_token, "action": "spam"}).encode()
+        body = urlencode({"token": self.server.credentials.csrf_token, "action": "spam"}).encode()
         status, _, response = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
         )
@@ -1608,7 +1611,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_spam_decision_converts_existing_quarantine_to_suppression(self) -> None:
         self.store.quarantine("sender", 150)
-        body = urlencode({"token": self.server._csrf_token}).encode()
+        body = urlencode({"token": self.server.credentials.csrf_token}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}/spam", body
         )
@@ -1620,7 +1623,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_spam_partial_archive_failure_is_compensated(self) -> None:
         self.client.fail_next_mute = True
-        body = urlencode({"token": self.server._csrf_token}).encode()
+        body = urlencode({"token": self.server.credentials.csrf_token}).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}/spam", body
         )
@@ -1641,7 +1644,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_legitimate_decision_restores_gatekeeper_quarantine(self) -> None:
         self.store.quarantine("sender", 150)
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "legitimate"}
+            {"token": self.server.credentials.csrf_token, "action": "legitimate"}
         ).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
@@ -1657,7 +1660,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_legitimate_decision_resolves_active_challenge(self) -> None:
         self.store.set_challenge("sender", "challenge", "digest", 700, 42, 150)
         body = urlencode(
-            {"token": self.server._csrf_token, "action": "legitimate"}
+            {"token": self.server.credentials.csrf_token, "action": "legitimate"}
         ).encode()
         status, _, _ = await self.server._dispatch(
             "POST", f"/review/{self.review_id}", body
