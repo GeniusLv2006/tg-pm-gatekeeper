@@ -358,13 +358,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             envelope=self.review_protector.seal(
                 {"schema_version": 5, "text": "private-canary"}
             ),
-            reason="critical_rule",
+            reason="permanent_suppression",
             expires_at=self.now - 1,
             now=self.now - 100,
         )
         self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             reference=None,
             now=self.now,

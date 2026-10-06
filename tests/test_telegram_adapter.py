@@ -521,12 +521,20 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"Synthetic Sender", persisted)
         self.assertNotIn(b"Personal note", persisted)
 
+    def test_operator_reason_marks_legacy_critical_rule(self) -> None:
+        self.assertEqual(
+            TelegramAdapter._operator_reason("critical_rule"), "Legacy Critical Rule Match"
+        )
+        self.assertEqual(
+            TelegramAdapter._operator_reason("challenge_timeout"), "Challenge Timeout"
+        )
+
     async def test_cases_create_reply_bound_controls_without_evidence(self) -> None:
         sender_key = self.protector.sender_key(123456789)
         reference = self.protector.seal_restriction_reference(123456789, -987654321)
         self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             restriction_reference=reference,
         )
@@ -542,7 +550,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Example /gatekeeper allow Sender (@example_sender)", card)
         self.assertNotIn("\n/gatekeeper allow", card)
         self.assertNotIn("\u202e", card)
-        self.assertIn("Critical Rule", card)
+        self.assertIn("Reason: Permanent Suppression", card)
         self.assertIn("Reply to this message with /gatekeeper allow", card)
         self.assertNotIn(sender_key, card)
         self.assertEqual(
@@ -809,14 +817,14 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
         restriction_reference = protector.seal_restriction_reference(123, 456)
         state = store.suppress(
             "sender",
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             reference=reference,
             restriction_reference=restriction_reference,
         )
         action_id = store.schedule_action(
             "sender",
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=reference,
             execute_at=0,
             expected_revision=state.revision,
@@ -904,11 +912,11 @@ class TelegramActionDeletionTests(unittest.IsolatedAsyncioTestCase):
             store, IdentifierProtector(b"k" * 32)
         )
         state = store.suppress(
-            "sender", "critical_rule", until=None, reference=b"invalid"
+            "sender", "permanent_suppression", until=None, reference=b"invalid"
         )
         action_id = store.schedule_action(
             "sender",
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=b"invalid",
             execute_at=0,
             expected_revision=state.revision,
