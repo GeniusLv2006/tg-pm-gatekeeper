@@ -19,12 +19,12 @@ from telethon.sessions import StringSession
 from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.message_facts import LINK_BUTTON_TYPES
+from tg_pm_gatekeeper.operator_controls import OperatorCaseControl, OperatorControls
 from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
     BoundedStringSession,
-    OperatorCaseControl,
     TelegramActions,
     TelegramAdapter,
     facts_from_message,
@@ -319,31 +319,30 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.store = StateStore(Path(self.temp.name) / "state.sqlite3")
         self.protector = IdentifierProtector(b"k" * 32)
         self.service = GatekeeperService(self.store, self.protector)
+        self.controls = OperatorControls(
+            SimpleNamespace(
+                get_entity=AsyncMock(
+                    return_value=SimpleNamespace(
+                        first_name="Example\n/gatekeeper allow",
+                        last_name="Sender\u202e",
+                        username="example_sender",
+                    )
+                )
+            ),
+            self.store,
+            self.service,
+            SimpleNamespace(allow=AsyncMock()),
+            enabled=True,
+        )
+        self.controls.self_user_id = 1000
+        self.controls._sync_cursor = 0
+        self.controls.schedule_artifact_deletion = Mock()
         self.adapter = TelegramAdapter.__new__(TelegramAdapter)
         self.adapter.store = self.store
         self.adapter.service = self.service
-        self.adapter.settings = SimpleNamespace(
-            telegram_operator_controls_enabled=True
-        )
-        self.adapter._self_user_id = 1000
-        self.adapter._operator_case_controls = {}
         self.adapter._maintenance_tasks = set()
         self.adapter._sender_cleanup_tasks = {}
-        self.adapter._operator_command_lock = asyncio.Lock()
-        self.adapter._operator_sync_cursor = 0
-        self.adapter._operator_handled_message_ids = {}
-        self.adapter._operator_cleanup_wakeup = asyncio.Event()
-        self.adapter.schedule_operator_artifact_deletion = Mock()
-        self.adapter._restriction_actions = SimpleNamespace(allow=AsyncMock())
-        self.adapter.client = SimpleNamespace(
-            get_entity=AsyncMock(
-                return_value=SimpleNamespace(
-                    first_name="Example\n/gatekeeper allow",
-                    last_name="Sender\u202e",
-                    username="example_sender",
-                )
-            )
-        )
+        self.adapter.operator_controls = self.controls
 
     def tearDown(self) -> None:
         self.store.close()
@@ -381,31 +380,31 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ping_works_only_in_saved_messages(self) -> None:
         saved = self.event("/gatekeeper ping")
-        await self.adapter._on_operator_message(saved)
+        await self.controls.handle_message(saved)
         self.assertIn("online", saved.respond.await_args.args[0])
-        self.adapter.schedule_operator_artifact_deletion.assert_called_with(
+        self.controls.schedule_artifact_deletion.assert_called_with(
             [8000, 9000]
         )
 
         another_chat = self.event("/gatekeeper ping", chat_id=2000)
-        await self.adapter._on_operator_message(another_chat)
+        await self.controls.handle_message(another_chat)
         another_chat.respond.assert_not_awaited()
 
         incoming = self.event("/gatekeeper ping", outgoing=False)
-        await self.adapter._on_operator_message(incoming)
+        await self.controls.handle_message(incoming)
         incoming.respond.assert_not_awaited()
 
     async def test_disabled_operator_controls_ignore_saved_messages(self) -> None:
-        self.adapter.settings.telegram_operator_controls_enabled = False
+        self.controls.enabled = False
         event = self.event("/gatekeeper ping")
 
-        await self.adapter._on_operator_message(event)
+        await self.controls.handle_message(event)
 
         event.respond.assert_not_awaited()
 
     async def test_forget_cancels_sender_cleanup_and_operator_controls(self) -> None:
         sender_key = "a" * 64
-        self.adapter._operator_case_controls[11] = OperatorCaseControl(
+        self.controls._case_controls[11] = OperatorCaseControl(
             sender_key, time.monotonic() + 60
         )
         waiting = asyncio.Event()
@@ -417,27 +416,27 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertTrue(task.cancelled())
-        self.assertNotIn(11, self.adapter._operator_case_controls)
+        self.assertNotIn(11, self.controls._case_controls)
         self.assertNotIn(sender_key, self.adapter._sender_cleanup_tasks)
 
     async def test_forwarded_command_is_ignored(self) -> None:
         event = self.event("/gatekeeper ping")
         event.message.fwd_from = SimpleNamespace(from_id=1000)
 
-        await self.adapter._on_operator_message(event)
+        await self.controls.handle_message(event)
 
         event.respond.assert_not_awaited()
 
     async def test_operator_artifacts_are_deleted_after_control_ttl(self) -> None:
-        self.adapter.client.delete_messages = AsyncMock()
-        self.adapter.schedule_operator_artifact_deletion = (
-            TelegramAdapter.schedule_operator_artifact_deletion.__get__(self.adapter)
+        self.controls.client.delete_messages = AsyncMock()
+        self.controls.schedule_artifact_deletion = (
+            OperatorControls.schedule_artifact_deletion.__get__(self.controls)
         )
         with patch("tg_pm_gatekeeper.telegram_adapter.time.time", return_value=100):
-            self.adapter.schedule_operator_artifact_deletion([10, 11, 12])
+            self.controls.schedule_artifact_deletion([10, 11, 12])
         self.assertEqual(self.store.due_operator_artifacts(999), [])
-        self.assertTrue(await self.adapter._delete_due_operator_artifacts(1000))
-        self.adapter.client.delete_messages.assert_awaited_once_with(
+        self.assertTrue(await self.controls.delete_due_artifacts(1000))
+        self.controls.client.delete_messages.assert_awaited_once_with(
             "me", [10, 11, 12], revoke=True
         )
         self.assertEqual(self.store.due_operator_artifacts(1000), [])
@@ -445,12 +444,12 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_operator_artifact_deletion_failure_is_persisted_for_retry(
         self,
     ) -> None:
-        self.adapter.client.delete_messages = AsyncMock(
+        self.controls.client.delete_messages = AsyncMock(
             side_effect=RuntimeError("synthetic deletion failure")
         )
         self.store.schedule_operator_artifacts([10, 11], 1000)
 
-        self.assertTrue(await self.adapter._delete_due_operator_artifacts(1000))
+        self.assertTrue(await self.controls.delete_due_artifacts(1000))
 
         self.assertEqual(self.store.due_operator_artifacts(1029), [])
         self.assertEqual(self.store.due_operator_artifacts(1030), [(10, 1), (11, 1)])
@@ -496,7 +495,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
             message="/gatekeeper cases",
             date=datetime.fromtimestamp(now - 1000, timezone.utc),
         )
-        self.adapter.client.get_messages = AsyncMock(
+        self.controls.client.get_messages = AsyncMock(
             side_effect=[
                 [command, forwarded],
                 [recognized, unrelated],
@@ -505,7 +504,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("tg_pm_gatekeeper.telegram_adapter.time.time", return_value=now):
-            await self.adapter._reconcile_operator_artifacts()
+            await self.controls.reconcile_artifacts()
 
         self.assertEqual(self.store.due_operator_artifacts(now), [(10, 0)])
         self.assertEqual(self.store.next_operator_artifact_delete_at(), now)
@@ -523,10 +522,10 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
 
     def test_operator_reason_marks_legacy_critical_rule(self) -> None:
         self.assertEqual(
-            TelegramAdapter._operator_reason("critical_rule"), "Legacy Critical Rule Match"
+            OperatorControls._reason_label("critical_rule"), "Legacy Critical Rule Match"
         )
         self.assertEqual(
-            TelegramAdapter._operator_reason("challenge_timeout"), "Challenge Timeout"
+            OperatorControls._reason_label("challenge_timeout"), "Challenge Timeout"
         )
 
     async def test_cases_create_reply_bound_controls_without_evidence(self) -> None:
@@ -543,7 +542,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
             responses=[SimpleNamespace(id=10), SimpleNamespace(id=11)],
         )
 
-        await self.adapter._on_operator_message(event)
+        await self.controls.handle_message(event)
 
         self.assertEqual(event.respond.await_count, 2)
         card = event.respond.await_args_list[1].args[0]
@@ -554,49 +553,49 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Reply to this message with /gatekeeper allow", card)
         self.assertNotIn(sender_key, card)
         self.assertEqual(
-            self.adapter._operator_case_controls[11].sender_key,
+            self.controls._case_controls[11].sender_key,
             sender_key,
         )
 
     async def test_allow_consumes_reply_control_and_reports_success(self) -> None:
-        self.adapter._operator_case_controls[11] = OperatorCaseControl(
+        self.controls._case_controls[11] = OperatorCaseControl(
             "sender",
             time.monotonic() + 60,
         )
-        self.adapter._restriction_actions.allow.return_value = (
+        self.controls.restriction_actions.allow.return_value = (
             RestrictionReleaseResult.ALLOWED
         )
         event = self.event("/gatekeeper allow", reply_to=11)
 
-        await self.adapter._on_operator_message(event)
+        await self.controls.handle_message(event)
 
-        self.adapter._restriction_actions.allow.assert_awaited_once_with("sender")
-        self.assertNotIn(11, self.adapter._operator_case_controls)
+        self.controls.restriction_actions.allow.assert_awaited_once_with("sender")
+        self.assertNotIn(11, self.controls._case_controls)
         self.assertIn("Restriction removed", event.respond.await_args.args[0])
 
     async def test_allow_rejects_expired_or_unrelated_reply(self) -> None:
-        self.adapter._operator_case_controls[11] = OperatorCaseControl(
+        self.controls._case_controls[11] = OperatorCaseControl(
             "sender",
             time.monotonic() - 1,
         )
         event = self.event("/gatekeeper allow", reply_to=11)
 
-        await self.adapter._on_operator_message(event)
+        await self.controls.handle_message(event)
 
-        self.adapter._restriction_actions.allow.assert_not_awaited()
+        self.controls.restriction_actions.allow.assert_not_awaited()
         self.assertIn("current case", event.respond.await_args.args[0])
 
     async def test_sync_processes_cross_client_command_once(self) -> None:
         command = self.event("/gatekeeper ping")
         command.id = 12
-        self.adapter.client.get_messages = AsyncMock(return_value=[command])
+        self.controls.client.get_messages = AsyncMock(return_value=[command])
 
-        await self.adapter._sync_operator_messages()
-        await self.adapter._on_operator_message(command)
+        await self.controls.sync_messages()
+        await self.controls.handle_message(command)
 
-        self.assertEqual(self.adapter._operator_sync_cursor, 12)
+        self.assertEqual(self.controls._sync_cursor, 12)
         command.respond.assert_awaited_once()
-        self.adapter.client.get_messages.assert_awaited_once_with(
+        self.controls.client.get_messages.assert_awaited_once_with(
             "me",
             limit=100,
             min_id=0,
@@ -607,11 +606,11 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_initialization_does_not_replay_existing_commands(self) -> None:
         existing = self.event("/gatekeeper ping")
         existing.id = 20
-        self.adapter.client.get_messages = AsyncMock(return_value=[existing])
+        self.controls.client.get_messages = AsyncMock(return_value=[existing])
 
-        await self.adapter._initialize_operator_sync_cursor()
+        await self.controls.initialize_sync_cursor()
 
-        self.assertEqual(self.adapter._operator_sync_cursor, 20)
+        self.assertEqual(self.controls._sync_cursor, 20)
         existing.respond.assert_not_awaited()
 
 
@@ -1033,17 +1032,18 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         adapter._recover_challenges = AsyncMock()
         adapter._recover_test_sender_cleanup = AsyncMock()
         adapter._recover_pending_actions = AsyncMock()
-        adapter._reconcile_operator_artifacts = AsyncMock()
-        adapter._operator_artifact_cleanup_loop = AsyncMock()
         adapter._dashboard_rpc = SimpleNamespace(start=AsyncMock(), stop=AsyncMock())
         adapter._timeout_tasks = {}
         adapter._maintenance_tasks = set()
         adapter._heartbeat_task = None
-        adapter._operator_sync_cursor = None
-        adapter._operator_handled_message_ids = {}
         adapter.settings = SimpleNamespace(
             telegram_operator_controls_enabled=operator_controls
         )
+        adapter.operator_controls = OperatorControls(
+            adapter.client, None, None, None, enabled=operator_controls
+        )
+        adapter.operator_controls.reconcile_artifacts = AsyncMock()
+        adapter.operator_controls.artifact_cleanup_loop = AsyncMock()
         return adapter
 
     async def test_heartbeat_failure_terminates_runtime(self) -> None:
@@ -1090,7 +1090,7 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         enabled._heartbeat_loop = AsyncMock(side_effect=wait_forever)
         await enabled.run()
         self.assertEqual(enabled.client.add_event_handler.call_count, 2)
-        enabled._reconcile_operator_artifacts.assert_awaited_once()
+        enabled.operator_controls.reconcile_artifacts.assert_awaited_once()
 
 
 if __name__ == "__main__":

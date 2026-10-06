@@ -96,3 +96,9 @@ def facts_from_message(message: types.Message) -> MessageFacts:
         is_forwarded=getattr(message, "fwd_from", None) is not None,
         via_bot=getattr(message, "via_bot_id", None) is not None,
     )
+
+
+def reply_to_message_id(message: types.Message) -> int | None:
+    reply_header = getattr(message, "reply_to", None)
+    value = getattr(reply_header, "reply_to_msg_id", None)
+    return value if isinstance(value, int) else None
