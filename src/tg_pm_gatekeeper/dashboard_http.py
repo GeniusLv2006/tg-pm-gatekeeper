@@ -282,7 +282,12 @@ class DashboardHttpServer:
     ) -> tuple[int, dict[str, str], bytes]:
         parsed = urlsplit(target)
         path = parsed.path
-        if path in {"/dashboard.js", "/dashboard.css", "/dashboard-error.css"}:
+        if path in {
+            "/dashboard.js",
+            "/dashboard-theme.js",
+            "/dashboard.css",
+            "/dashboard-error.css",
+        }:
             if method != "GET":
                 return 405, {"Allow": "GET"}, b""
             asset_name = path.removeprefix("/")
@@ -539,8 +544,56 @@ class DashboardHttpServer:
             return ""
         css = "message quote" if quote else "message"
         return (
-            f"<p class='eyebrow'>{html.escape(label)}</p>"
+            f"<h3 class='field-label'>{html.escape(label)}</h3>"
             f"<pre class='{css}'>{html.escape(value)}</pre>"
+        )
+
+    @staticmethod
+    def _badge(label: str, tone: str = "neutral") -> str:
+        return f"<span class='badge badge-{tone}'>{html.escape(label)}</span>"
+
+    @staticmethod
+    def _case_tone(status: str, *, archived: bool = False) -> str:
+        if archived:
+            return "neutral"
+        return {"quarantined": "hold", "suppressed": "block"}.get(status, "neutral")
+
+    @staticmethod
+    def _review_tone(classification: str) -> str:
+        return "monitor" if classification.startswith("would_") else "hold"
+
+    @staticmethod
+    def _page_header(
+        title: str,
+        *,
+        count: str | None = None,
+        lede: str = "",
+        meta: str = "",
+        aside: str = "",
+        back: tuple[str, str] | None = None,
+    ) -> str:
+        back_link = (
+            f"<a class='back-link' href='{back[0]}'>← {html.escape(back[1])}</a>"
+            if back is not None
+            else ""
+        )
+        count_html = (
+            f" <span class='title-count'>{html.escape(count)}</span>" if count else ""
+        )
+        lede_html = f"<p class='lede'>{lede}</p>" if lede else ""
+        return (
+            "<div class='page-header'><div class='page-heading'>"
+            f"{back_link}<h1>{html.escape(title)}{count_html}</h1>{meta}{lede_html}</div>"
+            + (f"<div class='page-header-aside'>{aside}</div>" if aside else "")
+            + "</div>"
+        )
+
+    @staticmethod
+    def _key_values(rows: list[tuple[str, str]]) -> str:
+        return (
+            "<dl class='kv'>"
+            + "".join(f"<div><dt>{label}</dt><dd>{value}</dd></div>" for label, value in rows)
+            + "</dl>"
         )
 
     @staticmethod
@@ -595,7 +648,6 @@ class DashboardHttpServer:
             )
             items.append(
                 "<li class='signal-item'>"
-                "<span class='signal-index' aria-hidden='true'></span>"
                 "<div class='signal-copy'>"
                 f"<div class='signal-heading'><strong>{title}</strong>{score_badge}</div>"
                 f"{source_badge}{explanation_copy}"
@@ -610,7 +662,9 @@ class DashboardHttpServer:
         )
 
     @classmethod
-    def _policy_decision_panel(cls, payload: dict[str, object]) -> str:
+    def _policy_decision_panel(
+        cls, payload: dict[str, object], *, note: str | None = None
+    ) -> str:
         raw_score = payload.get("risk_score")
         if isinstance(raw_score, bool):
             risk_score = None
@@ -678,7 +732,11 @@ class DashboardHttpServer:
         score_symbol = "✓" if score_gate_met else "×"
         gate_symbol = "✓" if destructive_gate_met else "×"
         return f"""
-        <section class="policy-map" aria-label="Policy decision explanation">
+        <section class="rail-card policy-map" aria-label="Policy decision explanation">
+          <div class="policy-outcome {action_class}">
+            <small>Final Policy Decision</small><strong>{html.escape(action_label)}</strong>
+            <p>{html.escape(outcome_copy)}</p>
+          </div>
           <div class="policy-score-head">
             <div><span class="policy-kicker">Risk Score</span>
               <strong>{risk_score}</strong><small>Additive points · not a probability</small></div>
@@ -702,13 +760,43 @@ class DashboardHttpServer:
               <strong>{html.escape(gate_label)}</strong>
               <p>Requires a non-quoted denied domain, or a corroborated repeated campaign.</p></div>
           </div>
-          <div class="policy-outcome {action_class}">
-            <small>Final Policy Decision</small><strong>{html.escape(action_label)}</strong>
-            <p>{html.escape(outcome_copy)}</p>
-          </div>
+          {f'<p class="policy-note">{html.escape(note)}</p>' if note else ''}
         </section>"""
 
-    def _review_sections(self, payload: dict[str, object]) -> str:
+    @classmethod
+    def _recomputed_policy_panel(cls, recorded_signals: object) -> str:
+        """Rebuild the policy view for a review, which records signals but not a score."""
+        if not isinstance(recorded_signals, list) or not recorded_signals:
+            return ""
+        signals: list[EvidenceSignal] = []
+        for item in recorded_signals:
+            if not isinstance(item, dict):
+                return ""
+            code, source, weight = item.get("code"), item.get("source"), item.get("weight")
+            # Legacy HR-rule rows carry bare codes without weights; they cannot be scored.
+            if (
+                not isinstance(code, str)
+                or not isinstance(source, str)
+                or isinstance(weight, bool)
+                or not isinstance(weight, int)
+            ):
+                return ""
+            signals.append(EvidenceSignal(code, source, weight, ""))  # type: ignore[arg-type]
+        decision = PolicyEngine().decide(tuple(signals))
+        return cls._policy_decision_panel(
+            {
+                "risk_score": decision.risk_score,
+                "signals": recorded_signals,
+                "planned_action": decision.planned_action,
+                "policy_version": decision.policy_version,
+            },
+            note=(
+                "Recomputed from the recorded signal weights with the current policy. "
+                "Reviews do not store their original score."
+            ),
+        )
+
+    def _review_sections(self, payload: dict[str, object]) -> tuple[str, str, str]:
         text = str(payload.get("text", ""))
         quote_text = str(payload.get("quote_text", ""))
         preview_text = str(payload.get("preview_text", ""))
@@ -736,17 +824,27 @@ class DashboardHttpServer:
                 "metadata before deciding whether to allow the sender or leave the "
                 "restriction unchanged.</div>"
             )
-        return (
-            sections
-            + f"<p class='content-label'>Button Text</p><pre>{html.escape(button_texts)}</pre>"
-            + f"<p class='content-label'>Normalized Domains</p><pre>{html.escape(domains)}</pre>"
-            + f"<p class='content-label'>Quoted-Context Domains</p><pre>{html.escape(quote_domains)}</pre>"
-            + f"<details><summary>Full URLs</summary><pre>{urls}</pre></details>"
+
+        def value(text: str) -> str:
+            if text == "—":
+                return "<span class='empty-value'>—</span>"
+            return f"<span class='mono'>{html.escape(text)}</span>"
+
+        link_facts = self._key_values(
+            [
+                ("Button Text", value(button_texts)),
+                ("Normalized Domains", value(domains)),
+                ("Quoted-Context Domains", value(quote_domains)),
+            ]
+        )
+        technical = (
+            f"<details><summary>Full URLs</summary><pre>{urls}</pre></details>"
             + f"<details><summary>Quoted-Context URLs</summary><pre>{quote_urls}</pre></details>"
             + f"<details><summary>Link Shape</summary><pre>{url_shape}</pre></details>"
             + f"<details><summary>Quoted-Context Link Shape</summary><pre>{quote_url_shape}</pre></details>"
             + f"<details><summary>Full Decrypted Case Payload</summary><pre>{details}</pre></details>"
         )
+        return sections, link_facts, technical
 
     async def _dispatch_enforcement(
         self, method: str, path: str, body: bytes
@@ -809,20 +907,21 @@ class DashboardHttpServer:
                 return self._backend_error(exc.code)
             if item.get("archived_at") is None or item.get("suppressed_until") is not None:
                 return self._backend_error("case_not_archived")
-            content = (
-                self._masthead("Forget Restriction", "Confirmation", csrf_token=self._csrf_token)
-                + "<main class='list-main'><section class='queue-intro'>"
-                + "<p class='eyebrow'>Destructive Local Action</p>"
-                + "<h2>Release and Forget This Archived Restriction?</h2>"
-                + "<p>This removes all local policy, evidence, identity, snapshot, and history data. "
-                + "It does not restore, move, unmute, or delete the Telegram conversation. "
-                + "A future message will be handled as an unknown sender.</p>"
-                + f"<form method='post' action='/cases/{sender_key}/forget'>"
-                + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
-                + "<button class='danger' type='submit'>Release and Forget</button></form>"
-                + "<p><a href='/cases/archive'>Cancel</a></p></section></main>"
+            return 200, {}, self._confirmation_page(
+                nav="archive",
+                title="Release and Forget This Archived Restriction?",
+                body=(
+                    "This removes all local policy, evidence, identity, snapshot, and history "
+                    "data. It does not restore, move, unmute, or delete the Telegram "
+                    "conversation. A future message will be handled as an unknown sender."
+                ),
+                action=f"/cases/{sender_key}/forget",
+                button="Release and Forget",
+                tone="block",
+                cancel_href="/cases/archive",
+                page_title="Forget Restriction",
+                warning="Destructive Local Action",
             )
-            return 200, {}, self._page(content, raw=True, page_title="Forget Restriction")
         if method != "POST":
             return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
         values = parse_qs(body.decode("utf-8"), strict_parsing=True)
@@ -856,19 +955,20 @@ class DashboardHttpServer:
                 or item.get("archived_at") is not None
             ):
                 return self._backend_error("case_not_found")
-            content = (
-                self._masthead("Archive Restriction", "Confirmation", csrf_token=self._csrf_token)
-                + "<main class='list-main'><section class='queue-intro'>"
-                + "<h2>Keep This Restriction and Move It to the Archive?</h2>"
-                + "<p>The permanent suppression remains in force. The sender will remain "
-                + "blocked by local policy, while its reviewable evidence keeps the existing "
-                + "expiry. You can move the restriction back to Needs Attention later.</p>"
-                + f"<form method='post' action='/cases/{sender_key}/archive'>"
-                + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
-                + "<button type='submit'>Keep and Archive</button></form>"
-                + f"<p><a href='/cases/{sender_key}'>Cancel</a></p></section></main>"
+            return 200, {}, self._confirmation_page(
+                nav="cases",
+                title="Keep This Restriction and Move It to the Archive?",
+                body=(
+                    "The permanent suppression remains in force. The sender will remain "
+                    "blocked by local policy, while its reviewable evidence keeps the existing "
+                    "expiry. You can move the restriction back to Needs Attention later."
+                ),
+                action=f"/cases/{sender_key}/archive",
+                button="Keep and Archive",
+                tone="primary",
+                cancel_href=f"/cases/{sender_key}",
+                page_title="Archive Restriction",
             )
-            return 200, {}, self._page(content, raw=True, page_title="Archive Restriction")
         if method != "POST":
             return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
         values = parse_qs(body.decode("utf-8"), strict_parsing=True)
@@ -895,19 +995,26 @@ class DashboardHttpServer:
                 "cases.forget_preview", {"days": days}
             )
             count = int(result["count"])
-            content = (
-                self._masthead("Bulk Forget", f"{count} Eligible", csrf_token=self._csrf_token)
-                + "<main class='list-main'><section class='queue-intro'>"
-                + f"<h2>Release and Forget {count} Archived Restriction{'s' if count != 1 else ''}?</h2>"
-                + f"<p>Only permanent restrictions archived for at least {days} days and with no pending or failed work are eligible. "
-                + "Telegram conversations are not changed.</p>"
-                + "<form method='post' action='/cases/archive/forget'>"
-                + f"<input type='hidden' name='token' value='{self._csrf_token}'>"
-                + f"<input type='hidden' name='days' value='{days}'>"
-                + "<button class='danger' type='submit'>Confirm Bulk Forget</button></form>"
-                + "<p><a href='/cases/archive'>Cancel</a></p></section></main>"
+            return 200, {}, self._confirmation_page(
+                nav="archive",
+                title=(
+                    f"Release and Forget {count} Archived "
+                    f"Restriction{'s' if count != 1 else ''}?"
+                ),
+                body=(
+                    f"Only permanent restrictions archived for at least {days} days and with "
+                    "no pending or failed work are eligible. Telegram conversations are not "
+                    "changed."
+                ),
+                action="/cases/archive/forget",
+                hidden={"days": str(days)},
+                button="Confirm Bulk Forget",
+                tone="block",
+                cancel_href="/cases/archive",
+                page_title="Bulk Forget",
+                warning="Destructive Local Action",
+                disabled=count == 0,
             )
-            return 200, {}, self._page(content, raw=True, page_title="Bulk Forget")
         if method != "POST":
             return 405, {"Allow": "GET, POST"}, self._page("Method Not Allowed")
         if not secrets.compare_digest(source.get("token", [""])[0], self._csrf_token):
@@ -932,7 +1039,7 @@ class DashboardHttpServer:
         def sender_cell(item: SimpleNamespace) -> str:
             if archived:
                 return (
-                    f"<a class='identity-link' href='/cases/{item.sender_key}'>"
+                    f"<a class='identity-link row-link' href='/cases/{item.sender_key}'>"
                     "Archived Sender</a>"
                 )
             return self._identity_cell(
@@ -940,18 +1047,29 @@ class DashboardHttpServer:
                 href=f"/cases/{item.sender_key}",
             )
 
-        rows = "".join(
-            "<tr>"
-            f"<td data-label='Sender'>{sender_cell(item)}</td>"
-            f"<td data-label='State'><span class='badge'>{html.escape(self._human_label(item.status))}</span>"
-            f"<span class='cell-note'>{html.escape(self._restriction_summary(item))}</span></td>"
-            f"<td data-label='Trigger'>{html.escape(self._list_reason_label(item.reason))}</td>"
-            f"<td data-label='Evidence'><span class='availability{' availability-unavailable' if not item.has_evidence else ''}'>"
-            f"{'Ready' if item.has_evidence else 'Unavailable'}</span></td>"
-            f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.archived_at if archived else item.updated_at))}</td>"
-            "</tr>"
-            for item in items
-        ) or f"<tr class='empty-row'><td colspan='5'>No {'archived' if archived else 'active'} restrictions.</td></tr>"
+        def row(item: SimpleNamespace) -> str:
+            tone = self._case_tone(item.status, archived=archived)
+            evidence = (
+                "<span class='availability'>Ready</span>"
+                if item.has_evidence
+                else "<span class='availability availability-unavailable'>Unavailable</span>"
+            )
+            age = self._relative_age(item.archived_at if archived else item.updated_at)
+            return (
+                f"<tr class='tone-{tone}'>"
+                f"<td data-label='Sender'>{sender_cell(item)}</td>"
+                f"<td data-label='State'>{self._badge(self._human_label(item.status), tone)}"
+                f"<span class='cell-note'>{html.escape(self._restriction_summary(item))}</span></td>"
+                f"<td data-label='Trigger'>{html.escape(self._list_reason_label(item.reason))}</td>"
+                f"<td data-label='Evidence'>{evidence}</td>"
+                f"<td data-label='Age' class='age'>{html.escape(age)}</td>"
+                "</tr>"
+            )
+
+        rows = "".join(row(item) for item in items) or (
+            "<tr class='empty-row'><td colspan='5'>"
+            f"No {'archived' if archived else 'active'} restrictions.</td></tr>"
+        )
         reason_counts = sorted(
             (key.removeprefix("reason:"), value)
             for key, value in stats.items()
@@ -980,8 +1098,8 @@ class DashboardHttpServer:
         if stats["unidentified"]:
             recovery = (
                 "<details class='advanced-recovery'><summary>Advanced Recovery"
-                f" <span>{stats['unidentified']} unidentified</span></summary><div class='advanced-recovery-content'>"
-                "<p class='eyebrow'>Manual Recovery</p>"
+                f" <span class='summary-note'>{stats['unidentified']} unidentified</span></summary>"
+                "<div class='advanced-recovery-content'>"
                 "<h2>Allow an Unidentified Restricted Sender by Telegram User ID</h2>"
                 "<p>Use this only for a restriction without an encrypted control identity, such as "
                 "one created before control identities were retained or when Gatekeeper could "
@@ -994,7 +1112,7 @@ class DashboardHttpServer:
                 "<label for='release-user-id'>Telegram User ID</label>"
                 "<input id='release-user-id' name='user_id' type='text' inputmode='numeric' "
                 "pattern='[0-9]+' autocomplete='off' required>"
-                "<button class='danger' type='submit'>Allow Without Restore</button>"
+                "<button class='btn btn-block' type='submit'>Allow Without Restore</button>"
                 "</form></div></details>"
             )
         base = "/cases/archive" if archived else "/cases"
@@ -1006,51 +1124,81 @@ class DashboardHttpServer:
         filtered_base = base + (f"?{urlencode(filter_values)}" if filter_values else "")
         archive_tools = ""
         if archived:
-            reason_links = " · ".join(
-                f"<a href='/cases/archive?{urlencode({'reason': item_reason})}'>"
-                f"{html.escape(self._reason_label(item_reason))}</a>"
+
+            def filter_link(label: str, values: dict[str, object], current: bool) -> str:
+                query = f"?{urlencode(values)}" if values else ""
+                marker = " aria-current='true'" if current else ""
+                return f"<a href='/cases/archive{query}'{marker}>{html.escape(label)}</a>"
+
+            age_filter = {"older_days": older_days} if older_days else {}
+            reason_filter = {"reason": reason} if reason else {}
+            reason_links = filter_link("All", age_filter, reason is None) + "".join(
+                filter_link(
+                    self._reason_label(item_reason),
+                    {"reason": item_reason, **age_filter},
+                    reason == item_reason,
+                )
                 for item_reason, _ in reason_counts
-            ) or "No reasons"
+            )
+            age_links = filter_link("Any age", reason_filter, older_days is None) + "".join(
+                filter_link(f"{days} days", {**reason_filter, "older_days": days}, older_days == days)
+                for days in (30, 90, 180, 365)
+            )
+            forget_links = "".join(
+                f"<a href='/cases/archive/forget?days={days}'>{days} days</a>"
+                for days in (30, 90, 180, 365)
+            )
+            # One label column keeps both filters and the cleanup action aligned.
             archive_tools = (
-                "<section class='queue-intro compact-intro archive-tools'><p class='eyebrow'>Local Cleanup</p>"
-                f"<p>Filter by reason: <a href='/cases/archive'>All</a> · {reason_links}</p>"
-                "<p>Minimum archive age: "
-                + " · ".join(
-                    f"<a href='/cases/archive?older_days={days}'>{days} days</a>"
-                    for days in (30, 90, 180, 365)
-                )
-                + "</p>"
-                "<p>Preview release and forget by minimum archive age:</p><p>"
-                + " · ".join(
-                    f"<a href='/cases/archive/forget?days={days}'>{days} days</a>"
-                    for days in (30, 90, 180, 365)
-                )
-                + "</p></section>"
+                "<section class='archive-tools' aria-label='Archive filters and cleanup'>"
+                "<span class='filter-label'>Reason</span>"
+                f"<nav class='segmented' aria-label='Filter by reason'>{reason_links}</nav>"
+                "<span class='filter-label'>Minimum archive age</span>"
+                f"<nav class='segmented' aria-label='Minimum archive age'>{age_links}</nav>"
+                "<hr class='tools-divider'>"
+                "<span class='filter-label'>Preview release and forget</span>"
+                "<nav class='segmented segmented-danger' aria-label='Preview release and forget'>"
+                f"{forget_links}</nav></section>"
             )
+        if archived:
+            lede = (
+                "Permanent restrictions you chose to keep. They remain enforced by local "
+                "policy; review them or forget them here."
+            )
+        else:
+            lede = (
+                "Review every current restriction. Evidence availability is tracked "
+                "separately; Telegram block is never used."
+            )
+        stat_strip = (
+            "<div class='stat-block'><p class='stat-caption'>All enforced restrictions, "
+            "including archived</p><dl class='stat-strip'>"
+            f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
+            f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
+            f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div>"
+            "</dl></div>"
+        )
+        live_region = "archived-restrictions" if archived else "active-cases"
         content = (
-            self._masthead(
-                "Archived Restrictions" if archived else "Active Cases",
-                f"{total} Restrictions", csrf_token=self._csrf_token
+            self._masthead("archive" if archived else "cases", csrf_token=self._csrf_token)
+            + "<main class='page'>"
+            + f"<div class='live-region' data-live-region='{live_region}'>"
+            + self._page_header(
+                "Archived Restrictions" if archived else "Needs Attention",
+                count=str(total),
+                lede=lede,
+                aside=stat_strip,
             )
-            + "<p class='back'><a href='/'>← Operations Dashboard</a> · "
-            + ("<a href='/cases'>Needs Attention</a>" if archived else "<a href='/cases/archive'>Archived Restrictions</a>")
-            + " · <a href='/review'>Pending Reviews</a></p>"
-            + "<main class='list-main' data-live-region='active-cases'><section class='queue-intro compact-intro'><p class='eyebrow'>Protect Mode State</p>"
-            + "<p class='lede'>Review every current restriction. Evidence availability is tracked separately; Telegram block is never used.</p>"
-            + "<dl class='metric-grid'>"
-            + f"<div><dt>Quarantined</dt><dd class='data-value'>{stats['quarantined']}</dd></div>"
-            + f"<div><dt>Suppressed</dt><dd class='data-value'>{stats['suppressed']}</dd></div>"
-            + f"<div><dt>Reviewable Evidence</dt><dd class='data-value'>{stats['reviewable']}</dd></div></dl>"
             + "<details class='context-note'><summary>Restriction Context</summary>"
-            + f"<p><strong>State reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></details></section>"
+            + f"<p><strong>State reasons:</strong> {reasons}. {snapshot_note}{identity_note}</p></details>"
+            + archive_tools
             + "<div class='table-shell'><table class='data-table cases-table'><thead><tr><th>Sender</th><th>State</th><th>Trigger</th><th>Evidence</th><th>Age</th></tr></thead>"
             + f"<tbody>{rows}</tbody></table></div>"
             + self._pagination(filtered_base, page, total)
-            + archive_tools
-            + "</main>"
+            + "</div>"
             + "<section class='advanced-recovery-wrap' data-live-region='legacy-recovery'>"
             + recovery
-            + "</section>"
+            + "</section></main>"
         )
         return self._page(
             content,
@@ -1087,32 +1235,18 @@ class DashboardHttpServer:
         )
         identity_value = self._identity_from_value(result.get("identity"))
         identity = "Identity Unavailable"
-        telegram_link = ""
         user_id: int | None = None
         if identity_value is not None:
             user_id = identity_value.user_id
             identity = identity_value.name or "Name Unavailable"
             if identity_value.username:
                 identity += f" (@{identity_value.username})"
-            telegram_link = (
-                f"<a class='telegram-link' href='tg://user?id={user_id}'>"
-                "Open This Conversation in Telegram ↗</a>"
-            )
         signal_breakdown = self._signal_breakdown(payload.get("signals", []))
         policy_panel = self._policy_decision_panel(payload)
         features = json.dumps(payload.get("features", {}), indent=2, sort_keys=True)
         observed_at = item.evidence_created_at or item.updated_at
         observed = datetime.fromtimestamp(observed_at, timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
-        )
-        evidence_content = (
-            self._review_sections(payload)
-            if evidence_available
-            else (
-                "<div class='empty-state'><strong>Evidence expired or unavailable.</strong> "
-                "The encrypted control identity is retained only so this restriction remains "
-                "visible and reversible.</div>"
-            )
         )
         evidence_expiry = (
             datetime.fromtimestamp(item.evidence_expires_at, timezone.utc).strftime(
@@ -1121,22 +1255,32 @@ class DashboardHttpServer:
             if item.evidence_expires_at is not None
             else "Expired or unavailable"
         )
-        evidence_heading = (
-            "Decrypted Local Evidence"
-            if evidence_available
-            else "Restriction Control"
-        )
-        evidence_note = (
-            "Encrypted at rest; decrypted only for this owner-only view."
-            if evidence_available
-            else unavailable_note + " Only the encrypted control identity remains available."
-        )
+        if evidence_available:
+            message_html, link_facts, technical = self._review_sections(payload)
+            evidence_heading = "Decrypted Local Evidence"
+            evidence_note = "Encrypted at rest; decrypted only for this owner-only view."
+            evidence_panels = (
+                "<section class='panel'><h2 class='panel-title'>Links and Buttons</h2>"
+                f"{link_facts}</section>"
+            )
+        else:
+            message_html = (
+                "<div class='empty-state'><strong>Evidence expired or unavailable.</strong> "
+                "The encrypted control identity is retained only so this restriction remains "
+                "visible and reversible.</div>"
+            )
+            technical = ""
+            evidence_heading = "Restriction Control"
+            evidence_note = (
+                unavailable_note + " Only the encrypted control identity remains available."
+            )
+            evidence_panels = ""
         allow_action = (
             self._action_form(
-                item.sender_key, "allow", "Allow Sender", base="cases"
+                item.sender_key, "allow", "Allow Sender", base="cases", tone="allow"
             )
             if user_id is not None
-            else "<button type='button' disabled>Allow Unavailable</button>"
+            else "<button class='btn' type='button' disabled>Allow Unavailable</button>"
         )
         if result.get("has_dialog_snapshot") is True:
             allow_guidance = (
@@ -1154,51 +1298,93 @@ class DashboardHttpServer:
             )
             if not item.has_open_actions:
                 secondary_action += (
-                    f"<a class='danger button-link' href='/cases/{item.sender_key}/forget'>"
+                    f"<a class='btn btn-block-outline' href='/cases/{item.sender_key}/forget'>"
                     "Release and Forget…</a>"
                 )
         elif item.status == "suppressed" and item.suppressed_until is None:
             secondary_action = (
-                f"<a class='button-link' href='/cases/{item.sender_key}/archive'>"
+                f"<a class='btn' href='/cases/{item.sender_key}/archive'>"
                 "Keep and Archive…</a>"
             )
         else:
             secondary_action = ""
-        back_href = "/cases/archive" if archived else "/cases"
-        back_label = "Archived Restrictions" if archived else "Active Cases"
-        content = f"""
-        {self._masthead("Active Cases", self._human_label(item.status), csrf_token=self._csrf_token)}
-        <p class="back"><a href="{back_href}">← {back_label}</a></p>
-        {self._change_notice()}
-        <main class="review-grid"><section class="message-panel">
-          <p class="eyebrow">{evidence_heading}</p>
-          <h2>{html.escape(identity)}</h2>
-          <p class="refresh-note">{evidence_note}</p>
-          {evidence_content}
-          {telegram_link}
-        </section><aside class="case-file"><p class="eyebrow">Restriction Details</p>
-          <dl><dt>Status</dt><dd><span class="badge">{html.escape(self._human_label(item.status))}</span></dd>
-          <dt>Restriction Cause</dt><dd>{html.escape(self._human_label(item.reason))}</dd></dl>
-          {policy_panel}
-          <dl>
-          <dt>Evidence Signals</dt><dd class="signal-breakdown">{signal_breakdown}</dd>
-          <dt>Triggered</dt><dd>{observed}</dd><dt>Restriction</dt><dd>{html.escape(self._remaining(item))}</dd>
-          <dt>Evidence Expires</dt><dd>{evidence_expiry}</dd></dl>
-          <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
-        </aside></main><section class="decision-panel"><p class="eyebrow">Operator Action</p>
-          <h2>Allow Sender</h2>
-          <p>{html.escape(allow_guidance)}</p>
-          <div class="actions two">
-            {allow_action}
-            {secondary_action}
-          </div></section>"""
+        back = (
+            ("/cases/archive", "Archived Restrictions")
+            if archived
+            else ("/cases", "Needs Attention")
+        )
+        status_label = self._human_label(item.status)
+        tone = self._case_tone(item.status, archived=archived)
+        meta = self._identity_meta(user_id)
+        technical_panel = (
+            "<section class='panel panel-quiet'><h2 class='panel-title'>Technical Details</h2>"
+            f"{technical}"
+            f"<details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>"
+            "</section>"
+        )
+        facts = self._key_values(
+            [
+                ("Restriction Cause", html.escape(self._human_label(item.reason))),
+                ("Triggered", observed),
+                ("Restriction", html.escape(self._remaining(item))),
+                ("Evidence Expires", evidence_expiry),
+            ]
+        )
+        content = (
+            self._masthead("archive" if archived else "cases", csrf_token=self._csrf_token)
+            + "<main class='page detail-page'>"
+            + self._page_header(
+                identity,
+                meta=meta,
+                back=back,
+                aside=self._badge(
+                    "Archived · " + status_label if archived else status_label, tone
+                ),
+            )
+            + f"""
+        <div class="detail-grid">
+          <div class="evidence-column">
+            <section class="panel">
+              <div class="panel-head"><h2 class="panel-title">{evidence_heading}</h2>
+                <p class="panel-note">{evidence_note}</p></div>
+              {message_html}
+            </section>
+            {evidence_panels}
+            <section class="panel"><h2 class="panel-title">Evidence Signals</h2>
+              <div class="signal-breakdown">{signal_breakdown}</div></section>
+            {technical_panel}
+          </div>
+          <aside class="decision-rail" aria-label="Decision">
+            {self._change_notice()}
+            <section class="rail-card decision-card"><h2 class="rail-title">Operator Action</h2>
+              <p class="rail-help">{html.escape(allow_guidance)}</p>
+              <div class="action-stack">{allow_action}{secondary_action}</div></section>
+            {policy_panel}
+            <section class="rail-card"><h2 class="rail-title">Restriction Details</h2>{facts}</section>
+          </aside>
+        </div></main>"""
+        )
         return 200, {}, self._page(
             content,
             raw=True,
-            page_title=f"Active Case · {self._human_label(item.status)}",
+            page_title=f"Active Case · {status_label}",
             live_refresh="notice",
             page_version=await self._backend_page_version(f"/cases/{item.sender_key}"),
         )
+
+    @staticmethod
+    def _identity_meta(user_id: int | None, *, review_id: int | None = None) -> str:
+        parts: list[str] = []
+        if user_id is not None:
+            parts.append(f"<span class='identity-id'>ID {user_id}</span>")
+        if review_id is not None:
+            parts.append(f"<span class='identity-id'>Review #{review_id}</span>")
+        if user_id is not None:
+            parts.append(
+                f"<a class='telegram-link' href='tg://user?id={user_id}'>"
+                "Open This Conversation in Telegram ↗</a>"
+            )
+        return f"<p class='page-meta'>{''.join(parts)}</p>" if parts else ""
 
     async def _show_review(
         self, item: Any | int
@@ -1216,80 +1402,88 @@ class DashboardHttpServer:
             identity = identity_value.name or "Name Unavailable"
             if identity_value.username:
                 identity += f" (@{identity_value.username})"
-        signals = self._signal_breakdown(json.loads(item.signals))
+        recorded_signals = json.loads(item.signals)
+        signals = self._signal_breakdown(recorded_signals)
+        policy_panel = self._recomputed_policy_panel(recorded_signals)
         review_reason = self._human_label(item.classification)
+        tone = self._review_tone(item.classification)
         features = json.dumps(json.loads(item.features), indent=2, sort_keys=True)
         observed_at = datetime.fromtimestamp(item.updated_at, timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
         )
         text = result.get("message")
+        facts_rows: list[tuple[str, str]] = []
+        if text is not None and user_id is not None:
+            facts_rows.append(("Telegram ID", f"<span class='mono'>{user_id}</span>"))
+        facts_rows += [
+            ("Messages Observed", str(item.message_count)),
+            ("Last Observed", observed_at),
+        ]
+        facts = self._key_values(facts_rows)
         if text is None:
-            content = f"""
-            {self._masthead("Review Item", f"Review #{item.id}", csrf_token=self._csrf_token)}
-            <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
-            {self._change_notice()}
-            <main class="review-grid">
-              <section class="message-panel">
-                <p class="eyebrow">Telegram Message Unavailable</p>
-                <h2>{html.escape(identity)}</h2>
-                <div class="empty-state"><strong>The referenced message no longer exists.</strong>
-                <p>The conversation may have been deleted in Telegram. This pending row is local
-                review state and is not removed automatically.</p></div>
-              </section>
-              <aside class="case-file"><p class="eyebrow">Review Details</p>
-                <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-                <dt>Evidence Signals</dt><dd class="signal-breakdown">{signals}</dd>
-                <dt>Messages Observed</dt><dd>{item.message_count}</dd>
-                <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
-              </aside>
-            </main>
-            <section class="decision-panel"><p class="eyebrow">Resolve Local Record</p>
-              <h2>Dismiss Pending Reviews</h2>
-              <p>Remove this sender's pending review and cancel pending Gatekeeper deletion jobs. Telegram and trust state are unchanged.</p>
-              <div class="actions one">
-                {self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")}
-              </div>
-            </section>
-            """
-            return 200, {}, self._page(
-                content,
-                raw=True,
-                page_title=f"Review #{item.id}",
-                live_refresh="notice",
-                page_version=await self._backend_page_version(f"/review/{item.id}"),
+            message_panel = (
+                "<section class='panel'><div class='panel-head'>"
+                "<h2 class='panel-title'>Telegram Message Unavailable</h2></div>"
+                "<div class='empty-state'><strong>The referenced message no longer exists.</strong>"
+                "<p>The conversation may have been deleted in Telegram. This pending row is local "
+                "review state and is not removed automatically.</p></div></section>"
             )
-        text = str(text)
-        content = f"""
-        {self._masthead("Review Item", f"Review #{item.id}", csrf_token=self._csrf_token)}
-        <p class="back"><a href="/review">← Back to Pending Reviews</a></p>
-        {self._change_notice()}
-        <main class="review-grid">
-          <section class="message-panel">
-            <p class="eyebrow">Fetched from Telegram · Not Stored Locally</p>
-            <h2>{html.escape(identity)}</h2>
-            <pre class="message">{html.escape(text)}</pre>
-            <a class="telegram-link" href="tg://user?id={user_id}">Open This Conversation in Telegram ↗</a>
-          </section>
-          <aside class="case-file">
-            <p class="eyebrow">Review Details</p>
-            <dl><dt>Review Reason</dt><dd><span class="badge">{html.escape(review_reason)}</span></dd>
-            <dt>Evidence Signals</dt><dd class="signal-breakdown">{signals}</dd>
-            <dt>Telegram ID</dt><dd>{user_id}</dd>
-            <dt>Messages Observed</dt><dd>{item.message_count}</dd>
-            <dt>Last Observed</dt><dd>{observed_at}</dd></dl>
-            <details><summary>Structural Features</summary><pre>{html.escape(features)}</pre></details>
-          </aside>
-        </main>
-        <section class="decision-panel"><p class="eyebrow">Sender Decision</p>
-          <h2>Resolve Pending Reviews</h2>
-          <p>This decision applies to all pending entries for this sender.</p>
-          <div class="actions">
-            {self._action_form(item.id, "legitimate", "Allow Sender")}
-            {self._action_form(item.id, "spam", "Suppress and Delete", danger=True)}
-            {self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")}
-          </div>
-        </section>
-        """
+            decision = (
+                "<section class='rail-card decision-card'>"
+                "<h2 class='rail-title'>Dismiss Pending Reviews</h2>"
+                "<p class='rail-help'>Remove this sender's pending review and cancel pending "
+                "Gatekeeper deletion jobs. Telegram and trust state are unchanged.</p>"
+                "<div class='action-stack'>"
+                + self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")
+                + "</div></section>"
+            )
+            technical = ""
+        else:
+            message_panel = (
+                "<section class='panel'><div class='panel-head'>"
+                "<h2 class='panel-title'>Message</h2>"
+                "<p class='panel-note'>Fetched from Telegram · Not Stored Locally</p></div>"
+                f"<pre class='message'>{html.escape(str(text))}</pre></section>"
+            )
+            decision = (
+                "<section class='rail-card decision-card'>"
+                "<h2 class='rail-title'>Sender Decision</h2>"
+                "<p class='rail-help'>This decision applies to all pending entries for this "
+                "sender.</p><div class='action-stack'>"
+                + self._action_form(item.id, "legitimate", "Allow Sender", tone="allow")
+                + self._action_form(item.id, "spam", "Suppress and Delete", tone="block")
+                + self._action_form(item.id, "dismiss", "Dismiss & Cancel Jobs")
+                + "</div></section>"
+            )
+            technical = (
+                "<section class='panel panel-quiet'><h2 class='panel-title'>Technical Details</h2>"
+                f"<details><summary>Structural Features</summary><pre>{html.escape(features)}</pre>"
+                "</details></section>"
+            )
+        content = (
+            self._masthead("reviews", csrf_token=self._csrf_token)
+            + "<main class='page detail-page'>"
+            + self._page_header(
+                identity,
+                meta=self._identity_meta(
+                    user_id if text is not None else None, review_id=item.id
+                ),
+                back=("/review", "Pending Reviews"),
+                aside=self._badge(review_reason, tone),
+            )
+            + "<div class='detail-grid'><div class='evidence-column'>"
+            + message_panel
+            + "<section class='panel'><h2 class='panel-title'>Evidence Signals</h2>"
+            + f"<div class='signal-breakdown'>{signals}</div></section>"
+            + technical
+            + "</div><aside class='decision-rail' aria-label='Decision'>"
+            + self._change_notice()
+            + decision
+            + policy_panel
+            + "<section class='rail-card'><h2 class='rail-title'>Review Details</h2>"
+            + facts
+            + "</section></aside></div></main>"
+        )
         return 200, {}, self._page(
             content,
             raw=True,
@@ -1318,17 +1512,46 @@ class DashboardHttpServer:
                 "auto_forget_skipped": 0,
             }
         mode = str(result["mode"])
-        content = (
-            self._masthead(
-                "Operations Dashboard", mode.title(), csrf_token=self._csrf_token
+
+        def queue_card(href: str, title: str, note: str, count: int, tone: str) -> str:
+            state = f"tone-{tone}" if count else "is-empty"
+            return (
+                f"<a class='queue-card {state}' href='{href}'>"
+                f"<span class='queue-count'>{count}</span>"
+                f"<strong>{title}</strong><span class='queue-note'>{note}</span></a>"
             )
-            + "<main class='list-main' data-live-region='operations'><section class='queue-intro compact-intro'><p class='eyebrow'>Operator Overview</p>"
-            "<p class='lede'>Review restrictions, recover false positives, and resolve pending decisions.</p>"
-            "<dl class='metric-grid'>"
+
+        content = (
+            self._masthead("overview", csrf_token=self._csrf_token)
+            + "<main class='page'><div class='live-region' data-live-region='operations'>"
+            + self._page_header(
+                "Operations Dashboard",
+                lede="Review restrictions, recover false positives, and resolve pending decisions.",
+                aside=self._badge(
+                    f"{mode.title()} Mode", "monitor" if mode == "monitor" else "allow"
+                ),
+            )
+            + "<nav class='queue-grid' aria-label='Review areas'>"
+            + queue_card(
+                "/review", "Pending Reviews",
+                "Resolve simulations and exception reviews.", pending_reviews, "monitor",
+            )
+            + queue_card(
+                "/cases", "Active Cases · Needs Attention",
+                "Review unresolved restrictions and failures.",
+                int(storage_stats["attention_cases"]), "hold",
+            )
+            + queue_card(
+                "/cases/archive", "Archived Restrictions",
+                "Review or forget confirmed permanent restrictions.",
+                int(storage_stats["archived_restrictions"]), "neutral",
+            )
+            + "</nav><dl class='stat-strip stat-strip-wide'>"
             f"<div><dt>Active Restrictions</dt><dd class='data-value'>{active_restrictions}</dd></div>"
             f"<div><dt>Reviewable Cases</dt><dd class='data-value'>{active_stats['reviewable']}</dd></div>"
-            f"<div><dt>Pending Reviews</dt><dd class='data-value'>{pending_reviews}</dd></div>"
-            "</dl><details class='context-note'><summary>Storage and Maintenance</summary>"
+            "</dl>"
+            + self._policy_thresholds()
+            + "<details class='context-note'><summary>Storage and Maintenance</summary>"
             f"<p>Needs attention: {storage_stats['attention_cases']} · "
             f"Archived: {storage_stats['archived_restrictions']} · "
             f"Database: {storage_stats['database_logical_bytes']} bytes "
@@ -1339,12 +1562,7 @@ class DashboardHttpServer:
             f"<p>Last maintenance: released {storage_stats['temporary_released']} temporary restrictions, "
             f"forgot {storage_stats['auto_forgotten']} archived restrictions, "
             f"skipped {storage_stats['auto_forget_skipped']} with unfinished work.</p>"
-            "</details></section>"
-            "<nav class='area-grid' aria-label='Review areas'>"
-            f"<a class='area-card' href='/cases'><span class='eyebrow'>Restrictions</span><strong>Active Cases · Needs Attention</strong><span>Review unresolved restrictions and failures.</span><b>{storage_stats['attention_cases']}</b></a>"
-            f"<a class='area-card' href='/cases/archive'><span class='eyebrow'>Retained Policy</span><strong>Archived Restrictions</strong><span>Review or forget confirmed permanent restrictions.</span><b>{storage_stats['archived_restrictions']}</b></a>"
-            f"<a class='area-card' href='/review'><span class='eyebrow'>Decisions</span><strong>Pending Reviews</strong><span>Resolve simulations and exception reviews.</span><b>{pending_reviews}</b></a>"
-            "</nav></main>"
+            "</details></div></main>"
         )
         return self._page(
             content,
@@ -1354,39 +1572,63 @@ class DashboardHttpServer:
             page_version=await self._backend_page_version("/"),
         )
 
+    @staticmethod
+    def _policy_thresholds() -> str:
+        strict = PolicyEngine.STRICT_CHALLENGE_THRESHOLD
+        permanent = PolicyEngine.PERMANENT_SUPPRESSION_THRESHOLD
+        version = html.escape(PolicyEngine().decide(()).policy_version)
+        return (
+            "<section class='policy-thresholds' aria-label='Scoring policy thresholds'>"
+            f"<h2>Scoring Policy <span class='policy-version'>{version}</span></h2>"
+            "<ol class='threshold-scale'>"
+            f"<li class='tone-allow'><b>0–{strict - 1}</b><span>Standard Challenge</span></li>"
+            f"<li class='tone-hold'><b>{strict}+</b><span>Strict Challenge</span></li>"
+            f"<li class='tone-block'><b>{permanent}+</b><span>Permanent Suppression, only with "
+            "a non-quoted owner-denied domain or a corroborated repeated campaign</span></li>"
+            "</ol></section>"
+        )
+
     async def _review_queue_page(self, *, page: int = 1) -> bytes:
         result = await self.backend.request("reviews.list", {"page": page})
         total = int(result["total"])
         items = [SimpleNamespace(**value) for value in result["items"]]
-        rows = "".join(
-            "<tr>"
-            f"<td data-label='Sender'>{self._identity_cell(self._identity_from_value(item.identity), href=f'/review/{item.id}')}</td>"
-            f"<td data-label='Review'><span class='badge'>{html.escape(self._human_label(item.classification))}</span>"
-            f"<span class='cell-note'>Review #{item.id}</span></td>"
-            f"<td data-label='Signals'>{html.escape(self._signal_summary(json.loads(item.signals)))}</td>"
-            f"<td data-label='Messages' class='numeric'>{item.message_count}</td>"
-            f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.updated_at))}</td>"
-            "</tr>"
-            for item in items
-        )
-        if not rows:
-            rows = "<tr class='empty-row'><td colspan='5'>No pending reviews.</td></tr>"
-        return self._page(
-            self._masthead(
-                "Pending Reviews", f"{total} Pending", csrf_token=self._csrf_token
+
+        def row(item: SimpleNamespace) -> str:
+            tone = self._review_tone(item.classification)
+            identity = self._identity_cell(
+                self._identity_from_value(item.identity), href=f"/review/{item.id}"
             )
-            + "<p class='back'><a href='/'>← Operations Dashboard</a> · <a href='/cases'>Active Cases</a></p>"
-            + "<main class='list-main' data-live-region='pending-reviews'><section class='queue-intro compact-intro'><p class='eyebrow'>Decision Queue</p>"
-            "<p class='lede'>Open a sender to fetch message content and make a decision.</p>"
-            "<details class='context-note'><summary>Review and Refresh Behavior</summary>"
+            return (
+                f"<tr class='tone-{tone}'>"
+                f"<td data-label='Sender'>{identity}</td>"
+                f"<td data-label='Review'>{self._badge(self._human_label(item.classification), tone)}"
+                f"<span class='cell-note'>Review #{item.id}</span></td>"
+                f"<td data-label='Signals'>{html.escape(self._signal_summary(json.loads(item.signals)))}</td>"
+                f"<td data-label='Messages' class='numeric'>{item.message_count}</td>"
+                f"<td data-label='Age' class='age'>{html.escape(self._relative_age(item.updated_at))}</td>"
+                "</tr>"
+            )
+
+        rows = "".join(row(item) for item in items) or (
+            "<tr class='empty-row'><td colspan='5'>No pending reviews.</td></tr>"
+        )
+        return self._page(
+            self._masthead("reviews", csrf_token=self._csrf_token)
+            + "<main class='page'><div class='live-region' data-live-region='pending-reviews'>"
+            + self._page_header(
+                "Pending Reviews",
+                count=str(total),
+                lede="Open a sender to fetch message content and make a decision.",
+            )
+            + "<details class='context-note'><summary>Review and Refresh Behavior</summary>"
             "<p>Identity is cached briefly in memory; message content is fetched only on the detail page. "
             "Deleted Telegram conversations leave their local review available for resolution. "
-            "The list refreshes in place only when review state changes.</p></details></section>"
+            "The list refreshes in place only when review state changes.</p></details>"
             "<div class='table-shell'><table class='data-table reviews-table'><thead><tr><th>Sender</th><th>Review</th>"
             "<th>Signals</th><th>Messages</th>"
             f"<th>Age</th></tr></thead><tbody>{rows}</tbody></table></div>"
             + self._pagination("/review", page, total)
-            + "</main>",
+            + "</div></main>",
             raw=True,
             page_title="Pending Reviews",
             live_refresh="replace",
@@ -1410,7 +1652,10 @@ class DashboardHttpServer:
             identity_id = f"<span class='identity-id'>ID {identity.user_id}</span>"
         name = html.escape(label)
         if href is not None:
-            name = f"<a class='identity-link' href='{html.escape(href, quote=True)}'>{name}</a>"
+            name = (
+                f"<a class='identity-link row-link' href='{html.escape(href, quote=True)}'>"
+                f"{name}</a>"
+            )
         return f"<span class='identity-name'>{name}</span>{identity_id}"
 
     @staticmethod
@@ -1451,30 +1696,45 @@ class DashboardHttpServer:
             + "</nav>"
         )
 
-    @staticmethod
+    NAVIGATION = (
+        ("overview", "/", "Overview"),
+        ("reviews", "/review", "Pending Reviews"),
+        ("cases", "/cases", "Needs Attention"),
+        ("archive", "/cases/archive", "Archived"),
+    )
+
+    @classmethod
     def _masthead(
-        section: str, status: str, *, csrf_token: str | None = None
+        cls, active: str | None = None, *, csrf_token: str | None = None
     ) -> str:
+        brand = (
+            "<span class='brand-mark' aria-hidden='true'>TG</span>"
+            "<span class='brand-name'>PM Gatekeeper</span>"
+        )
+        if csrf_token is None:
+            return f"<header class='masthead'><div class='masthead-inner'><span class='brand'>{brand}</span></div></header>"
+        current = " aria-current='page'"
+        links = "".join(
+            f"<a href='{href}'{current if key == active else ''}>{label}</a>"
+            for key, href, label in cls.NAVIGATION
+        )
         checked_at = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        logout = (
+        return (
+            "<header class='masthead'><div class='masthead-inner'>"
+            f"<a class='brand' href='/'>{brand}</a>"
+            "<nav class='primary-nav' aria-label='Dashboard sections' data-section-indicator>"
+            f"{links}</nav>"
+            "<div class='connection' data-connection data-state='connected'>"
+            "<span class='live'><i aria-hidden='true'></i><span data-connection-label>Connected</span></span>"
+            f"<small data-checked-at>Checked {checked_at}</small>"
+            "<button class='refresh-control' type='button' data-dashboard-refresh "
+            "aria-label='Check Now' title='Check Now'>↻</button></div>"
+            "<button class='theme-toggle' type='button' data-theme-toggle "
+            "aria-label='Change theme'>System</button>"
             "<form class='logout-form' method='post' action='/logout'>"
             f"<input type='hidden' name='token' value='{csrf_token}'>"
             "<button type='submit'>Sign Out</button></form>"
-            if csrf_token is not None
-            else ""
-        )
-        return (
-            "<header class='masthead'><div><span class='mark'>TG</span>"
-            "<span class='product'>PM Gatekeeper</span></div>"
-            f"<div class='section' data-section-indicator>{html.escape(section)}"
-            f"<span>{html.escape(status)}</span></div>"
-            "<div class='connection' data-connection data-state='connected'>"
-            "<div><span class='live'><i></i><span data-connection-label>Connected</span></span>"
-            f"<small data-checked-at>Checked {checked_at}</small></div>"
-            "<button class='refresh-control' type='button' data-dashboard-refresh "
-            "aria-label='Check Now' title='Check Now'>↻</button></div>"
-            + logout
-            + "</header>"
+            "</div></header>"
         )
 
     @staticmethod
@@ -1492,16 +1752,50 @@ class DashboardHttpServer:
         action: str,
         label: str,
         *,
-        danger: bool = False,
+        tone: str | None = None,
         base: str = "review",
     ) -> str:
-        button_class = " class='danger'" if danger else ""
+        button_class = f"btn btn-{tone}" if tone else "btn"
         return (
             f"<form method='post' action='/{base}/{review_id}'>"
             f"<input type='hidden' name='token' value='{self._csrf_token}'>"
             f"<input type='hidden' name='action' value='{action}'>"
-            f"<button{button_class} type='submit'>{html.escape(label)}</button></form>"
+            f"<button class='{button_class}' type='submit'>{html.escape(label)}</button></form>"
         )
+
+    def _confirmation_page(
+        self,
+        *,
+        nav: str,
+        title: str,
+        body: str,
+        action: str,
+        button: str,
+        tone: str,
+        cancel_href: str,
+        page_title: str,
+        hidden: dict[str, str] | None = None,
+        warning: str | None = None,
+        disabled: bool = False,
+    ) -> bytes:
+        hidden_inputs = "".join(
+            f"<input type='hidden' name='{name}' value='{html.escape(value, quote=True)}'>"
+            for name, value in (hidden or {}).items()
+        )
+        warning_badge = self._badge(warning, "block") if warning else ""
+        content = (
+            self._masthead(nav, csrf_token=self._csrf_token)
+            + "<main class='page confirm-page'><section class='confirm-card"
+            + (" confirm-danger" if tone == "block" else "")
+            + f"'>{warning_badge}<h1>{html.escape(title)}</h1><p>{html.escape(body)}</p>"
+            + "<div class='confirm-actions'>"
+            + f"<form method='post' action='{action}'>"
+            + f"<input type='hidden' name='token' value='{self._csrf_token}'>{hidden_inputs}"
+            + f"<button class='btn btn-{tone}' type='submit'{' disabled' if disabled else ''}>"
+            + f"{html.escape(button)}</button></form>"
+            + f"<a class='btn' href='{cancel_href}'>Cancel</a></div></section></main>"
+        )
+        return self._page(content, raw=True, page_title=page_title)
 
     @staticmethod
     def _relative_age(created_at: int) -> str:
@@ -1648,13 +1942,13 @@ class DashboardHttpServer:
                     "Dashboard Access Missing",
                     "Dashboard Signed Out",
                 }
-                else "<a class='button-link' href='/'>Return to Dashboard</a>"
+                else "<a class='btn' href='/'>Return to Dashboard</a>"
             )
             body = (
-                cls._masthead("Error", "Request Not Completed")
+                cls._masthead()
                 + "<main class='error-layout'><section class='error-card'>"
                 + "<div class='error-content'>"
-                + "<p class='eyebrow'>Dashboard Error</p>"
+                + "<p class='error-kind'>Dashboard Error</p>"
                 + f"<h1>{html.escape(content)}</h1>"
                 + f"<p>{html.escape(guidance)}</p>"
                 + "<p class='error-command'><code>scripts/dashboard-tunnel.sh SSH_TARGET</code></p>"
@@ -1672,7 +1966,10 @@ class DashboardHttpServer:
             else ""
         )
         dashboard_script = (
-            '<script src="/dashboard.js" defer></script>' if raw else ""
+            '<script src="/dashboard-theme.js"></script>'
+            '<script src="/dashboard.js" defer></script>'
+            if raw
+            else ""
         )
         stylesheet = "/dashboard.css" if raw else "/dashboard-error.css"
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">

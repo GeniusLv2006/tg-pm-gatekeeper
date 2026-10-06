@@ -173,6 +173,8 @@ Overview and list pages update their marked regions in place only when the servi
 
 Dashboard links update the page content in place while retaining the masthead, background, and stylesheet. Pagination, filters, confirmation pages, and browser Back/Forward use the same navigation path; superseded requests are cancelled. If the session expires or navigation fails, the browser falls back to normal navigation. Decision forms still submit through the existing authenticated POST and confirmation flow.
 
+The overview shows the current scoring-policy thresholds. Active Case details show the risk score and policy decision recorded with the evidence. Pending reviews record signal weights but not a score, so their detail page recomputes the score and decision from those weights with the current policy and labels the result as recomputed; legacy rule codes without weights are shown without a score. The dashboard follows the system light or dark appearance by default, and the masthead theme control can override it. Only that choice (`light` or `dark`) is kept in the browser's local storage for the dashboard origin; it contains no case, identity, or session data. Error pages, which load before sign-in, follow the system appearance only.
+
 ### Telegram operator controls
 
 This feature is disabled by default. To opt in, set the following deployment value and recreate the service:
