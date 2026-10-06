@@ -7,10 +7,8 @@ import asyncio
 import logging
 import os
 import time
-import unicodedata
 from collections import OrderedDict
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,8 +19,9 @@ from telethon.tl import TLObject
 from .config import ConfigurationError, Settings, read_api_hash, read_private_file
 from .dashboard_backend import InProcessDashboardBackend
 from .dashboard_rpc import DashboardRpcServer
-from .message_facts import facts_from_message
-from .restriction_actions import RestrictionActions, RestrictionReleaseResult
+from .message_facts import facts_from_message, reply_to_message_id
+from .operator_controls import OperatorControls
+from .restriction_actions import RestrictionActions
 from .rules import normalized_domain
 from .service import (
     TEST_MESSAGE_DELETE_DELAY_SECONDS,
@@ -41,18 +40,6 @@ RUNTIME_METRICS_INTERVAL_SECONDS = 15 * 60
 SERVICE_USER_IDS = {777000, 42777}
 HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
 PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
-OPERATOR_CASE_LIMIT = 5
-OPERATOR_CONTROL_TTL_SECONDS = 15 * 60
-OPERATOR_IDENTITY_TIMEOUT_SECONDS = 5
-OPERATOR_SYNC_INTERVAL_SECONDS = 3
-OPERATOR_SYNC_BATCH_LIMIT = 100
-OPERATOR_CLEANUP_BATCH_LIMIT = 100
-OPERATOR_CLEANUP_RETRY_BASE_SECONDS = 30
-OPERATOR_CLEANUP_RETRY_MAX_SECONDS = 60 * 60
-OPERATOR_CLEANUP_POLL_SECONDS = 60
-OPERATOR_ORPHAN_LOOKBACK_SECONDS = 7 * 24 * 60 * 60
-OPERATOR_ORPHAN_SEARCH_LIMIT = 200
-OPERATOR_ORPHAN_SEARCH_QUERIES = ("/gatekeeper", "Gatekeeper", "restriction")
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
     "⚠️ Verification Required",
@@ -77,12 +64,6 @@ GATEKEEPER_MESSAGE_PREFIXES = (
 
 class TelegramAuthorizationError(RuntimeError):
     """Raised when the configured Telegram session cannot operate the client."""
-
-
-@dataclass(frozen=True, slots=True)
-class OperatorCaseControl:
-    sender_key: str
-    expires_at: float
 
 
 def formatting_entities_from_spans(
@@ -124,12 +105,6 @@ def load_denylist(path: Path | None) -> frozenset[str]:
             raise ConfigurationError(f"invalid denylist entry on line {line_number}")
         values.add(domain)
     return frozenset(values)
-
-
-def reply_to_message_id(message: types.Message) -> int | None:
-    reply_header = getattr(message, "reply_to", None)
-    value = getattr(reply_header, "reply_to_msg_id", None)
-    return value if isinstance(value, int) else None
 
 
 def input_peer_from_sender(sender) -> types.InputPeerUser | None:
@@ -433,11 +408,6 @@ class TelegramAdapter:
         self._sender_cleanup_tasks: dict[str, set[asyncio.Task]] = {}
         self._heartbeat_task: asyncio.Task | None = None
         self._self_user_id: int | None = None
-        self._operator_case_controls: dict[int, OperatorCaseControl] = {}
-        self._operator_command_lock = asyncio.Lock()
-        self._operator_sync_cursor: int | None = None
-        self._operator_handled_message_ids: dict[int, float] = {}
-        self._operator_cleanup_wakeup = asyncio.Event()
         self._next_metrics_at = 0.0
         self._restriction_actions = RestrictionActions(
             store,
@@ -456,6 +426,13 @@ class TelegramAdapter:
             restriction_actions=self._restriction_actions,
         )
         self._dashboard_backend = dashboard_backend
+        self.operator_controls = OperatorControls(
+            self.client,
+            store,
+            service,
+            self._restriction_actions,
+            enabled=settings.telegram_operator_controls_enabled,
+        )
         self._dashboard_rpc = DashboardRpcServer(
             settings.dashboard_rpc_socket_path, dashboard_backend
         )
@@ -466,9 +443,10 @@ class TelegramAdapter:
             raise TelegramAuthorizationError("telegram session is not authorized")
         me = await self.client.get_me()
         self._self_user_id = int(me.id)
+        self.operator_controls.self_user_id = self._self_user_id
         if self.settings.telegram_operator_controls_enabled:
-            await self._initialize_operator_sync_cursor()
-            await self._reconcile_operator_artifacts()
+            await self.operator_controls.initialize_sync_cursor()
+            await self.operator_controls.reconcile_artifacts()
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
         await self._recover_pending_actions()
@@ -478,10 +456,10 @@ class TelegramAdapter:
         )
         if self.settings.telegram_operator_controls_enabled:
             self.client.add_event_handler(
-                self._on_operator_message, events.NewMessage(outgoing=True)
+                self.operator_controls.handle_message, events.NewMessage(outgoing=True)
             )
-            self._track_maintenance_task(self._operator_sync_loop())
-            self._track_maintenance_task(self._operator_artifact_cleanup_loop())
+            self._track_maintenance_task(self.operator_controls.sync_loop())
+            self._track_maintenance_task(self.operator_controls.artifact_cleanup_loop())
         disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         LOG.info("service_started")
@@ -541,9 +519,7 @@ class TelegramAdapter:
                     for sender_key in sender_keys:
                         if self.store.active_restriction(sender_key, now=now) is None:
                             self.cancel_timeout(sender_key)
-                            self._dashboard_backend._identity_cache.pop(
-                                sender_key, None
-                            )
+                            self._dashboard_backend.evict_identity(sender_key)
                             self._forget_sender_runtime_refs(sender_key)
                 LOG.info(
                     "maintenance_complete:auto_forgotten=%d:"
@@ -639,362 +615,6 @@ class TelegramAdapter:
             LOG.info(f"message_handled:{outcome}")
         except Exception:
             LOG.error("event_handler_failed")
-
-    async def _on_operator_message(self, event) -> None:
-        if (
-            not self.settings.telegram_operator_controls_enabled
-            or self._self_user_id is None
-            or not event.is_private
-            or not bool(getattr(event.message, "out", False))
-            or event.chat_id != self._self_user_id
-            or getattr(event.message, "fwd_from", None) is not None
-        ):
-            return
-        text = (event.raw_text or "").strip()
-        if text != "/gatekeeper" and not text.startswith("/gatekeeper "):
-            return
-        artifact_ids: list[int] = []
-        try:
-            async with self._operator_command_lock:
-                message_id = getattr(event, "id", None)
-                now = time.monotonic()
-                self._operator_handled_message_ids = {
-                    handled_id: expires_at
-                    for handled_id, expires_at in self._operator_handled_message_ids.items()
-                    if expires_at > now
-                }
-                if (
-                    isinstance(message_id, int)
-                    and message_id in self._operator_handled_message_ids
-                ):
-                    return
-                if isinstance(message_id, int):
-                    self._operator_handled_message_ids[message_id] = (
-                        now + OPERATOR_CONTROL_TTL_SECONDS
-                    )
-                    artifact_ids.append(message_id)
-                if text in {"/gatekeeper", "/gatekeeper help"}:
-                    command_name = "help"
-                    await self._operator_respond(
-                        event,
-                        self._operator_help(),
-                        artifact_ids,
-                    )
-                elif text == "/gatekeeper ping":
-                    command_name = "ping"
-                    await self._operator_respond(
-                        event,
-                        "✅ Gatekeeper operator controls are online.",
-                        artifact_ids,
-                    )
-                elif text == "/gatekeeper cases":
-                    command_name = "cases"
-                    await self._send_operator_cases(event, artifact_ids)
-                elif text == "/gatekeeper allow":
-                    command_name = "allow"
-                    await self._allow_operator_case(event, artifact_ids)
-                else:
-                    command_name = "unknown"
-                    await self._operator_respond(
-                        event,
-                        "Unknown Gatekeeper command. Send /gatekeeper help.",
-                        artifact_ids,
-                    )
-                LOG.info(f"operator_command_handled:{command_name}")
-        except Exception:
-            LOG.error("operator_command_failed")
-            try:
-                await self._operator_respond(
-                    event,
-                    "❌ Gatekeeper could not process that operator command.",
-                    artifact_ids,
-                )
-            except Exception:
-                LOG.error("operator_response_failed")
-        finally:
-            if artifact_ids:
-                self.schedule_operator_artifact_deletion(artifact_ids)
-
-    @staticmethod
-    async def _operator_respond(event, text: str, artifact_ids: list[int]):
-        message = await event.respond(text, link_preview=False, parse_mode=None)
-        message_id = getattr(message, "id", None)
-        if isinstance(message_id, int):
-            artifact_ids.append(message_id)
-        return message
-
-    async def _initialize_operator_sync_cursor(self) -> None:
-        try:
-            messages = await self.client.get_messages("me", limit=1)
-        except Exception:
-            self._operator_sync_cursor = None
-            LOG.warning("operator_sync_initialization_failed")
-            return
-        self._operator_sync_cursor = max(
-            (int(message.id) for message in messages),
-            default=0,
-        )
-
-    async def _operator_sync_loop(self) -> None:
-        while True:
-            await asyncio.sleep(OPERATOR_SYNC_INTERVAL_SECONDS)
-            try:
-                await self._sync_operator_messages()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOG.warning("operator_sync_failed")
-
-    async def _sync_operator_messages(self) -> None:
-        if self._operator_sync_cursor is None:
-            await self._initialize_operator_sync_cursor()
-            return
-        while True:
-            messages = await self.client.get_messages(
-                "me",
-                limit=OPERATOR_SYNC_BATCH_LIMIT,
-                min_id=self._operator_sync_cursor,
-                reverse=True,
-                search="/gatekeeper",
-            )
-            if not messages:
-                return
-            for message in messages:
-                message_id = int(message.id)
-                if message_id <= self._operator_sync_cursor:
-                    continue
-                self._operator_sync_cursor = message_id
-                await self._on_operator_message(message)
-            if len(messages) < OPERATOR_SYNC_BATCH_LIMIT:
-                return
-
-    async def _reconcile_operator_artifacts(self) -> None:
-        now = int(time.time())
-        cutoff = now - OPERATOR_ORPHAN_LOOKBACK_SECONDS
-        artifacts: dict[int, int] = {}
-        try:
-            for query in OPERATOR_ORPHAN_SEARCH_QUERIES:
-                messages = await self.client.get_messages(
-                    "me",
-                    limit=OPERATOR_ORPHAN_SEARCH_LIMIT,
-                    search=query,
-                )
-                for message in messages:
-                    message_id = getattr(message, "id", None)
-                    sent_at = getattr(message, "date", None)
-                    if (
-                        not isinstance(message_id, int)
-                        or not isinstance(sent_at, datetime)
-                        or int(sent_at.timestamp()) < cutoff
-                        or not bool(getattr(message, "out", False))
-                        or getattr(message, "fwd_from", None) is not None
-                        or not self._is_operator_artifact_text(
-                            getattr(message, "message", "")
-                        )
-                    ):
-                        continue
-                    artifacts[message_id] = max(
-                        now,
-                        int(sent_at.timestamp()) + OPERATOR_CONTROL_TTL_SECONDS,
-                    )
-        except Exception:
-            LOG.warning("operator_artifact_reconciliation_failed")
-            return
-        if not artifacts:
-            return
-        for message_id, delete_at in artifacts.items():
-            self.store.schedule_operator_artifacts([message_id], delete_at)
-        self._operator_cleanup_wakeup.set()
-        LOG.info("operator_artifacts_reconciled")
-
-    @staticmethod
-    def _is_operator_artifact_text(value: object) -> bool:
-        text = str(value or "").strip()
-        if text == "/gatekeeper" or text.startswith("/gatekeeper "):
-            return True
-        if text in {
-            TelegramAdapter._operator_help(),
-            "✅ Gatekeeper operator controls are online.",
-            "Unknown Gatekeeper command. Send /gatekeeper help.",
-            "❌ Gatekeeper could not process that operator command.",
-            "✅ Gatekeeper has no active restrictions.",
-            "Reply to a current case from /gatekeeper cases. "
-            "Case controls expire after 15 minutes.",
-            "✅ Restriction removed. The sender is now allowed and pending "
-            "Gatekeeper deletion jobs were cancelled.",
-            "ℹ️ This restriction was already resolved. No action was taken.",
-            "⚠️ Telegram identity is unavailable. Use Advanced Recovery in the Dashboard.",
-            "❌ Telegram restore failed. The restriction was left unchanged.",
-        }:
-            return True
-        if text.startswith("Gatekeeper Active Cases · showing "):
-            counts = text.removeprefix("Gatekeeper Active Cases · showing ").split(
-                " of ", 1
-            )
-            return len(counts) == 2 and all(value.isdecimal() for value in counts)
-        lines = text.splitlines()
-        return (
-            len(lines) >= 8
-            and lines[0] == "Gatekeeper Active Case"
-            and lines[1] == ""
-            and lines[2].startswith("Sender: ")
-            and lines[3].startswith("State: ")
-            and lines[4].startswith("Reason: ")
-            and lines[5].startswith("Updated: ")
-            and lines[6] == ""
-            and "\n".join(lines[7:])
-            in {
-                "Reply to this message with /gatekeeper allow\n"
-                "This control is single-use and expires in 15 minutes.",
-                "Telegram identity is unavailable. Use Advanced Recovery in the Dashboard.",
-            }
-        )
-
-    async def _send_operator_cases(self, event, artifact_ids: list[int]) -> None:
-        self._operator_case_controls.clear()
-        total = self.store.active_restriction_count()
-        items = self.store.active_restrictions(limit=OPERATOR_CASE_LIMIT)
-        if not items:
-            await self._operator_respond(
-                event,
-                "✅ Gatekeeper has no active restrictions.",
-                artifact_ids,
-            )
-            return
-        await self._operator_respond(
-            event,
-            f"Gatekeeper Active Cases · showing {len(items)} of {total}",
-            artifact_ids,
-        )
-        expires_at = time.monotonic() + OPERATOR_CONTROL_TTL_SECONDS
-        for item in items:
-            identity = await self._operator_identity(item.reference)
-            actionable = item.reference is not None
-            instruction = (
-                "Reply to this message with /gatekeeper allow\n"
-                "This control is single-use and expires in 15 minutes."
-                if actionable
-                else "Telegram identity is unavailable. Use Advanced Recovery in the Dashboard."
-            )
-            message = await self._operator_respond(
-                event,
-                "Gatekeeper Active Case\n\n"
-                f"Sender: {identity}\n"
-                f"State: {item.status.title()}\n"
-                f"Reason: {self._operator_reason(item.reason)}\n"
-                f"Updated: {self._operator_age(item.updated_at)}\n\n"
-                f"{instruction}",
-                artifact_ids,
-            )
-            if actionable:
-                self._operator_case_controls[int(message.id)] = OperatorCaseControl(
-                    item.sender_key,
-                    expires_at,
-                )
-
-    async def _allow_operator_case(self, event, artifact_ids: list[int]) -> None:
-        reply_id = reply_to_message_id(event.message)
-        now = time.monotonic()
-        self._operator_case_controls = {
-            message_id: control
-            for message_id, control in self._operator_case_controls.items()
-            if control.expires_at > now
-        }
-        control = (
-            self._operator_case_controls.pop(reply_id, None)
-            if reply_id is not None
-            else None
-        )
-        if control is None:
-            await self._operator_respond(
-                event,
-                "Reply to a current case from /gatekeeper cases. "
-                "Case controls expire after 15 minutes.",
-                artifact_ids,
-            )
-            return
-        result = await self._restriction_actions.allow(control.sender_key)
-        response = {
-            RestrictionReleaseResult.ALLOWED: (
-                "✅ Restriction removed. The sender is now allowed and pending "
-                "Gatekeeper deletion jobs were cancelled."
-            ),
-            RestrictionReleaseResult.NOT_ACTIVE: (
-                "ℹ️ This restriction was already resolved. No action was taken."
-            ),
-            RestrictionReleaseResult.IDENTITY_UNAVAILABLE: (
-                "⚠️ Telegram identity is unavailable. Use Advanced Recovery in the Dashboard."
-            ),
-            RestrictionReleaseResult.TELEGRAM_ACTION_FAILED: (
-                "❌ Telegram restore failed. The restriction was left unchanged."
-            ),
-        }[result]
-        await self._operator_respond(event, response, artifact_ids)
-
-    async def _operator_identity(self, reference: bytes | None) -> str:
-        if reference is None:
-            return "Identity unavailable"
-        try:
-            user_id, access_hash = self.service.protector.open_restriction_reference(
-                reference
-            )
-            sender = await asyncio.wait_for(
-                self.client.get_entity(
-                    types.InputPeerUser(user_id=user_id, access_hash=access_hash)
-                ),
-                timeout=OPERATOR_IDENTITY_TIMEOUT_SECONDS,
-            )
-        except Exception:
-            return "Name unavailable"
-        name = " ".join(
-            self._operator_text(value)
-            for value in (
-                getattr(sender, "first_name", None),
-                getattr(sender, "last_name", None),
-            )
-            if value
-        ).strip() or "Unnamed sender"
-        name = name[:120]
-        username = getattr(sender, "username", None)
-        clean_username = self._operator_text(username)[:64] if username else ""
-        return f"{name} (@{clean_username})" if clean_username else name
-
-    @staticmethod
-    def _operator_text(value: object) -> str:
-        return " ".join(
-            "".join(
-                (" " if unicodedata.category(char) == "Cc" else char)
-                for char in str(value)
-                if unicodedata.category(char) != "Cf"
-            ).split()
-        )
-
-    @staticmethod
-    def _operator_reason(reason: str) -> str:
-        # critical_rule predates adaptive scoring and survives only in old restrictions.
-        if reason == "critical_rule":
-            return "Legacy Critical Rule Match"
-        return reason.replace("_", " ").title()
-
-    @staticmethod
-    def _operator_age(updated_at: int) -> str:
-        age = max(0, int(time.time()) - updated_at)
-        if age < 60:
-            return "just now"
-        if age < 3600:
-            return f"{age // 60} minutes ago"
-        if age < 86400:
-            return f"{age // 3600} hours ago"
-        return f"{age // 86400} days ago"
-
-    @staticmethod
-    def _operator_help() -> str:
-        return (
-            "Gatekeeper operator controls work only in Saved Messages.\n\n"
-            "/gatekeeper ping — check the control channel\n"
-            "/gatekeeper cases — list up to 5 active restrictions\n"
-            "Reply to a case with /gatekeeper allow — restore and allow the sender"
-        )
 
     def _review_reference(self, sender, message_id: int) -> bytes | None:
         sender_id = getattr(sender, "id", None)
@@ -1171,11 +791,7 @@ class TelegramAdapter:
         for task in self._sender_cleanup_tasks.pop(sender_key, set()):
             if task is not asyncio.current_task():
                 task.cancel()
-        self._operator_case_controls = {
-            message_id: control
-            for message_id, control in self._operator_case_controls.items()
-            if control.sender_key != sender_key
-        }
+        self.operator_controls.forget_sender(sender_key)
 
     async def _timeout_worker(
         self,
@@ -1223,59 +839,6 @@ class TelegramAdapter:
                     self._sender_cleanup_tasks.pop(sender_key, None)
 
         task.add_done_callback(finished)
-
-    def schedule_operator_artifact_deletion(self, message_ids: list[int]) -> None:
-        unique_ids = tuple(dict.fromkeys(message_ids))
-        self.store.schedule_operator_artifacts(
-            unique_ids,
-            int(time.time()) + OPERATOR_CONTROL_TTL_SECONDS,
-        )
-        self._operator_cleanup_wakeup.set()
-
-    async def _operator_artifact_cleanup_loop(self) -> None:
-        while True:
-            now = int(time.time())
-            if await self._delete_due_operator_artifacts(now):
-                continue
-            next_delete_at = self.store.next_operator_artifact_delete_at()
-            delay = OPERATOR_CLEANUP_POLL_SECONDS
-            if next_delete_at is not None:
-                delay = max(
-                    0,
-                    min(OPERATOR_CLEANUP_POLL_SECONDS, next_delete_at - now),
-                )
-            self._operator_cleanup_wakeup.clear()
-            try:
-                await asyncio.wait_for(
-                    self._operator_cleanup_wakeup.wait(), timeout=delay
-                )
-            except TimeoutError:
-                pass
-
-    async def _delete_due_operator_artifacts(self, now: int) -> bool:
-        due = self.store.due_operator_artifacts(
-            now, limit=OPERATOR_CLEANUP_BATCH_LIMIT
-        )
-        if not due:
-            return False
-        message_ids = [message_id for message_id, _ in due]
-        try:
-            await self.client.delete_messages("me", message_ids, revoke=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            retry_count = max(count for _, count in due) + 1
-            retry_delay = min(
-                OPERATOR_CLEANUP_RETRY_MAX_SECONDS,
-                OPERATOR_CLEANUP_RETRY_BASE_SECONDS
-                * (2 ** min(retry_count - 1, 7)),
-            )
-            self.store.retry_operator_artifacts(message_ids, now + retry_delay)
-            LOG.warning("operator_artifact_deletion_failed")
-        else:
-            self.store.complete_operator_artifacts(message_ids)
-            LOG.info("operator_artifacts_deleted")
-        return True
 
     def schedule_test_message_deletion(
         self, peer, sender_key: str, since: int, delete_at: int

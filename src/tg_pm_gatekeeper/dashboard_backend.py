@@ -239,7 +239,7 @@ class InProcessDashboardBackend:
                 self.cancel_timeout(item.sender_key)
             else:
                 self.store.decide_sender_reviews(item.sender_key, ReviewStatus.DISMISSED)
-            self._identity_cache.pop(item.sender_key, None)
+            self.evict_identity(item.sender_key)
         return {"outcome": "completed"}
 
     async def _case_list(self, params: dict[str, object]) -> dict[str, object]:
@@ -335,7 +335,7 @@ class InProcessDashboardBackend:
                 if not self.store.forget_restriction(sender_key):
                     raise DashboardBackendError("case_not_forgettable")
                 self.cancel_timeout(sender_key)
-                self._identity_cache.pop(sender_key, None)
+                self.evict_identity(sender_key)
                 self.on_sender_forgotten(sender_key)
             LOG.info("archived_restrictions_forgotten:count=1")
             return {"outcome": "forgotten"}
@@ -351,7 +351,7 @@ class InProcessDashboardBackend:
             raise DashboardBackendError(errors[result])
         if result != RestrictionReleaseResult.ALLOWED:
             raise DashboardBackendError("restriction_release_failed")
-        self._identity_cache.pop(sender_key, None)
+        self.evict_identity(sender_key)
         return {"outcome": "allowed"}
 
     async def _case_forget_preview(
@@ -373,7 +373,7 @@ class InProcessDashboardBackend:
                     sender_key, archived_before=cutoff
                 ):
                     self.cancel_timeout(sender_key)
-                    self._identity_cache.pop(sender_key, None)
+                    self.evict_identity(sender_key)
                     self.on_sender_forgotten(sender_key)
                     count += 1
         LOG.info("archived_restrictions_forgotten:count=%d", count)
@@ -391,7 +391,7 @@ class InProcessDashboardBackend:
             self.store.allow(sender_key)
             self.store.clear_dialog_snapshot(sender_key)
             self.cancel_timeout(sender_key)
-            self._identity_cache.pop(sender_key, None)
+            self.evict_identity(sender_key)
             self.store.audit(
                 sender_key,
                 "OPERATOR_ALLOW_WITHOUT_RESTORE",
@@ -732,6 +732,10 @@ class InProcessDashboardBackend:
             "name": name[:120],
             "username": str(username)[:64] if username else None,
         }
+
+    def evict_identity(self, sender_key: str) -> None:
+        """Drop the cached Telegram name for a sender whose restriction ended."""
+        self._identity_cache.pop(sender_key, None)
 
     def _cache_identity(
         self,
