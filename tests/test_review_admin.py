@@ -96,7 +96,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             "sender",
             reference,
             "would_quarantine",
-            '["HR-01_MULTIPLE_LINK_BUTTONS"]',
+            '[{"code":"MULTIPLE_LINK_BUTTONS","source":"button","weight":25}]',
             "{}",
             int(time.time()) + 700,
             100,
@@ -138,11 +138,11 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_deleted_telegram_message_can_resolve_local_review(self) -> None:
         self.client.message = None
         state = self.store.suppress(
-            "sender", "critical_rule", until=None, reference=b"reference"
+            "sender", "permanent_suppression", until=None, reference=b"reference"
         )
         self.store.schedule_action(
             "sender",
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=b"reference",
             execute_at=int(time.time()) + 600,
             expected_revision=state.revision,
@@ -319,7 +319,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.store._connection.execute(
             "UPDATE review_queue SET signals=? WHERE id=?",
             (
-                '[{"code":"HR-01_MULTIPLE_LINK_BUTTONS","source":"rules","weight":12,'
+                '[{"code":"MULTIPLE_LINK_BUTTONS","source":"button","weight":25,'
                 '"explanation":"First explanation"},{"code":"AUTHORED_DENIED_DOMAIN",'
                 '"source":"heuristics","weight":70,"explanation":"Second explanation"}]',
                 self.review_id,
@@ -354,12 +354,37 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Recomputed from the recorded signal weights", detail)
 
     async def test_review_detail_skips_policy_for_legacy_rule_codes(self) -> None:
+        # Reviews queued before adaptive scoring store bare HR rule codes without weights.
+        self.store._connection.execute(
+            "UPDATE review_queue SET signals=? WHERE id=?",
+            ('["HR-01_MULTIPLE_LINK_BUTTONS"]', self.review_id),
+        )
+        queue = await self.server._review_queue_page()
         _, _, detail = await self.server._dispatch(
             "GET", f"/review/{self.review_id}", b""
         )
 
+        self.assertIn(b"Legacy HR-01 \xc2\xb7 Multiple Link Buttons", queue)
+        self.assertIn(b"<strong>Legacy HR-01 \xc2\xb7 Multiple Link Buttons</strong>", detail)
         self.assertNotIn(b"policy-map", detail)
-        self.assertIn(b"Multiple Link Buttons", detail)
+
+    async def test_legacy_critical_rule_restriction_is_labelled_as_legacy(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.suppress(
+            sender_key,
+            "critical_rule",
+            until=None,
+            restriction_reference=self.protector.seal_restriction_reference(
+                123456789, -987654321
+            ),
+        )
+
+        cases = await self.server._enforcement_index_page()
+        _, _, detail = await self.server._dispatch("GET", f"/cases/{sender_key}", b"")
+
+        self.assertIn(b"Legacy Critical Rule Match", cases)
+        self.assertIn(b"Legacy Critical Rule Match", detail)
+        self.assertNotIn(b"Critical HR Match", detail)
 
     async def test_overview_shows_policy_thresholds(self) -> None:
         page = await self.server._dashboard_page()
@@ -876,12 +901,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             sender_key,
             reference=reference,
             envelope=envelope,
-            reason="critical_rule",
+            reason="permanent_suppression",
             expires_at=int(time.time()) + 700,
         )
         self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             reference=reference,
             restriction_reference=self.protector.seal_restriction_reference(
@@ -896,7 +921,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"Limited Textual Evidence", detail)
         self.assertIn(b"deciding whether to allow the sender", detail)
         self.assertIn(b"Decrypted Local Evidence", detail)
-        self.assertIn(b"Critical HR Match", detail)
+        self.assertIn(b"Permanent Suppression", detail)
         self.assertIn(b"Evidence Signals", detail)
         self.assertIn(b"<ol class='signal-list'", detail)
         self.assertIn(b"<strong>Multiple Link Buttons</strong>", detail)
@@ -1078,7 +1103,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         sender_key = "a" * 64
         self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             restriction_reference=self.protector.seal_restriction_reference(
                 123456789, -987654321
@@ -1107,7 +1132,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_keep_archive_requires_confirmation_page_and_csrf(self) -> None:
         sender_key = "d" * 64
-        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.suppress(sender_key, "permanent_suppression", until=None)
 
         status, _, confirmation = await self.server._dispatch(
             "GET", f"/cases/{sender_key}/archive", b""
@@ -1132,7 +1157,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         now = int(time.time())
         for sender_key, age in (("b" * 64, 100), ("c" * 64, 10)):
             self.store.suppress(
-                sender_key, "critical_rule", until=None, now=now - age * 86400
+                sender_key, "permanent_suppression", until=None, now=now - age * 86400
             )
             self.store.archive_restriction(sender_key, now - age * 86400)
 
@@ -1197,12 +1222,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
             envelope=self.review_protector.seal(
                 {"schema_version": 5, "text": "expired-private-canary"}
             ),
-            reason="critical_rule",
+            reason="permanent_suppression",
             expires_at=int(time.time()) - 1,
         )
         self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             restriction_reference=self.protector.seal_restriction_reference(
                 user_id, -987654321
@@ -1241,12 +1266,12 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
                 123456789, -987654321, 42
             ),
             envelope=b"invalid-encrypted-evidence",
-            reason="critical_rule",
+            reason="permanent_suppression",
             expires_at=int(time.time()) + 700,
         )
         self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             restriction_reference=self.protector.seal_restriction_reference(
                 123456789, -987654321
@@ -1313,13 +1338,13 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.protector.sender_key(user_id)
         state = self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             reference=b"expired-reference",
         )
         self.store.schedule_action(
             sender_key,
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=b"expired-reference",
             execute_at=int(time.time()) + 600,
             expected_revision=state.revision,
@@ -1411,7 +1436,7 @@ class ReviewAdminTests(unittest.IsolatedAsyncioTestCase):
     async def test_release_by_user_id_requires_valid_csrf(self) -> None:
         user_id = 771_234_569
         sender_key = self.protector.sender_key(user_id)
-        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.suppress(sender_key, "permanent_suppression", until=None)
         body = urlencode({"token": "invalid", "user_id": str(user_id)}).encode()
 
         status, _, response = await self.server._dispatch(

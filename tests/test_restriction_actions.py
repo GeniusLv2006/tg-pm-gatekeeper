@@ -53,14 +53,14 @@ class RestrictionActionsTests(unittest.IsolatedAsyncioTestCase):
         )
         state = self.store.suppress(
             sender_key,
-            "critical_rule",
+            "permanent_suppression",
             until=None,
             reference=review_reference,
             restriction_reference=restriction_reference,
         )
         action_id = self.store.schedule_action(
             sender_key,
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=review_reference,
             execute_at=9999999999,
             expected_revision=state.revision,

@@ -970,6 +970,9 @@ class TelegramAdapter:
 
     @staticmethod
     def _operator_reason(reason: str) -> str:
+        # critical_rule predates adaptive scoring and survives only in old restrictions.
+        if reason == "critical_rule":
+            return "Legacy Critical Rule Match"
         return reason.replace("_", " ").title()
 
     @staticmethod

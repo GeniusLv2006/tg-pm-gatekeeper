@@ -46,7 +46,7 @@ class CliTests(unittest.TestCase):
             ),
             "suppressed": lambda store: store.suppress(
                 SENDER_KEY,
-                "critical_rule",
+                "permanent_suppression",
                 until=None,
                 reference=b"reference",
                 restriction_reference=b"control",

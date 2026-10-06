@@ -289,11 +289,11 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.statistics(now=100)["pending_reviews"], 1)
 
         other = self.store.suppress(
-            "other", "critical_rule", until=None, reference=b"other", now=200
+            "other", "permanent_suppression", until=None, reference=b"other", now=200
         )
         other_action = self.store.schedule_action(
             "other",
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=b"other",
             execute_at=210,
             expected_revision=other.revision,
@@ -333,14 +333,14 @@ class StoreTests(unittest.TestCase):
             try:
                 state = store.suppress(
                     "sender",
-                    "critical_rule",
+                    "permanent_suppression",
                     until=None,
                     reference=b"reference",
                     now=100,
                 )
                 store.schedule_action(
                     "sender",
-                    reason="critical_rule",
+                    reason="permanent_suppression",
                     reference=b"reference",
                     execute_at=200,
                     expected_revision=state.revision,
@@ -355,14 +355,14 @@ class StoreTests(unittest.TestCase):
 
                 other = store.suppress(
                     "other",
-                    "critical_rule",
+                    "permanent_suppression",
                     until=None,
                     reference=b"other",
                     now=300,
                 )
                 other_id = store.schedule_action(
                     "other",
-                    reason="critical_rule",
+                    reason="permanent_suppression",
                     reference=b"other",
                     execute_at=400,
                     expected_revision=other.revision,
@@ -385,11 +385,11 @@ class StoreTests(unittest.TestCase):
     def test_protect_preflight_rejects_stale_pending_action(self) -> None:
         self.store.heartbeat()
         state = self.store.suppress(
-            "sender", "critical_rule", until=None, reference=b"reference", now=100
+            "sender", "permanent_suppression", until=None, reference=b"reference", now=100
         )
         self.store.schedule_action(
             "sender",
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=b"reference",
             execute_at=100,
             expected_revision=state.revision,
@@ -399,7 +399,7 @@ class StoreTests(unittest.TestCase):
         # Recreate an intentionally stale row to exercise the preflight guard.
         self.store.schedule_action(
             "sender",
-            reason="critical_rule",
+            reason="permanent_suppression",
             reference=b"reference",
             execute_at=102,
             expected_revision=state.revision,
@@ -529,7 +529,7 @@ class StoreTests(unittest.TestCase):
             "sender",
             b"second",
             "would_quarantine",
-            '["HR-01_MULTIPLE_LINK_BUTTONS"]',
+            '[{"code":"MULTIPLE_LINK_BUTTONS","source":"button","weight":25}]',
             "{}",
             800,
             200,
@@ -612,9 +612,9 @@ class StoreTests(unittest.TestCase):
         self.store.save_dialog_snapshot(
             "temporary", DialogSnapshot(folder_id=1, silent=True, mute_until=200)
         )
-        self.store.suppress("old", "critical_rule", until=None, now=100)
+        self.store.suppress("old", "permanent_suppression", until=None, now=100)
         self.store.archive_restriction("old", 100)
-        self.store.suppress("new", "critical_rule", until=None, now=100)
+        self.store.suppress("new", "permanent_suppression", until=None, now=100)
         self.store.archive_restriction("new", 150_000)
 
         metrics = self.store.prune(
@@ -644,10 +644,10 @@ class StoreTests(unittest.TestCase):
             second_connection.close()
 
     def test_old_failed_action_blocks_auto_forget_after_audit_retention(self) -> None:
-        state = self.store.suppress("sender", "critical_rule", until=None, now=100)
+        state = self.store.suppress("sender", "permanent_suppression", until=None, now=100)
         self.store.archive_restriction("sender", 100)
         action_id = self.store.schedule_action(
-            "sender", reason="critical_rule", reference=b"reference",
+            "sender", reason="permanent_suppression", reference=b"reference",
             execute_at=110, expected_revision=state.revision, now=100,
         )
         self.store.finish_action(action_id, "failed", 110)
@@ -699,7 +699,7 @@ class StoreMigrationTests(unittest.TestCase):
 
     def test_v7_database_adds_archive_column_without_archiving_existing_rows(self) -> None:
         store = StateStore(self.path)
-        store.suppress("sender", "critical_rule", until=None, now=100)
+        store.suppress("sender", "permanent_suppression", until=None, now=100)
         store._connection.execute("DROP INDEX sender_state_archive_idx")
         store._connection.execute("ALTER TABLE sender_state DROP COLUMN archived_at")
         store._connection.execute("PRAGMA user_version=7")

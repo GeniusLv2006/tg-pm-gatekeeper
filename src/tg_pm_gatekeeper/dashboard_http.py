@@ -1857,7 +1857,7 @@ class DashboardHttpServer:
             "restore_failed": "Restoration Failed · Protect",
             "warning_failed": "Failure Warning Not Delivered · Protect",
             "timeout_notice_failed": "Timeout Warning Not Delivered · Protect",
-            "critical_rule": "Critical HR Match",
+            "critical_rule": "Legacy Critical Rule Match",
             "permanent_suppression": "Permanent Suppression",
             "standard_challenge": "Standard Challenge",
             "strict_challenge": "Strict Challenge",
@@ -1887,8 +1887,9 @@ class DashboardHttpServer:
         prefix = ""
         body = value
         if value.startswith("HR-") and "_" in value:
+            # HR rule codes predate adaptive scoring and survive only in old rows.
             prefix, body = value.split("_", 1)
-            prefix += " · "
+            prefix = f"Legacy {prefix} · "
         label = body.replace("_", " ").strip().title()
         label = label.replace("Url", "URL").replace("Vpn", "VPN")
         label = label.replace("Webview", "WebView")

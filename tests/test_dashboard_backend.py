@@ -120,7 +120,7 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_keep_case_waits_for_sender_lock(self) -> None:
         sender_key = "d" * 64
-        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.suppress(sender_key, "permanent_suppression", until=None)
         lock = self.service.sender_lock(sender_key)
         await lock.acquire()
         decision = asyncio.create_task(
@@ -139,7 +139,7 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
         sender_key = "e" * 64
         forgotten: list[str] = []
         self.backend.on_sender_forgotten = forgotten.append
-        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.suppress(sender_key, "permanent_suppression", until=None)
         with self.assertRaisesRegex(DashboardBackendError, "case_not_forgettable"):
             await self.backend.request(
                 "cases.decide", {"sender_key": sender_key, "action": "forget"}
@@ -156,7 +156,7 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bulk_forget_rechecks_eligibility_after_sender_lock(self) -> None:
         sender_key = "f" * 64
-        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.suppress(sender_key, "permanent_suppression", until=None)
         self.store.archive_restriction(sender_key, int(time.time()) - 100 * 86400)
         lock = self.service.sender_lock(sender_key)
         await lock.acquire()
@@ -174,10 +174,10 @@ class DashboardBackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_archive_page_version_uses_filters(self) -> None:
         sender_key = "f" * 64
-        self.store.suppress(sender_key, "critical_rule", until=None)
+        self.store.suppress(sender_key, "permanent_suppression", until=None)
         self.store.archive_restriction(sender_key, int(time.time()) - 100 * 86400)
         self.assertNotEqual(
-            self.backend.page_version("/cases/archive?reason=critical_rule"),
+            self.backend.page_version("/cases/archive?reason=permanent_suppression"),
             self.backend.page_version("/cases/archive?reason=manual_spam"),
         )
 
