@@ -316,72 +316,16 @@ class GatekeeperService:
 
         outcome = "fail_safe"
         try:
-            state = self.store.sender(sender_key)
-            if is_test_sender and state.status == SenderStatus.ALLOWED:
-                self.store.revoke(sender_key, now)
-                state = self.store.sender(sender_key)
-            if state.status == SenderStatus.SUPPRESSED:
-                if state.suppressed_until is not None and state.suppressed_until <= now:
-                    self.store.release_expired_suppression(sender_key, now)
-                    state = self.store.sender(sender_key)
-                elif not is_test_sender:
-                    if self.store.get_mode() == "monitor":
-                        outcome = "would_delete_suppressed"
-                        return outcome
-                    outcome = self._schedule_suppressed_delete(
-                        sender_key, state, message, actions, now
-                    )
-                    return outcome
-            elif (
-                is_test_sender
-                and state.status in {SenderStatus.PROVISIONAL, SenderStatus.QUARANTINED}
-                and state.updated_at + TEST_STATE_RESET_DELAY_SECONDS <= now
-            ):
-                self.store.reset_test_sender(sender_key, state.updated_at, now)
-                state = self.store.sender(sender_key)
-            if not is_test_sender and (
-                message.is_service or message.is_bot or message.is_contact
-            ):
-                self.store.allow(sender_key, now)
-                self.store.audit(sender_key, "TRUSTED_SENDER", "allowed", now)
-                outcome = "allowed"
-                return outcome
-            if state.status == SenderStatus.ALLOWED:
-                outcome = "allowed"
-                return outcome
-            if (
-                not is_test_sender
-                and state.status in {SenderStatus.UNKNOWN, SenderStatus.PROVISIONAL}
-                and message.has_trusted_history
-            ):
-                self.store.allow(sender_key, now)
-                self.store.audit(sender_key, "TRUSTED_HISTORY", "allowed", now)
-                outcome = "allowed"
-                return outcome
-            if state.status == SenderStatus.QUARANTINED:
-                outcome = "already_quarantined"
-                return outcome
-            if state.status in CHALLENGE_STARTING_STATUSES:
-                outcome = "challenge_starting"
-                return outcome
-
-            recent_links = self.store.recent_link_messages(sender_key, now=now)
-            signals = detect_evidence_signals(
-                message.facts,
-                previous_link_messages=recent_links,
-                denylist=self.denylist,
+            state, settled = self._settle_before_screening(
+                sender_key, message, actions, now, is_test_sender=is_test_sender
             )
-            if message.facts.has_link and not is_test_sender:
-                self.store.record_link_message(sender_key, now)
-            if not is_test_sender:
-                candidate = campaign_candidate(message.facts, signals)
-                if candidate is not None:
-                    fingerprint = self.protector.campaign_fingerprint(candidate)
-                    if self.store.observe_campaign(
-                        fingerprint, sender_key, now=now
-                    ) >= 2:
-                        signals += (repeated_campaign_signal(),)
+            if settled is not None:
+                outcome = settled
+                return outcome
 
+            signals = self._evidence_signals(
+                sender_key, message, now, is_test_sender=is_test_sender
+            )
             decision = self.policy.decide(() if is_test_sender else signals)
             if (
                 decision.planned_action == "permanent_suppression"
@@ -442,6 +386,90 @@ class GatekeeperService:
             return "fail_safe"
         finally:
             self.store.finish_message(sender_key, message.message_id, outcome)
+
+    def _settle_before_screening(
+        self,
+        sender_key: str,
+        message: IncomingMessage,
+        actions: MessageActions,
+        now: int,
+        *,
+        is_test_sender: bool,
+    ) -> tuple[SenderState, str | None]:
+        """Apply state that decides a message without evidence screening.
+
+        Returns the current sender state and, when the message is already decided,
+        its outcome. Expired suppressions and stale test-sender states are reset first.
+        """
+        state = self.store.sender(sender_key)
+        if is_test_sender and state.status == SenderStatus.ALLOWED:
+            self.store.revoke(sender_key, now)
+            state = self.store.sender(sender_key)
+        if state.status == SenderStatus.SUPPRESSED:
+            if state.suppressed_until is not None and state.suppressed_until <= now:
+                self.store.release_expired_suppression(sender_key, now)
+                state = self.store.sender(sender_key)
+            elif not is_test_sender:
+                if self.store.get_mode() == "monitor":
+                    return state, "would_delete_suppressed"
+                return state, self._schedule_suppressed_delete(
+                    sender_key, state, message, actions, now
+                )
+        elif (
+            is_test_sender
+            and state.status in {SenderStatus.PROVISIONAL, SenderStatus.QUARANTINED}
+            and state.updated_at + TEST_STATE_RESET_DELAY_SECONDS <= now
+        ):
+            self.store.reset_test_sender(sender_key, state.updated_at, now)
+            state = self.store.sender(sender_key)
+        if not is_test_sender and (
+            message.is_service or message.is_bot or message.is_contact
+        ):
+            self.store.allow(sender_key, now)
+            self.store.audit(sender_key, "TRUSTED_SENDER", "allowed", now)
+            return state, "allowed"
+        if state.status == SenderStatus.ALLOWED:
+            return state, "allowed"
+        if (
+            not is_test_sender
+            and state.status in {SenderStatus.UNKNOWN, SenderStatus.PROVISIONAL}
+            and message.has_trusted_history
+        ):
+            self.store.allow(sender_key, now)
+            self.store.audit(sender_key, "TRUSTED_HISTORY", "allowed", now)
+            return state, "allowed"
+        if state.status == SenderStatus.QUARANTINED:
+            return state, "already_quarantined"
+        if state.status in CHALLENGE_STARTING_STATUSES:
+            return state, "challenge_starting"
+        return state, None
+
+    def _evidence_signals(
+        self,
+        sender_key: str,
+        message: IncomingMessage,
+        now: int,
+        *,
+        is_test_sender: bool,
+    ) -> tuple[EvidenceSignal, ...]:
+        """Detect signals and record the link and campaign observations they depend on."""
+        recent_links = self.store.recent_link_messages(sender_key, now=now)
+        signals = detect_evidence_signals(
+            message.facts,
+            previous_link_messages=recent_links,
+            denylist=self.denylist,
+        )
+        if message.facts.has_link and not is_test_sender:
+            self.store.record_link_message(sender_key, now)
+        if not is_test_sender:
+            candidate = campaign_candidate(message.facts, signals)
+            if candidate is not None:
+                fingerprint = self.protector.campaign_fingerprint(candidate)
+                if self.store.observe_campaign(
+                    fingerprint, sender_key, now=now
+                ) >= 2:
+                    signals += (repeated_campaign_signal(),)
+        return signals
 
     def _active_case_payload(
         self,
@@ -850,198 +878,252 @@ class GatekeeperService:
     ) -> str:
         expires_at = state.challenge_expires_at
         if not expires_at or message.sent_at > expires_at:
-            self.store.expire_challenge(
-                sender_key,
-                expires_at or 0,
-                now,
-                suppression_seconds=(
-                    VERIFICATION_FAILED_SUPPRESSION_SECONDS
-                    if state.challenge_profile == "strict"
-                    else VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS
-                ),
-                restriction_reference=self.restriction_reference(
-                    state.challenge_action_reference
-                ),
-            )
-            self.store.audit(sender_key, "challenge_expired", "already_archived", now)
-            actions.cancel_timeout(sender_key)
-            await self._finalize_timeout_failure(
-                sender_key,
-                state,
-                actions,
-                now,
-                fallback_reference=message.review_reference,
-            )
-            return "suppressed"
-
+            return await self._expire_late_reply(sender_key, state, message, actions, now)
         if message.reply_to_message_id != state.challenge_message_id:
-            await self._send_guidance_once(
-                sender_key,
-                state,
-                actions,
-                REPLY_REQUIRED_TEXT,
-                now,
-                formatting=notice_formatting(REPLY_REQUIRED_TEXT),
+            return await self._ignore_with_guidance(
+                sender_key, state, actions, now,
+                REPLY_REQUIRED_TEXT, "CHALLENGE_WRONG_REPLY_TARGET",
             )
-            self.store.audit(sender_key, "CHALLENGE_WRONG_REPLY_TARGET", "ignored", now)
-            return "challenge_pending"
-
         answer = canonical_answer(message.text)
         if answer is None:
-            await self._send_guidance_once(
-                sender_key,
-                state,
-                actions,
-                DIGITS_REQUIRED_TEXT,
-                now,
-                formatting=notice_formatting(DIGITS_REQUIRED_TEXT),
+            return await self._ignore_with_guidance(
+                sender_key, state, actions, now,
+                DIGITS_REQUIRED_TEXT, "CHALLENGE_NON_NUMERIC",
             )
-            self.store.audit(sender_key, "CHALLENGE_NON_NUMERIC", "ignored", now)
-            return "challenge_pending"
-
         actual = self.protector.answer_digest(
             sender_key, state.challenge_id or "", answer
         )
         if state.answer_digest and self.protector.matches(state.answer_digest, actual):
-            if not await self._restore_with_retry(actions):
-                self.store.audit(sender_key, "CHALLENGE_RESTORE", "action_failed", now)
-                self._enqueue_review(sender_key, message, "restore_failed", (), now)
-                return "fail_safe"
-            self.store.mark_provisional(sender_key, now)
-            self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
-            actions.cancel_timeout(sender_key)
-            passed_message_id = await self._send_notice(
-                sender_key,
-                actions,
-                VERIFICATION_PASSED_TEXT,
-                now,
-                reply_to_message_id=message.message_id,
-                formatting=notice_formatting(VERIFICATION_PASSED_TEXT),
+            return await self._accept_correct_answer(
+                sender_key, state, message, actions, now
             )
-            verification_message_ids = set(
-                self.store.message_ids_between(
-                    sender_key,
-                    state.challenge_message_id or message.message_id,
-                    max(message.message_id, passed_message_id or message.message_id),
-                )
-            )
-            verification_message_ids.add(message.message_id)
-            if state.challenge_message_id is not None:
-                verification_message_ids.add(state.challenge_message_id)
-            if passed_message_id is not None:
-                verification_message_ids.add(passed_message_id)
-            actions.schedule_verification_message_deletion(
-                sender_key,
-                tuple(sorted(verification_message_ids)),
-                now + VERIFICATION_SUCCESS_DELETE_DELAY_SECONDS,
-            )
-            self.store.audit(
-                sender_key,
-                "CHALLENGE_CLEANUP",
-                "scheduled",
-                now,
-            )
-            if sender_key == self.test_sender_key:
-                actions.schedule_test_state_reset(
-                    sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
-                )
-            return "provisional"
-
         attempts = self.store.increment_attempts(sender_key, now)
         self.store.audit(sender_key, "CHALLENGE_INCORRECT", "rejected", now)
         max_attempts = (
             1 if state.challenge_profile == "strict" else self.challenge_max_attempts
         )
         if attempts >= max_attempts:
-            actions.cancel_timeout(sender_key)
-            failed_text = (
-                TEST_VERIFICATION_FAILED_TEXT
-                if sender_key == self.test_sender_key
-                else VERIFICATION_FAILED_TEXT
+            return await self._fail_exhausted_attempts(
+                sender_key, state, message, actions, now
             )
-            warning_message_id = await self._send_notice(
+        return await self._reject_incorrect_answer(
+            sender_key, state, actions, now, max_attempts - attempts
+        )
+
+    async def _expire_late_reply(
+        self,
+        sender_key: str,
+        state: SenderState,
+        message: IncomingMessage,
+        actions: MessageActions,
+        now: int,
+    ) -> str:
+        """A reply after the deadline ends the challenge as a timeout."""
+        expires_at = state.challenge_expires_at
+        self.store.expire_challenge(
+            sender_key,
+            expires_at or 0,
+            now,
+            suppression_seconds=(
+                VERIFICATION_FAILED_SUPPRESSION_SECONDS
+                if state.challenge_profile == "strict"
+                else VERIFICATION_TIMEOUT_SUPPRESSION_SECONDS
+            ),
+            restriction_reference=self.restriction_reference(
+                state.challenge_action_reference
+            ),
+        )
+        self.store.audit(sender_key, "challenge_expired", "already_archived", now)
+        actions.cancel_timeout(sender_key)
+        await self._finalize_timeout_failure(
+            sender_key,
+            state,
+            actions,
+            now,
+            fallback_reference=message.review_reference,
+        )
+        return "suppressed"
+
+    async def _ignore_with_guidance(
+        self,
+        sender_key: str,
+        state: SenderState,
+        actions: MessageActions,
+        now: int,
+        text: str,
+        rule_code: str,
+    ) -> str:
+        """Unusable replies consume no attempt; the sender gets one corrective hint."""
+        await self._send_guidance_once(
+            sender_key,
+            state,
+            actions,
+            text,
+            now,
+            formatting=notice_formatting(text),
+        )
+        self.store.audit(sender_key, rule_code, "ignored", now)
+        return "challenge_pending"
+
+    async def _accept_correct_answer(
+        self,
+        sender_key: str,
+        state: SenderState,
+        message: IncomingMessage,
+        actions: MessageActions,
+        now: int,
+    ) -> str:
+        """Restore the dialog, mark the sender provisional, and schedule flow cleanup."""
+        if not await self._restore_with_retry(actions):
+            self.store.audit(sender_key, "CHALLENGE_RESTORE", "action_failed", now)
+            self._enqueue_review(sender_key, message, "restore_failed", (), now)
+            return "fail_safe"
+        self.store.mark_provisional(sender_key, now)
+        self.store.audit(sender_key, "CHALLENGE_CORRECT", "provisional", now)
+        actions.cancel_timeout(sender_key)
+        passed_message_id = await self._send_notice(
+            sender_key,
+            actions,
+            VERIFICATION_PASSED_TEXT,
+            now,
+            reply_to_message_id=message.message_id,
+            formatting=notice_formatting(VERIFICATION_PASSED_TEXT),
+        )
+        verification_message_ids = set(
+            self.store.message_ids_between(
                 sender_key,
-                actions,
+                state.challenge_message_id or message.message_id,
+                max(message.message_id, passed_message_id or message.message_id),
+            )
+        )
+        verification_message_ids.add(message.message_id)
+        if state.challenge_message_id is not None:
+            verification_message_ids.add(state.challenge_message_id)
+        if passed_message_id is not None:
+            verification_message_ids.add(passed_message_id)
+        actions.schedule_verification_message_deletion(
+            sender_key,
+            tuple(sorted(verification_message_ids)),
+            now + VERIFICATION_SUCCESS_DELETE_DELAY_SECONDS,
+        )
+        self.store.audit(
+            sender_key,
+            "CHALLENGE_CLEANUP",
+            "scheduled",
+            now,
+        )
+        if sender_key == self.test_sender_key:
+            actions.schedule_test_state_reset(
+                sender_key, now, now + TEST_STATE_RESET_DELAY_SECONDS
+            )
+        return "provisional"
+
+    async def _fail_exhausted_attempts(
+        self,
+        sender_key: str,
+        state: SenderState,
+        message: IncomingMessage,
+        actions: MessageActions,
+        now: int,
+    ) -> str:
+        """Warn, then suppress and schedule whole-dialog deletion; quarantine on failure."""
+        actions.cancel_timeout(sender_key)
+        failed_text = (
+            TEST_VERIFICATION_FAILED_TEXT
+            if sender_key == self.test_sender_key
+            else VERIFICATION_FAILED_TEXT
+        )
+        warning_message_id = await self._send_notice(
+            sender_key,
+            actions,
+            failed_text,
+            now,
+            formatting=emphasized(
                 failed_text,
+                "⛔ Verification Failed",
+                "10 seconds",
+            ),
+        )
+        if warning_message_id is None:
+            self.store.quarantine(
+                sender_key,
                 now,
-                formatting=emphasized(
-                    failed_text,
-                    "⛔ Verification Failed",
-                    "10 seconds",
+                restriction_reference=self.restriction_reference(
+                    message.review_reference
                 ),
             )
-            if warning_message_id is None:
-                self.store.quarantine(
-                    sender_key,
-                    now,
-                    restriction_reference=self.restriction_reference(
-                        message.review_reference
-                    ),
-                )
-                self._activate_enforcement_review(
-                    sender_key,
-                    "warning_failed",
-                    now,
-                    reference=message.review_reference,
-                )
-                self._enqueue_review(sender_key, message, "warning_failed", (), now)
-                self.store.audit(
-                    sender_key, "attempts_exhausted", "warning_failed", now
-                )
-                return "quarantined"
-            reference = message.review_reference or state.challenge_action_reference
-            if reference is None:
-                self.store.quarantine(sender_key, now)
-                self._activate_enforcement_review(
-                    sender_key, "reference_unavailable", now
-                )
-                self.store.audit(
-                    sender_key, "attempts_exhausted", "reference_unavailable", now
-                )
-                return "quarantined"
-            if sender_key == self.test_sender_key:
-                self.store.quarantine(sender_key, now)
-                terminal = self.store.sender(sender_key)
-                actions.schedule_test_state_reset(
-                    sender_key,
-                    terminal.updated_at,
-                    now + TEST_STATE_RESET_DELAY_SECONDS,
-                )
-            else:
-                terminal = self.store.suppress(
-                    sender_key,
-                    "attempts_exhausted",
-                    until=now + VERIFICATION_FAILED_SUPPRESSION_SECONDS,
-                    reference=reference,
-                    restriction_reference=self.restriction_reference(reference),
-                    now=now,
-                )
-                self._activate_enforcement_review(
-                    sender_key,
-                    "attempts_exhausted",
-                    now,
-                    reference=reference,
-                )
-            action_id = self.store.schedule_action(
+            self._activate_enforcement_review(
                 sender_key,
-                reason="attempts_exhausted",
-                reference=reference,
-                execute_at=now + FAILED_DIALOG_DELETE_DELAY_SECONDS,
-                expected_revision=terminal.revision,
-                mode_independent=sender_key == self.test_sender_key,
-                now=now,
+                "warning_failed",
+                now,
+                reference=message.review_reference,
             )
-            actions.schedule_dialog_deletion(
-                action_id, now + FAILED_DIALOG_DELETE_DELAY_SECONDS
+            self._enqueue_review(sender_key, message, "warning_failed", (), now)
+            self.store.audit(
+                sender_key, "attempts_exhausted", "warning_failed", now
+            )
+            return "quarantined"
+        reference = message.review_reference or state.challenge_action_reference
+        if reference is None:
+            self.store.quarantine(sender_key, now)
+            self._activate_enforcement_review(
+                sender_key, "reference_unavailable", now
             )
             self.store.audit(
+                sender_key, "attempts_exhausted", "reference_unavailable", now
+            )
+            return "quarantined"
+        if sender_key == self.test_sender_key:
+            self.store.quarantine(sender_key, now)
+            terminal = self.store.sender(sender_key)
+            actions.schedule_test_state_reset(
+                sender_key,
+                terminal.updated_at,
+                now + TEST_STATE_RESET_DELAY_SECONDS,
+            )
+        else:
+            terminal = self.store.suppress(
                 sender_key,
                 "attempts_exhausted",
-                "dialog_deletion_scheduled",
-                now,
+                until=now + VERIFICATION_FAILED_SUPPRESSION_SECONDS,
+                reference=reference,
+                restriction_reference=self.restriction_reference(reference),
+                now=now,
             )
-            return "suppressed" if sender_key != self.test_sender_key else "quarantined"
-        remaining = max_attempts - attempts
+            self._activate_enforcement_review(
+                sender_key,
+                "attempts_exhausted",
+                now,
+                reference=reference,
+            )
+        action_id = self.store.schedule_action(
+            sender_key,
+            reason="attempts_exhausted",
+            reference=reference,
+            execute_at=now + FAILED_DIALOG_DELETE_DELAY_SECONDS,
+            expected_revision=terminal.revision,
+            mode_independent=sender_key == self.test_sender_key,
+            now=now,
+        )
+        actions.schedule_dialog_deletion(
+            action_id, now + FAILED_DIALOG_DELETE_DELAY_SECONDS
+        )
+        self.store.audit(
+            sender_key,
+            "attempts_exhausted",
+            "dialog_deletion_scheduled",
+            now,
+        )
+        return "suppressed" if sender_key != self.test_sender_key else "quarantined"
+
+    async def _reject_incorrect_answer(
+        self,
+        sender_key: str,
+        state: SenderState,
+        actions: MessageActions,
+        now: int,
+        remaining: int,
+    ) -> str:
         noun = "attempt" if remaining == 1 else "attempts"
         incorrect_text = (
             "❌ Incorrect Answer\n\nReply to the same verification message with "

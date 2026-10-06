@@ -1083,6 +1083,71 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.sender(sender_key).status, "quarantined")
         self.assertEqual(actions.dialog_deletions, [])
 
+    async def test_exhausted_attempts_without_reference_quarantine_instead_of_deleting(
+        self,
+    ) -> None:
+        sender_key = self.set_active_challenge()
+        actions = FakeActions()
+        await self.service.handle(
+            self.message(2, "11", reply_to_message_id=100, review_reference=b""), actions
+        )
+        outcome = await self.service.handle(
+            self.message(3, "10", reply_to_message_id=100, review_reference=b""), actions
+        )
+        self.assertEqual(outcome, "quarantined")
+        self.assertEqual(self.store.sender(sender_key).status, "quarantined")
+        self.assertEqual(actions.dialog_deletions, [])
+        self.assertEqual(actions.sent[-1][0], VERIFICATION_FAILED_TEXT)
+        row = self.store._connection.execute(
+            "SELECT outcome FROM audit WHERE sender_key=? AND rule_code='attempts_exhausted'",
+            (sender_key,),
+        ).fetchone()
+        self.assertEqual(row["outcome"], "reference_unavailable")
+
+    async def test_monitor_mode_reports_but_does_not_delete_for_suppressed_sender(
+        self,
+    ) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        self.store.suppress(sender_key, "manual_spam", until=None, now=self.now)
+        actions = FakeActions()
+        outcome = await self.service.handle(self.message(2), actions)
+        self.assertEqual(outcome, "would_delete_suppressed")
+        self.assertEqual(self.store.sender(sender_key).status, "suppressed")
+        self.assertEqual((actions.sent, actions.dialog_deletions), ([], []))
+        self.assertEqual(actions.deleted_messages, [])
+
+    async def test_quarantined_and_starting_senders_are_left_unchanged(self) -> None:
+        quarantined = self.protector.sender_key(123456789)
+        self.store.quarantine(quarantined, self.now)
+        starting = self.protector.sender_key(222222222)
+        self.store.begin_challenge_issue(
+            starting, "challenge", "digest", self.now + 60, "prompt", None, self.now
+        )
+        actions = FakeActions()
+        self.assertEqual(
+            await self.service.handle(self.message(2), actions), "already_quarantined"
+        )
+        self.assertEqual(
+            await self.service.handle(self.message(3, sender_id=222222222), actions),
+            "challenge_starting",
+        )
+        self.assertEqual(self.store.sender(quarantined).status, "quarantined")
+        self.assertEqual(self.store.sender(starting).status, "challenge_issuing")
+        self.assertEqual((actions.sent, actions.quarantines), ([], 0))
+
+    async def test_trusted_history_allows_unknown_sender_without_screening(self) -> None:
+        sender_key = self.protector.sender_key(123456789)
+        actions = FakeActions()
+        outcome = await self.service.handle(self.message(2, trusted=True), actions)
+        self.assertEqual(outcome, "allowed")
+        self.assertEqual(self.store.sender(sender_key).status, "allowed")
+        self.assertEqual((actions.sent, actions.quarantines), ([], 0))
+        row = self.store._connection.execute(
+            "SELECT outcome FROM audit WHERE sender_key=? AND rule_code='TRUSTED_HISTORY'",
+            (sender_key,),
+        ).fetchone()
+        self.assertEqual(row["outcome"], "allowed")
+
     async def test_message_sent_before_deadline_can_pass_after_processing_delay(
         self,
     ) -> None:
