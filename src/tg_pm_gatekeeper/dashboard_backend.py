@@ -125,11 +125,7 @@ class InProcessDashboardBackend:
 
     async def _review_list(self, params: dict[str, object]) -> dict[str, object]:
         page = self._page_param(params)
-        total = self.store.pending_review_count()
-        self._require_page(page, total)
-        items = self.store.review_items(
-            limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE
-        )
+        total, items = self._review_page(page, now=int(time.time()))
         identities = await self._review_identities(items)
         return {
             "page": page,
@@ -252,16 +248,9 @@ class InProcessDashboardBackend:
         if not isinstance(archived, bool):
             raise DashboardBackendError("invalid_request")
         reason, older_days = self._archive_filters(params) if archived else (None, None)
-        archived_before = (
-            int(time.time()) - older_days * 86400 if older_days is not None else None
-        )
-        total = self.store.active_restriction_count(
-            archived=archived, reason=reason, archived_before=archived_before
-        )
-        self._require_page(page, total)
-        items = self.store.active_restrictions(
-            archived=archived, reason=reason, archived_before=archived_before,
-            limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE
+        total, items = self._case_page(
+            page, archived=archived, reason=reason, older_days=older_days,
+            now=int(time.time()),
         )
         identities = {} if archived else await self._case_identities(items)
         return {
@@ -417,7 +406,6 @@ class InProcessDashboardBackend:
         page = self._query_page(parsed.query)
         if page is None:
             return None
-        offset = (page - 1) * PAGE_SIZE
         now = int(time.time())
         payload: object
         if path == "/":
@@ -429,12 +417,13 @@ class InProcessDashboardBackend:
                 self.store.pending_review_count(now=now),
             )
         elif path == "/review":
-            total = self.store.pending_review_count(now=now)
-            if not self._page_exists(page, total):
+            try:
+                _, reviews = self._review_page(page, now=now)
+            except DashboardBackendError:
                 return None
             payload = [
                 (item.id, item.updated_at, item.message_count, item.classification, item.signals)
-                for item in self.store.review_items(limit=PAGE_SIZE, offset=offset, now=now)
+                for item in reviews
             ]
         elif path in {"/cases", "/cases/archive"}:
             archived = path == "/cases/archive"
@@ -448,26 +437,15 @@ class InProcessDashboardBackend:
                 reason, older_days = (
                     self._archive_filters(filter_params) if archived else (None, None)
                 )
+                _, restrictions = self._case_page(
+                    page, archived=archived, reason=reason, older_days=older_days, now=now
+                )
             except (DashboardBackendError, ValueError):
-                return None
-            archived_before = (
-                now - older_days * 86400 if older_days is not None else None
-            )
-            total = self.store.active_restriction_count(
-                archived=archived, reason=reason, archived_before=archived_before
-            )
-            if not self._page_exists(page, total):
                 return None
             payload = (
                 sorted(self.store.enforcement_statistics(archived=archived, now=now).items()),
                 self.store.enforcement_statistics(now=now)["unidentified"],
-                [
-                    self._case_version(item, now)
-                    for item in self.store.active_restrictions(
-                        archived=archived, reason=reason, archived_before=archived_before,
-                        limit=PAGE_SIZE, offset=offset, now=now
-                    )
-                ],
+                [self._case_version(item, now) for item in restrictions],
             )
         elif path.startswith("/review/"):
             try:
@@ -494,6 +472,36 @@ class InProcessDashboardBackend:
             return None
         serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(serialized.encode("ascii")).hexdigest()[:20]
+
+    def _review_page(self, page: int, *, now: int) -> tuple[int, list[ReviewItem]]:
+        """One page of pending reviews; the list response and its version both use it."""
+        total = self.store.pending_review_count(now=now)
+        self._require_page(page, total)
+        items = self.store.review_items(
+            limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE, now=now
+        )
+        return total, items
+
+    def _case_page(
+        self,
+        page: int,
+        *,
+        archived: bool,
+        reason: str | None,
+        older_days: int | None,
+        now: int,
+    ) -> tuple[int, list[ActiveRestriction]]:
+        """One page of restrictions; the list response and its version both use it."""
+        archived_before = now - older_days * 86400 if older_days is not None else None
+        total = self.store.active_restriction_count(
+            archived=archived, reason=reason, archived_before=archived_before
+        )
+        self._require_page(page, total)
+        items = self.store.active_restrictions(
+            archived=archived, reason=reason, archived_before=archived_before,
+            limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE, now=now,
+        )
+        return total, items
 
     async def _review_identities(
         self, items: list[ReviewItem]
@@ -824,8 +832,6 @@ class InProcessDashboardBackend:
 
     @staticmethod
     def _query_page(query: str) -> int | None:
-        from urllib.parse import parse_qs
-
         raw = parse_qs(query).get("page", ["1"])[0]
         if not raw.isascii() or not raw.isdecimal():
             return None
