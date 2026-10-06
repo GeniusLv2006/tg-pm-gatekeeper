@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
+
+# Broker payloads are decoded JSON; callers validate the fields they read.
+JsonObject = dict[str, Any]
 
 
 class DashboardBackend(Protocol):
     async def request(
         self, method: str, params: dict[str, object]
-    ) -> dict[str, object]: ...
+    ) -> JsonObject: ...
 
 
 class DashboardBackendError(RuntimeError):

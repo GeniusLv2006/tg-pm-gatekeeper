@@ -15,12 +15,22 @@ updates:
         patterns:
           - ruff
           - setuptools
+          - mypy*
+          - ast-serialize
+          - librt
+          - pathspec
+          - typing-extensions
       runtime:
         patterns:
           - "*"
         exclude-patterns:
           - ruff
           - setuptools
+          - mypy*
+          - ast-serialize
+          - librt
+          - pathspec
+          - typing-extensions
           # Telegram layer changes can silently alter message parsing; review alone.
           - telethon
           - Telethon

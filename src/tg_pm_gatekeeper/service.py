@@ -25,6 +25,7 @@ from .rules import (
     url_evidence,
     url_shape,
 )
+from .states import CHALLENGE_STARTING_STATUSES, SenderStatus
 from .store import SenderState, StateStore
 
 LOG = logging.getLogger("gatekeeper.service")
@@ -316,10 +317,10 @@ class GatekeeperService:
         outcome = "fail_safe"
         try:
             state = self.store.sender(sender_key)
-            if is_test_sender and state.status == "allowed":
+            if is_test_sender and state.status == SenderStatus.ALLOWED:
                 self.store.revoke(sender_key, now)
                 state = self.store.sender(sender_key)
-            if state.status == "suppressed":
+            if state.status == SenderStatus.SUPPRESSED:
                 if state.suppressed_until is not None and state.suppressed_until <= now:
                     self.store.release_expired_suppression(sender_key, now)
                     state = self.store.sender(sender_key)
@@ -333,7 +334,7 @@ class GatekeeperService:
                     return outcome
             elif (
                 is_test_sender
-                and state.status in {"provisional", "quarantined"}
+                and state.status in {SenderStatus.PROVISIONAL, SenderStatus.QUARANTINED}
                 and state.updated_at + TEST_STATE_RESET_DELAY_SECONDS <= now
             ):
                 self.store.reset_test_sender(sender_key, state.updated_at, now)
@@ -345,22 +346,22 @@ class GatekeeperService:
                 self.store.audit(sender_key, "TRUSTED_SENDER", "allowed", now)
                 outcome = "allowed"
                 return outcome
-            if state.status == "allowed":
+            if state.status == SenderStatus.ALLOWED:
                 outcome = "allowed"
                 return outcome
             if (
                 not is_test_sender
-                and state.status in {"unknown", "provisional"}
+                and state.status in {SenderStatus.UNKNOWN, SenderStatus.PROVISIONAL}
                 and message.has_trusted_history
             ):
                 self.store.allow(sender_key, now)
                 self.store.audit(sender_key, "TRUSTED_HISTORY", "allowed", now)
                 outcome = "allowed"
                 return outcome
-            if state.status == "quarantined":
+            if state.status == SenderStatus.QUARANTINED:
                 outcome = "already_quarantined"
                 return outcome
-            if state.status in {"challenge_issuing", "challenge_archiving"}:
+            if state.status in CHALLENGE_STARTING_STATUSES:
                 outcome = "challenge_starting"
                 return outcome
 
@@ -407,10 +408,10 @@ class GatekeeperService:
                 self._record_decision(sender_key, decision, outcome, now)
                 return outcome
 
-            if state.status == "provisional" and not signals:
+            if state.status == SenderStatus.PROVISIONAL and not signals:
                 outcome = "provisional"
                 return outcome
-            if state.status == "challenged":
+            if state.status == SenderStatus.CHALLENGED:
                 outcome = await self._handle_challenge(
                     sender_key, state, message, actions, now
                 )
@@ -1283,7 +1284,7 @@ class GatekeeperService:
         async with self.sender_lock(sender_key):
             now = self.clock()
             state = self.store.sender(sender_key)
-            if state.status not in {"challenge_issuing", "challenge_archiving"}:
+            if state.status not in CHALLENGE_STARTING_STATUSES:
                 return False
             if not state.challenge_expires_at or state.challenge_expires_at <= now:
                 stale_message_id = recovered_message_id or state.challenge_message_id
@@ -1292,7 +1293,7 @@ class GatekeeperService:
                 self.store.reset_incomplete_challenge(sender_key, now)
                 self.store.audit(sender_key, "CHALLENGE_RECOVERY", "expired_reset", now)
                 return False
-            if state.status == "challenge_issuing":
+            if state.status == SenderStatus.CHALLENGE_ISSUING:
                 message_id = recovered_message_id
                 if message_id is None:
                     if not state.challenge_prompt:
