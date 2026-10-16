@@ -380,7 +380,12 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ping_works_only_in_saved_messages(self) -> None:
         saved = self.event("/gatekeeper ping")
-        await self.controls.handle_message(saved)
+        with self.assertLogs("gatekeeper.telegram", level="INFO") as logs:
+            await self.controls.handle_message(saved)
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            ["operator_command_handled:ping:event"],
+        )
         self.assertIn("online", saved.respond.await_args.args[0])
         self.controls.schedule_artifact_deletion.assert_called_with(
             [8000, 9000]
@@ -590,9 +595,17 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         command.id = 12
         self.controls.client.get_messages = AsyncMock(return_value=[command])
 
-        await self.controls.sync_messages()
-        await self.controls.handle_message(command)
+        with self.assertLogs("gatekeeper.telegram", level="INFO") as logs:
+            await self.controls.sync_messages()
+            await self.controls.handle_message(command)
 
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            [
+                "operator_command_handled:ping:poll",
+                "operator_command_duplicate:event",
+            ],
+        )
         self.assertEqual(self.controls._sync_cursor, 12)
         command.respond.assert_awaited_once()
         self.controls.client.get_messages.assert_awaited_once_with(
