@@ -24,7 +24,7 @@ LOG = logging.getLogger("gatekeeper.telegram")
 OPERATOR_CASE_LIMIT = 5
 OPERATOR_CONTROL_TTL_SECONDS = 15 * 60
 OPERATOR_IDENTITY_TIMEOUT_SECONDS = 5
-OPERATOR_SYNC_INTERVAL_SECONDS = 3
+OPERATOR_SYNC_INTERVAL_SECONDS = 60
 OPERATOR_SYNC_BATCH_LIMIT = 100
 OPERATOR_CLEANUP_BATCH_LIMIT = 100
 OPERATOR_CLEANUP_RETRY_BASE_SECONDS = 30
@@ -73,7 +73,7 @@ class OperatorControls:
             if control.sender_key != sender_key
         }
 
-    async def handle_message(self, event) -> None:
+    async def handle_message(self, event, source: str = "event") -> None:
         if (
             not self.enabled
             or self.self_user_id is None
@@ -100,6 +100,7 @@ class OperatorControls:
                     isinstance(message_id, int)
                     and message_id in self._handled_message_ids
                 ):
+                    LOG.info(f"operator_command_duplicate:{source}")
                     return
                 if isinstance(message_id, int):
                     self._handled_message_ids[message_id] = (
@@ -133,7 +134,7 @@ class OperatorControls:
                         "Unknown Gatekeeper command. Send /gatekeeper help.",
                         artifact_ids,
                     )
-                LOG.info(f"operator_command_handled:{command_name}")
+                LOG.info(f"operator_command_handled:{command_name}:{source}")
         except Exception:
             LOG.error("operator_command_failed")
             try:
@@ -197,7 +198,7 @@ class OperatorControls:
                 if message_id <= self._sync_cursor:
                     continue
                 self._sync_cursor = message_id
-                await self.handle_message(message)
+                await self.handle_message(message, source="poll")
             if len(messages) < OPERATOR_SYNC_BATCH_LIMIT:
                 return
 
