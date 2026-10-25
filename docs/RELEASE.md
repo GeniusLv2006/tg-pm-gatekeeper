@@ -83,14 +83,15 @@ Install `requirements-quality.txt` as described in [CONTRIBUTING.md](../CONTRIBU
 6. For ordinary changes, enable squash auto-merge after review. Security-sensitive changes require explicit human review.
 7. Keep the squash title in the form `<conventional title> (#<PR>)`.
 8. After merge, delete the branch and fast-forward local `main`.
+9. Confirm all GitHub Actions jobs pass on the merged `main` commit before deploying it or continuing related work.
 
 Never bypass a failing check.
 
 ### Dependency updates and scheduled audits
 
-Dependabot opens weekly pull requests for pinned Python requirements, the Docker base image digest, and GitHub Actions. Base image updates are limited to patch releases and digest refreshes of the current Python minor version; moving to a new minor version is a deliberate pull request that also updates `requires-python`. Telethon updates arrive as their own pull requests because a new Telegram API layer can rename or restructure message types and silently change what the screening code sees. Version updates wait seven days after an upstream release before they are proposed; security updates are not delayed. Dependabot pull requests are security-sensitive dependency changes: review the upstream changes and the regenerated hashes, keep the files consistent where a version is pinned in more than one place, and never enable auto-merge for them.
+Dependabot opens weekly pull requests for pinned Python requirements, the Docker base image digest, and GitHub Actions. Base image updates are limited to patch releases and digest refreshes of the current Python minor version; moving to a new minor version is a deliberate pull request that also updates `requires-python`. Telethon updates arrive as their own pull requests because a new Telegram API layer can rename or restructure message types and silently change what the screening code sees. Version updates wait seven days after an upstream release before they are proposed; security updates are not delayed. Dependabot pull requests are security-sensitive dependency changes: review the upstream changes and the regenerated hashes, keep the files consistent where a version is pinned in more than one place, and never enable auto-merge for them. Because of the seven-day delay, a pull request's checks can predate an advisory published since; before merging, re-run them if `main` has moved or the latest run is more than a day old.
 
-The CI workflow also runs the `dependencies` and `image` jobs every Monday and can be started manually. The `image` job builds the Docker image and scans it with Grype, failing on high or critical vulnerabilities that have a published fix in the base image's operating-system packages or the installed Python packages. A scheduled failure means a newly published advisory affects a pinned dependency or the base image even though no code changed; treat it as a security fix and resolve it through a pull request, usually by updating the pinned version or base image digest. Do not add a Grype ignore rule unless the pull request documents why the finding does not affect Gatekeeper.
+The CI workflow also runs the `dependencies` and `image` jobs every Monday and can be started manually. The `image` job builds the Docker image and scans it with Grype, failing on high or critical vulnerabilities that have a published fix in the base image's operating-system packages or the installed Python packages. A scheduled failure, or a failure on `main` for a package the merged change did not touch, means a newly published advisory affects a pinned dependency or the base image even though no code changed; treat it as a security fix and resolve it through a pull request, usually by updating the pinned version or base image digest. Dependabot often opens that security update within minutes, so check for its pull request before opening a duplicate. Do not add a Grype ignore rule unless the pull request documents why the finding does not affect Gatekeeper.
 
 ## Deploy a merged change
 
@@ -109,7 +110,7 @@ For every live update:
 
 1. Confirm the server checkout is clean; record its commit, container health, and current mode.
 2. Create a private server-local backup for migrations or persistent-state changes.
-3. Fast-forward the server to the reviewed `main` commit.
+3. Fast-forward the server to the reviewed `main` commit once all its GitHub Actions jobs pass.
 4. Rebuild and recreate the container only when required above.
 5. Verify the deployed commit, health, restart count, mode, redacted status, logs, private-file permissions, dashboard socket, and absence of unexpected port mappings.
 6. Remove temporary tunnels after successful verification. Remove an ordinary operational backup only after its checks pass. For a schema-incompatible update, retain the private pre-migration backup until the operator explicitly closes the rollback window; successful startup checks alone do not authorize its deletion. Follow the backup and rollback rules in [deployment.md](deployment.md).
