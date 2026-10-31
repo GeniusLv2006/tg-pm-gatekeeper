@@ -30,7 +30,7 @@ from .service import (
     IncomingMessage,
     TextStyleSpan,
 )
-from .states import ActionStatus, SenderStatus
+from .states import GATEKEEPER_ARCHIVED_STATUSES, ActionStatus, SenderStatus
 from .store import DialogSnapshot, StateStore
 
 LOG = logging.getLogger("gatekeeper.telegram")
@@ -574,30 +574,26 @@ class TelegramAdapter:
             # but the fetched sender always carries what the peer needs.
             peer = input_peer_from_sender(sender) or event.input_chat
             trusted_history = False
-            if (
+            checks_history = (
                 sender_id != self.settings.test_sender_id
-                and state.status in {SenderStatus.UNKNOWN, SenderStatus.PROVISIONAL}
                 and not getattr(sender, "bot", False)
                 and not getattr(sender, "contact", False)
                 and sender_id not in SERVICE_USER_IDS
-            ):
-                try:
-                    trusted_history = await self._has_prior_outgoing(
-                        peer,
-                        event.message.id,
-                        sender_key,
-                        since=(
-                            state.updated_at if state.status == SenderStatus.PROVISIONAL else None
-                        ),
-                    )
-                except Exception:
-                    self.store.audit(
-                        sender_key,
-                        "TRUSTED_HISTORY_LOOKUP",
-                        "action_failed",
-                        int(time.time()),
-                    )
-                    LOG.warning("trusted_history_lookup_failed")
+            )
+            if checks_history and state.status in GATEKEEPER_ARCHIVED_STATUSES:
+                await self._release_if_owner_contacted(
+                    peer, event.message.id, sender_key, state.updated_at
+                )
+            elif checks_history and state.status in {
+                SenderStatus.UNKNOWN,
+                SenderStatus.PROVISIONAL,
+            }:
+                trusted_history = await self._owner_contacted(
+                    peer,
+                    event.message.id,
+                    sender_key,
+                    state.updated_at if state.status == SenderStatus.PROVISIONAL else None,
+                )
             sent_at = message_timestamp(event.message, fallback=int(time.time()))
             incoming = IncomingMessage(
                 sender_id=sender_id,
@@ -625,6 +621,31 @@ class TelegramAdapter:
             return None
         return self.service.protector.seal_review_reference(
             sender_id, access_hash, message_id
+        )
+
+    async def _owner_contacted(
+        self, peer, message_id: int, sender_key: str, since: int | None
+    ) -> bool:
+        """A failed lookup counts as no contact, so the sender is still screened."""
+        try:
+            return await self._has_prior_outgoing(
+                peer, message_id, sender_key, since=since
+            )
+        except Exception:
+            self.store.audit(
+                sender_key, "TRUSTED_HISTORY_LOOKUP", "action_failed", int(time.time())
+            )
+            LOG.warning("trusted_history_lookup_failed")
+            return False
+
+    async def _release_if_owner_contacted(
+        self, peer, message_id: int, sender_key: str, since: int
+    ) -> bool:
+        """Only messages sent after the restriction began can lift it."""
+        if not await self._owner_contacted(peer, message_id, sender_key, since):
+            return False
+        return await self._restriction_actions.release_after_owner_contact(
+            peer, sender_key
         )
 
     async def _has_prior_outgoing(
@@ -815,6 +836,17 @@ class TelegramAdapter:
                     expires_at + grace_seconds - int(time.time()),
                 )
             )
+            state = self.store.sender(sender_key)
+            if (
+                peer is not None
+                and sender_key != self.service.test_sender_key
+                and state.status == SenderStatus.CHALLENGED
+                and state.challenge_expires_at == expires_at
+                and await self._release_if_owner_contacted(
+                    peer, 0, sender_key, state.updated_at
+                )
+            ):
+                return
             actions = (
                 TelegramActions(self, peer, sender_key) if peer is not None else None
             )
