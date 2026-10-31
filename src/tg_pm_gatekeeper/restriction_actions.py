@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Callable
@@ -11,6 +12,7 @@ from typing import Callable
 from telethon import functions, types
 
 from .service import GatekeeperService
+from .states import GATEKEEPER_ARCHIVED_STATUSES
 from .store import StateStore
 
 LOG = logging.getLogger("gatekeeper.restrictions")
@@ -56,6 +58,30 @@ class RestrictionActions:
             self.store.allow(sender_key)
             self.cancel_timeout(sender_key)
             return RestrictionReleaseResult.ALLOWED
+
+    async def release_after_owner_contact(
+        self, peer: types.InputPeerUser, sender_key: str
+    ) -> bool:
+        """Lift a challenge or restriction because the owner messaged the sender."""
+        async with self.service.sender_lock(sender_key):
+            state = self.store.sender(sender_key)
+            if state.status not in GATEKEEPER_ARCHIVED_STATUSES:
+                return False
+            now = int(time.time())
+            if not await self.restore_dialog(peer, sender_key):
+                self.store.audit(sender_key, "OWNER_CONTACT", "action_failed", now)
+                return False
+            self.store.allow(sender_key, now)
+            self.store.audit(sender_key, "OWNER_CONTACT", "allowed", now)
+            self.cancel_timeout(sender_key)
+            if state.challenge_message_id is not None:
+                try:
+                    await self.telegram_client.delete_messages(
+                        peer, [state.challenge_message_id], revoke=True
+                    )
+                except Exception:
+                    LOG.warning("stale_challenge_prompt_delete_failed")
+            return True
 
     async def restore_dialog(
         self, peer: types.InputPeerUser, sender_key: str

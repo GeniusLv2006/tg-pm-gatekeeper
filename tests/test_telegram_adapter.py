@@ -20,7 +20,10 @@ from tg_pm_gatekeeper.config import ConfigurationError
 from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.message_facts import LINK_BUTTON_TYPES
 from tg_pm_gatekeeper.operator_controls import OperatorCaseControl, OperatorControls
-from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
+from tg_pm_gatekeeper.restriction_actions import (
+    RestrictionActions,
+    RestrictionReleaseResult,
+)
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
 from tg_pm_gatekeeper.states import SenderStatus
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
@@ -1144,6 +1147,114 @@ class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
             types.InputPeerUser(123, 456),
         )
         self.assertTrue(adapter.service.handle.await_args.args[0].has_trusted_history)
+
+    async def test_contact_after_restriction_releases_every_restricted_state(
+        self,
+    ) -> None:
+        for status, suppressed_until in (
+            (SenderStatus.CHALLENGED, None),
+            (SenderStatus.QUARANTINED, None),
+            (SenderStatus.SUPPRESSED, 4_000_000_000),
+            (SenderStatus.SUPPRESSED, None),
+            (SenderStatus.SUPPRESSED, 1),
+        ):
+            adapter, event = self.lookup_adapter(
+                {"status": status, "suppressed_until": suppressed_until, "updated_at": 7}
+            )
+            adapter._restriction_actions = SimpleNamespace(
+                release_after_owner_contact=AsyncMock(return_value=True)
+            )
+            await adapter._on_message(event)
+            self.assertEqual(
+                adapter._has_prior_outgoing.await_args.kwargs["since"], 7
+            )
+            adapter._restriction_actions.release_after_owner_contact.assert_awaited_once()
+            incoming = adapter.service.handle.await_args.args[0]
+            self.assertFalse(incoming.has_trusted_history)
+
+    async def test_no_contact_leaves_restriction_in_place(self) -> None:
+        adapter, event = self.lookup_adapter(
+            {"status": SenderStatus.SUPPRESSED, "suppressed_until": None, "updated_at": 7}
+        )
+        adapter._has_prior_outgoing = AsyncMock(return_value=False)
+        adapter._restriction_actions = SimpleNamespace(
+            release_after_owner_contact=AsyncMock()
+        )
+        await adapter._on_message(event)
+        adapter._restriction_actions.release_after_owner_contact.assert_not_awaited()
+
+    async def test_message_before_restriction_cannot_release(self) -> None:
+        outgoing = SimpleNamespace(
+            id=12,
+            out=True,
+            message="Earlier conversation.",
+            date=datetime.fromtimestamp(100, timezone.utc),
+        )
+        adapter, sender_key = self.history_adapter([outgoing])
+        self.assertFalse(
+            await adapter._has_prior_outgoing("peer", 13, sender_key, since=101)
+        )
+
+    async def timeout_adapter(self, *, contacted: bool):
+        adapter, _ = self.lookup_adapter(
+            {
+                "status": SenderStatus.CHALLENGED,
+                "suppressed_until": None,
+                "updated_at": 7,
+                "challenge_expires_at": 1,
+            }
+        )
+        adapter._timeout_tasks = {}
+        adapter.service.test_sender_key = None
+        adapter.service.expire_challenge = AsyncMock(return_value=True)
+        adapter._has_prior_outgoing = AsyncMock(return_value=contacted)
+        adapter._restriction_actions = SimpleNamespace(
+            release_after_owner_contact=AsyncMock(return_value=True)
+        )
+        await adapter._timeout_worker("key", 1, 0, 0, "peer")
+        return adapter
+
+    async def test_owner_contact_stops_challenge_timeout(self) -> None:
+        adapter = await self.timeout_adapter(contacted=True)
+        adapter._restriction_actions.release_after_owner_contact.assert_awaited_once()
+        adapter.service.expire_challenge.assert_not_awaited()
+
+    async def test_timeout_proceeds_without_owner_contact(self) -> None:
+        adapter = await self.timeout_adapter(contacted=False)
+        adapter.service.expire_challenge.assert_awaited_once()
+
+
+class RestrictionReleaseTests(unittest.IsolatedAsyncioTestCase):
+    def release_actions(self, *, restore: bool):
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        service = GatekeeperService(store, protector)
+        sender_key = protector.sender_key(123)
+        store.suppress(
+            sender_key,
+            "challenge_timeout",
+            until=None,
+            reference=protector.seal_review_reference(123, 456, 1),
+            now=100,
+        )
+        client = SimpleNamespace(delete_messages=AsyncMock())
+        cancel_timeout = Mock()
+        actions = RestrictionActions(
+            store, service, client, cancel_timeout=cancel_timeout
+        )
+        actions.restore_dialog = AsyncMock(return_value=restore)
+        return actions, store, sender_key, cancel_timeout
+
+    async def test_release_allows_sender(self) -> None:
+        actions, store, sender_key, cancel_timeout = self.release_actions(restore=True)
+        self.assertTrue(await actions.release_after_owner_contact("peer", sender_key))
+        self.assertEqual(store.sender(sender_key).status, SenderStatus.ALLOWED)
+        cancel_timeout.assert_called_once_with(sender_key)
+
+    async def test_failed_restore_keeps_restriction(self) -> None:
+        actions, store, sender_key, _ = self.release_actions(restore=False)
+        self.assertFalse(await actions.release_after_owner_contact("peer", sender_key))
+        self.assertEqual(store.sender(sender_key).status, SenderStatus.SUPPRESSED)
 
 
 class TelegramRunTests(unittest.IsolatedAsyncioTestCase):

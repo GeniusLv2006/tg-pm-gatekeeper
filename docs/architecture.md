@@ -55,6 +55,10 @@ allowed/provisional -> unknown (manual revoke)
 
 The issuing and archiving states are internal recovery phases. A sender becomes `challenged` only after the prompt is sent and the dialog is confirmed archived and muted. `provisional` means the sender passed the interaction check and can message normally while adaptive screening remains active. Only a later manual reply from the account owner, an explicit review, or a safe operator allow action grants `allowed`. The CLI refuses `allow` and `revoke` for challenge, quarantine, and suppression states because it cannot restore Telegram state.
 
+## Owner contact
+
+A message the owner sends to a sender counts as approval. An unknown sender is allowed when the recent private history contains a manual outgoing message. A challenged, quarantined, or suppressed sender, including a permanently suppressed one, is released only by a manual outgoing message sent after that state began, so earlier conversation cannot lift a restriction. The check runs when the sender next writes and again before a challenge timeout takes effect. Release restores the dialog, allows the sender, cancels pending deletion jobs, and removes any remaining challenge prompt. If the restore fails, the restriction stays in place. Gatekeeper's own messages never count. The dedicated test sender is excluded.
+
 ## Decision pipeline
 
 1. Accept only incoming private-message events.
