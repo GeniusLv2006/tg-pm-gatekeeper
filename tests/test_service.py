@@ -13,7 +13,6 @@ from tg_pm_gatekeeper.crypto import ActiveCaseProtector, IdentifierProtector
 from tg_pm_gatekeeper.rules import MessageFacts
 from tg_pm_gatekeeper.service import (
     DIGITS_REQUIRED_TEXT,
-    REPLY_REQUIRED_TEXT,
     TEST_VERIFICATION_FAILED_TEXT,
     TEST_VERIFICATION_TIMEOUT_TEXT,
     VERIFICATION_FAILED_SUPPRESSION_SECONDS,
@@ -515,7 +514,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("within 1 minute", prompt)
         self.assertIn("Answer: 7 + 5 = ?", prompt)
         self.assertIn("Attempts allowed: 2", prompt)
-        self.assertIn("Long-press this message, choose Reply", prompt)
+        self.assertIn("You do not need to use Reply", prompt)
         formatted_fragments = {
             prompt[span.offset : span.offset + span.length]
             for span in actions.formattings[0]
@@ -960,18 +959,41 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             self.store.outbound_statistics(now=self.now)["outbound_total_1h"], 1
         )
 
-    async def test_standalone_answer_does_not_consume_attempt_and_guides_once(
-        self,
-    ) -> None:
+    async def test_standalone_correct_answer_passes_without_reply(self) -> None:
         sender_key = self.set_active_challenge()
         actions = FakeActions()
-        for message_id in (2, 3):
+        self.assertEqual(
+            await self.service.handle(self.message(101, "12"), actions), "provisional"
+        )
+        self.assertEqual(self.store.sender(sender_key).status, "provisional")
+
+    async def test_answer_replying_to_another_message_passes(self) -> None:
+        sender_key = self.set_active_challenge()
+        actions = FakeActions()
+        self.assertEqual(
+            await self.service.handle(
+                self.message(101, "12", reply_to_message_id=50), actions
+            ),
+            "provisional",
+        )
+        self.assertEqual(self.store.sender(sender_key).status, "provisional")
+
+    async def test_standalone_wrong_answer_consumes_attempt(self) -> None:
+        sender_key = self.set_active_challenge()
+        actions = FakeActions()
+        await self.service.handle(self.message(101, "13"), actions)
+        self.assertEqual(self.store.sender(sender_key).attempts, 1)
+
+    async def test_message_sent_before_prompt_is_not_an_attempt(self) -> None:
+        sender_key = self.set_active_challenge()
+        actions = FakeActions()
+        for message_id, text in ((98, "13"), (99, "hello")):
             self.assertEqual(
-                await self.service.handle(self.message(message_id, "12"), actions),
+                await self.service.handle(self.message(message_id, text), actions),
                 "challenge_pending",
             )
         self.assertEqual(self.store.sender(sender_key).attempts, 0)
-        self.assertEqual([text for text, _ in actions.sent], [REPLY_REQUIRED_TEXT])
+        self.assertEqual(actions.sent, [])
 
     async def test_non_numeric_reply_does_not_consume_attempt(self) -> None:
         sender_key = self.set_active_challenge()
@@ -1532,17 +1554,17 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         sender_key = self.set_active_challenge()
         actions = FakeActions(send_success=False)
         self.assertEqual(
-            await self.service.handle(self.message(2, "12"), actions),
+            await self.service.handle(self.message(101, "hello"), actions),
             "challenge_pending",
         )
         self.assertFalse(self.store.sender(sender_key).guidance_sent)
         actions.send_success = True
         self.assertEqual(
-            await self.service.handle(self.message(3, "12"), actions),
+            await self.service.handle(self.message(102, "hello"), actions),
             "challenge_pending",
         )
         self.assertTrue(self.store.sender(sender_key).guidance_sent)
-        self.assertEqual([text for text, _ in actions.sent], [REPLY_REQUIRED_TEXT])
+        self.assertEqual([text for text, _ in actions.sent], [DIGITS_REQUIRED_TEXT])
 
     async def test_duplicate_message_has_no_second_action(self) -> None:
         self.store.set_mode("protect")

@@ -113,7 +113,7 @@ incoming private message
   -> score >= 70 and destructive evidence gate met? delete and permanently suppress
   -> score >= 30? archive/mute and send a strict arithmetic challenge (1 attempt)
   -> otherwise archive/mute and send the standard arithmetic challenge
-      -> correct direct Reply: restore the dialog
+      -> correct answer sent after the prompt, Reply optional: restore the dialog
       -> owner replies later: trust the sender
       -> standard timeout: warn, delete after 10 seconds, suppress for 2 hours
       -> standard attempts exhausted: warn, delete after 10 seconds, suppress for 24 hours

@@ -413,7 +413,7 @@ Once the operator explicitly closes the rollback window, confirm current health 
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `TG_CHALLENGE_TTL_SECONDS` | `60` | Time allowed for a direct reply; 30–600 seconds |
+| `TG_CHALLENGE_TTL_SECONDS` | `60` | Time allowed to answer; 30–600 seconds |
 | `TG_CHALLENGE_MAX_ATTEMPTS` | `2` | Numeric attempts; 1–5 |
 | `TG_OUTBOUND_LIMIT_PER_HOUR` | `10` | Gatekeeper messages per hour; 1–100 |
 | `TG_OUTBOUND_NOTICE_RESERVE_PER_HOUR` | `min(3, limit-1)` | Capacity unavailable to new challenges but usable by notices; 0–`limit-1` |
