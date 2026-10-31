@@ -22,6 +22,7 @@ from tg_pm_gatekeeper.message_facts import LINK_BUTTON_TYPES
 from tg_pm_gatekeeper.operator_controls import OperatorCaseControl, OperatorControls
 from tg_pm_gatekeeper.restriction_actions import RestrictionReleaseResult
 from tg_pm_gatekeeper.service import GatekeeperService, TextStyleSpan
+from tg_pm_gatekeeper.states import SenderStatus
 from tg_pm_gatekeeper.store import DialogSnapshot, StateStore
 from tg_pm_gatekeeper.telegram_adapter import (
     BoundedStringSession,
@@ -632,8 +633,12 @@ class FakeHistoryClient:
         self.messages = messages
 
     async def iter_messages(self, *args, **kwargs):
-        for message in self.messages:
-            yield message
+        # Mirrors Telethon: in private chats from_user is applied locally against
+        # sender_id, which is None for an outgoing message without from_id.
+        from_user = kwargs.get("from_user")
+        for message in self.messages[: kwargs.get("limit")]:
+            if from_user is None or getattr(message, "sender_id", None) == 1000:
+                yield message
 
 
 class PartialArchiveClient:
@@ -998,11 +1003,8 @@ class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
         adapter.store = store
         adapter.service = service
         adapter.client = FakeHistoryClient([outgoing])
-        event = SimpleNamespace(
-            input_chat="peer", message=SimpleNamespace(id=11)
-        )
         trusted = await adapter._has_prior_outgoing(
-            event, sender_key, since=100
+            "peer", 11, sender_key, since=100
         )
         self.assertFalse(trusted)
 
@@ -1021,13 +1023,127 @@ class TelegramHistoryTests(unittest.IsolatedAsyncioTestCase):
         adapter.store = store
         adapter.service = service
         adapter.client = FakeHistoryClient([outgoing])
-        event = SimpleNamespace(
-            input_chat="peer", message=SimpleNamespace(id=13)
-        )
         trusted = await adapter._has_prior_outgoing(
-            event, sender_key, since=100
+            "peer", 13, sender_key, since=100
         )
         self.assertTrue(trusted)
+
+    def history_adapter(self, messages):
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.store = store
+        adapter.service = GatekeeperService(store, protector)
+        adapter.client = FakeHistoryClient(messages)
+        return adapter, protector.sender_key(123)
+
+    async def test_owner_initiated_chat_without_sender_id_is_trusted(self) -> None:
+        outgoing = SimpleNamespace(
+            id=12,
+            out=True,
+            sender_id=None,
+            message="Hi, this is the owner.",
+            date=datetime.fromtimestamp(100, timezone.utc),
+        )
+        reply = SimpleNamespace(
+            id=13,
+            out=False,
+            sender_id=123,
+            message="Hello",
+            date=datetime.fromtimestamp(101, timezone.utc),
+        )
+        adapter, sender_key = self.history_adapter([reply, outgoing])
+        self.assertTrue(
+            await adapter._has_prior_outgoing("peer", reply.id, sender_key)
+        )
+
+    async def test_owner_message_behind_many_replies_is_trusted(self) -> None:
+        replies = [
+            SimpleNamespace(
+                id=200 - index,
+                out=False,
+                sender_id=123,
+                message="Hello",
+                date=datetime.fromtimestamp(101, timezone.utc),
+            )
+            for index in range(50)
+        ]
+        outgoing = SimpleNamespace(
+            id=12,
+            out=True,
+            sender_id=None,
+            message="Hi, this is the owner.",
+            date=datetime.fromtimestamp(100, timezone.utc),
+        )
+        adapter, sender_key = self.history_adapter([*replies, outgoing])
+        self.assertTrue(
+            await adapter._has_prior_outgoing("peer", replies[0].id, sender_key)
+        )
+
+    async def test_incoming_only_history_is_not_trusted(self) -> None:
+        earlier = SimpleNamespace(
+            id=12,
+            out=False,
+            sender_id=123,
+            message="Buy now",
+            date=datetime.fromtimestamp(100, timezone.utc),
+        )
+        latest = SimpleNamespace(
+            id=13,
+            out=False,
+            sender_id=123,
+            message="Buy now",
+            date=datetime.fromtimestamp(101, timezone.utc),
+        )
+        adapter, sender_key = self.history_adapter([latest, earlier])
+        self.assertFalse(
+            await adapter._has_prior_outgoing("peer", latest.id, sender_key)
+        )
+
+    async def test_missing_peer_never_searches_all_chats(self) -> None:
+        adapter, sender_key = self.history_adapter([])
+        adapter.client = SimpleNamespace(iter_messages=Mock())
+        with self.assertRaises(ValueError):
+            await adapter._has_prior_outgoing(None, 13, sender_key)
+        adapter.client.iter_messages.assert_not_called()
+
+    def lookup_adapter(self, sender_state: dict | None = None):
+        store = temporary_store(self)
+        protector = IdentifierProtector(b"k" * 32)
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.store = SimpleNamespace(
+            sender=Mock(return_value=SimpleNamespace(**sender_state)),
+            audit=store.audit,
+        )
+        adapter.service = SimpleNamespace(
+            protector=protector, handle=AsyncMock(return_value="allowed")
+        )
+        adapter.settings = SimpleNamespace(test_sender_id=None)
+        adapter._has_prior_outgoing = AsyncMock(return_value=True)
+        sender = SimpleNamespace(id=123, access_hash=456, bot=False, contact=False)
+        event = SimpleNamespace(
+            is_private=True,
+            message=types.Message(
+                id=1,
+                peer_id=types.PeerUser(123),
+                date=datetime.fromtimestamp(100, timezone.utc),
+                message="hello",
+            ),
+            input_chat=None,
+            get_sender=AsyncMock(return_value=sender),
+        )
+        return adapter, event
+
+    async def test_lookup_uses_sender_peer_when_input_chat_is_uncached(self) -> None:
+        adapter, event = self.lookup_adapter(
+            {"status": SenderStatus.UNKNOWN, "suppressed_until": None, "updated_at": 1}
+        )
+        await adapter._on_message(event)
+        self.assertEqual(
+            adapter._has_prior_outgoing.await_args.args[0],
+            types.InputPeerUser(123, 456),
+        )
+        self.assertTrue(adapter.service.handle.await_args.args[0].has_trusted_history)
 
 
 class TelegramRunTests(unittest.IsolatedAsyncioTestCase):

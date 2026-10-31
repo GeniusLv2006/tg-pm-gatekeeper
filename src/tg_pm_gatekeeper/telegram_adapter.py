@@ -40,6 +40,7 @@ RUNTIME_METRICS_INTERVAL_SECONDS = 15 * 60
 SERVICE_USER_IDS = {777000, 42777}
 HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
 PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
+HISTORY_LOOKUP_LIMIT = 100
 GATEKEEPER_MESSAGE_PREFIXES = (
     "To filter spam,",
     "⚠️ Verification Required",
@@ -569,6 +570,9 @@ class TelegramAdapter:
                 return
             sender_key = self.service.protector.sender_key(sender_id)
             state = self.store.sender(sender_key)
+            # event.input_chat is None when the peer is not in the entity cache,
+            # but the fetched sender always carries what the peer needs.
+            peer = input_peer_from_sender(sender) or event.input_chat
             trusted_history = False
             if (
                 sender_id != self.settings.test_sender_id
@@ -579,7 +583,8 @@ class TelegramAdapter:
             ):
                 try:
                     trusted_history = await self._has_prior_outgoing(
-                        event,
+                        peer,
+                        event.message.id,
                         sender_key,
                         since=(
                             state.updated_at if state.status == SenderStatus.PROVISIONAL else None
@@ -607,9 +612,6 @@ class TelegramAdapter:
                 has_trusted_history=trusted_history,
                 review_reference=self._review_reference(sender, event.message.id),
             )
-            peer = input_peer_from_sender(sender)
-            if peer is None:
-                peer = event.input_chat
             actions = TelegramActions(self, peer, sender_key)
             outcome = await self.service.handle(incoming, actions)
             LOG.info(f"message_handled:{outcome}")
@@ -626,10 +628,15 @@ class TelegramAdapter:
         )
 
     async def _has_prior_outgoing(
-        self, event, sender_key: str, *, since: int | None = None
+        self, peer, message_id: int, sender_key: str, *, since: int | None = None
     ) -> bool:
+        if peer is None:
+            # iter_messages(None) searches every chat, not this conversation.
+            raise ValueError("private chat peer is unavailable")
+        # Check message.out rather than passing from_user: Telethon applies that
+        # filter locally in private chats and drops outgoing messages with no from_id.
         async for message in self.client.iter_messages(
-            event.input_chat, limit=20, from_user="me"
+            peer, limit=HISTORY_LOOKUP_LIMIT
         ):
             if (
                 since is not None
@@ -640,7 +647,7 @@ class TelegramAdapter:
             text = message.message or ""
             generated_by_gatekeeper = text.startswith(GATEKEEPER_MESSAGE_PREFIXES)
             if (
-                message.id != event.message.id
+                message.id != message_id
                 and message.out
                 and not self.store.is_automated_message(sender_key, message.id)
                 and not generated_by_gatekeeper
