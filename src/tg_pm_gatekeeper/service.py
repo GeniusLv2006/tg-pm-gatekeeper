@@ -31,12 +31,9 @@ from .store import SenderState, StateStore
 LOG = logging.getLogger("gatekeeper.service")
 DIGITS_RE = re.compile(r"^[0-9]+$")
 CHALLENGE_PROCESSING_GRACE_SECONDS = 30
+CHALLENGE_DEADLINE_PREFIX = "Send the answer in this chat within "
 RESTORE_RETRY_DELAYS_SECONDS = (0.0, 0.1, 0.5)
-REPLY_REQUIRED_TEXT = (
-    "↩️ Reply Required\n\nLong-press the verification message, choose Reply, and "
-    "send only the answer. No attempt was used."
-)
-DIGITS_REQUIRED_TEXT = "🔢 Digits Only\n\nReply with digits only. No attempt was used."
+DIGITS_REQUIRED_TEXT = "🔢 Digits Only\n\nSend digits only. No attempt was used."
 VERIFICATION_PASSED_TEXT = (
     "✅ Verification Passed\n\nThis conversation has been restored."
 )
@@ -175,10 +172,10 @@ def challenge_prompt(
     attempts = str(max_attempts)
     return (
         "⚠️ Verification Required\n\n"
-        f"Reply to this message within {duration}.\n\n"
+        f"{CHALLENGE_DEADLINE_PREFIX}{duration}.\n\n"
         f"Answer: {challenge.expression}\n"
         f"Attempts allowed: {attempts}\n\n"
-        "Long-press this message, choose Reply, and send digits only."
+        "Send digits only. You do not need to use Reply."
     )
 
 
@@ -186,12 +183,12 @@ def challenge_prompt_formatting(prompt: str) -> tuple[TextStyleSpan, ...]:
     lines = prompt.splitlines()
     if (
         len(lines) < 6
-        or not lines[2].startswith("Reply to this message within ")
+        or not lines[2].startswith(CHALLENGE_DEADLINE_PREFIX)
         or not lines[4].startswith("Answer: ")
         or not lines[5].startswith("Attempts allowed: ")
     ):
         return ()
-    duration = lines[2].removeprefix("Reply to this message within ").removesuffix(".")
+    duration = lines[2].removeprefix(CHALLENGE_DEADLINE_PREFIX).removesuffix(".")
     expression = lines[4].removeprefix("Answer: ")
     attempts = lines[5].removeprefix("Attempts allowed: ")
     return emphasized(
@@ -879,11 +876,14 @@ class GatekeeperService:
         expires_at = state.challenge_expires_at
         if not expires_at or message.sent_at > expires_at:
             return await self._expire_late_reply(sender_key, state, message, actions, now)
-        if message.reply_to_message_id != state.challenge_message_id:
-            return await self._ignore_with_guidance(
-                sender_key, state, actions, now,
-                REPLY_REQUIRED_TEXT, "CHALLENGE_WRONG_REPLY_TARGET",
-            )
+        if (
+            state.challenge_message_id is not None
+            and message.message_id < state.challenge_message_id
+            and message.reply_to_message_id != state.challenge_message_id
+        ):
+            # Sent before the prompt existed, so it cannot be an answer to it.
+            self.store.audit(sender_key, "CHALLENGE_BEFORE_PROMPT", "ignored", now)
+            return "challenge_pending"
         answer = canonical_answer(message.text)
         if answer is None:
             return await self._ignore_with_guidance(
@@ -1126,8 +1126,7 @@ class GatekeeperService:
     ) -> str:
         noun = "attempt" if remaining == 1 else "attempts"
         incorrect_text = (
-            "❌ Incorrect Answer\n\nReply to the same verification message with "
-            f"digits only. {remaining} {noun} remaining."
+            f"❌ Incorrect Answer\n\nSend digits only. {remaining} {noun} remaining."
         )
         await self._send_notice(
             sender_key,
