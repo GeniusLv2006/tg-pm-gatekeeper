@@ -341,7 +341,6 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
             enabled=True,
         )
         self.controls.self_user_id = 1000
-        self.controls._sync_cursor = 0
         self.controls.schedule_artifact_deletion = Mock()
         self.adapter = TelegramAdapter.__new__(TelegramAdapter)
         self.adapter.store = self.store
@@ -390,7 +389,7 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
             await self.controls.handle_message(saved)
         self.assertEqual(
             [record.getMessage() for record in logs.records],
-            ["operator_command_handled:ping:event"],
+            ["operator_command_handled:ping"],
         )
         self.assertIn("online", saved.respond.await_args.args[0])
         self.controls.schedule_artifact_deletion.assert_called_with(
@@ -596,41 +595,22 @@ class OperatorCommandTests(unittest.IsolatedAsyncioTestCase):
         self.controls.restriction_actions.allow.assert_not_awaited()
         self.assertIn("current case", event.respond.await_args.args[0])
 
-    async def test_sync_processes_cross_client_command_once(self) -> None:
+    async def test_redelivered_command_is_processed_once(self) -> None:
         command = self.event("/gatekeeper ping")
         command.id = 12
-        self.controls.client.get_messages = AsyncMock(return_value=[command])
 
         with self.assertLogs("gatekeeper.telegram", level="INFO") as logs:
-            await self.controls.sync_messages()
+            await self.controls.handle_message(command)
             await self.controls.handle_message(command)
 
         self.assertEqual(
             [record.getMessage() for record in logs.records],
             [
-                "operator_command_handled:ping:poll",
-                "operator_command_duplicate:event",
+                "operator_command_handled:ping",
+                "operator_command_duplicate",
             ],
         )
-        self.assertEqual(self.controls._sync_cursor, 12)
         command.respond.assert_awaited_once()
-        self.controls.client.get_messages.assert_awaited_once_with(
-            "me",
-            limit=100,
-            min_id=0,
-            reverse=True,
-            search="/gatekeeper",
-        )
-
-    async def test_sync_initialization_does_not_replay_existing_commands(self) -> None:
-        existing = self.event("/gatekeeper ping")
-        existing.id = 20
-        self.controls.client.get_messages = AsyncMock(return_value=[existing])
-
-        await self.controls.initialize_sync_cursor()
-
-        self.assertEqual(self.controls._sync_cursor, 20)
-        existing.respond.assert_not_awaited()
 
 
 class FakeHistoryClient:
