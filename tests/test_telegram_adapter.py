@@ -31,6 +31,8 @@ from tg_pm_gatekeeper.telegram_adapter import (
     BoundedStringSession,
     TelegramActions,
     TelegramAdapter,
+    UpdateLoopStalledError,
+    UpdateStallDetector,
     facts_from_message,
     formatting_entities_from_spans,
     input_peer_from_sender,
@@ -1331,6 +1333,97 @@ class TelegramRunTests(unittest.IsolatedAsyncioTestCase):
         await enabled.run()
         self.assertEqual(enabled.client.add_event_handler.call_count, 2)
         enabled.operator_controls.reconcile_artifacts.assert_awaited_once()
+
+
+class UpdateStallDetectorTests(unittest.TestCase):
+    def test_empty_queue_never_reports_stall(self) -> None:
+        detector = UpdateStallDetector(300)
+        for now in (0.0, 400.0, 10_000.0):
+            self.assertIsNone(detector.observe(0, now))
+
+    def test_persistent_backlog_reports_after_threshold(self) -> None:
+        detector = UpdateStallDetector(300)
+        self.assertIsNone(detector.observe(3, 1000.0))
+        self.assertIsNone(detector.observe(7, 1299.0))
+        self.assertEqual(detector.observe(9, 1300.0), 300.0)
+
+    def test_drained_queue_resets_backlog_window(self) -> None:
+        detector = UpdateStallDetector(300)
+        self.assertIsNone(detector.observe(2, 0.0))
+        self.assertIsNone(detector.observe(0, 200.0))
+        self.assertIsNone(detector.observe(1, 250.0))
+        self.assertIsNone(detector.observe(1, 500.0))
+        self.assertEqual(detector.observe(1, 550.0), 300.0)
+
+    def test_unknown_queue_size_never_reports_stall(self) -> None:
+        detector = UpdateStallDetector(300)
+        self.assertIsNone(detector.observe(-1, 0.0))
+        self.assertIsNone(detector.observe(-1, 1000.0))
+
+
+class UpdateLoopWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    def make_adapter(self, client: object) -> TelegramAdapter:
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter.client = client
+        adapter._update_stall_detector = UpdateStallDetector(300)
+        return adapter
+
+    async def test_stalled_update_queue_terminates_heartbeat(self) -> None:
+        queue: asyncio.Queue[object] = asyncio.Queue()
+        queue.put_nowait(object())
+        adapter = self.make_adapter(SimpleNamespace(_updates_queue=queue))
+
+        adapter._check_update_loop(0.0)
+        with self.assertLogs("gatekeeper.telegram", "CRITICAL") as logs:
+            with self.assertRaises(UpdateLoopStalledError):
+                adapter._check_update_loop(300.0)
+
+        self.assertEqual(
+            logs.records[0].getMessage(),
+            "update_loop_stalled:queued_updates=1:stalled_seconds=300",
+        )
+
+    async def test_drained_update_queue_keeps_running(self) -> None:
+        queue: asyncio.Queue[object] = asyncio.Queue()
+        adapter = self.make_adapter(SimpleNamespace(_updates_queue=queue))
+
+        for now in (0.0, 300.0, 600.0):
+            adapter._check_update_loop(now)
+        self.assertEqual(adapter._queued_update_count(), 0)
+
+    async def test_telethon_client_exposes_update_queue(self) -> None:
+        # The watchdog relies on this private attribute; fail loudly if a
+        # Telethon upgrade removes it instead of silently disabling detection.
+        from telethon import TelegramClient
+
+        client = TelegramClient(StringSession(), 1, "0" * 32)
+        adapter = self.make_adapter(client)
+
+        self.assertIsInstance(client._updates_queue, asyncio.Queue)
+        self.assertEqual(adapter._queued_update_count(), 0)
+
+    async def test_missing_update_queue_is_ignored(self) -> None:
+        adapter = self.make_adapter(SimpleNamespace())
+
+        for now in (0.0, 300.0, 600.0):
+            adapter._check_update_loop(now)
+        self.assertEqual(adapter._queued_update_count(), -1)
+
+    async def test_stall_during_heartbeat_fails_before_heartbeat_write(self) -> None:
+        queue: asyncio.Queue[object] = asyncio.Queue()
+        queue.put_nowait(object())
+        adapter = self.make_adapter(SimpleNamespace(_updates_queue=queue))
+        adapter.store = Mock()
+        adapter._check_update_loop(0.0)
+
+        with (
+            patch("tg_pm_gatekeeper.telegram_adapter.time.monotonic", return_value=301.0),
+            self.assertLogs("gatekeeper.telegram", "CRITICAL"),
+            self.assertRaises(UpdateLoopStalledError),
+        ):
+            await adapter._heartbeat_loop()
+
+        adapter.store.heartbeat.assert_not_called()
 
 
 if __name__ == "__main__":
