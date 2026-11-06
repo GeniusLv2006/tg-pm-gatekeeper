@@ -1,4 +1,4 @@
-FROM python:3.14.10-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527 AS builder
+FROM python:3.14.10-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -8,7 +8,7 @@ COPY requirements-build.txt requirements.txt ./
 RUN python -m pip install --require-hashes --no-deps -r requirements-build.txt && \
     python -m pip install --require-hashes --no-deps --no-build-isolation --target /install -r requirements.txt
 
-FROM python:3.14.10-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527
+FROM python:3.14.10-slim-bookworm@sha256:3fe1a0b6c2d6b2ebb572906cdabeca75aeb558c0c17db5ffefbcf8094871c32b
 
 ENV MALLOC_ARENA_MAX=2 \
     PYTHONDONTWRITEBYTECODE=1 \
