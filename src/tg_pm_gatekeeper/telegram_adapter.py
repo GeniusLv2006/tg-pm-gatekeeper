@@ -37,6 +37,10 @@ LOG = logging.getLogger("gatekeeper.telegram")
 SESSION_ENTITY_CACHE_LIMIT = 256
 TELETHON_ENTITY_CACHE_LIMIT = 128
 RUNTIME_METRICS_INTERVAL_SECONDS = 15 * 60
+# Telethon awaits update-loop requests without a timeout and resends them only on
+# reconnect, so a lost reply can block update processing on a live connection
+# while received updates accumulate in its unbounded queue.
+UPDATE_LOOP_STALL_SECONDS = 5 * 60
 SERVICE_USER_IDS = {777000, 42777}
 HEARTBEAT_PATH = Path("/tmp/gatekeeper-heartbeat")  # noqa: S108 - private tmpfs
 PRUNE_INTERVAL_SECONDS = 12 * 60 * 60
@@ -65,6 +69,36 @@ GATEKEEPER_MESSAGE_PREFIXES = (
 
 class TelegramAuthorizationError(RuntimeError):
     """Raised when the configured Telegram session cannot operate the client."""
+
+
+class UpdateLoopStalledError(RuntimeError):
+    """Raised when received Telegram updates stop being consumed."""
+
+
+class UpdateStallDetector:
+    """Detect a Telethon update queue that stays non-empty for too long.
+
+    A healthy update loop drains the queue within milliseconds, so periodic
+    samples almost always observe it empty. Any backlog that persists across
+    every sample for the threshold means the consumer is blocked.
+    """
+
+    def __init__(self, threshold_seconds: float) -> None:
+        self._threshold_seconds = threshold_seconds
+        self._backlog_since: float | None = None
+
+    def observe(self, queued_updates: int, now: float) -> float | None:
+        """Return the stalled duration once it reaches the threshold."""
+        if queued_updates <= 0:
+            self._backlog_since = None
+            return None
+        if self._backlog_since is None:
+            self._backlog_since = now
+            return None
+        stalled_seconds = now - self._backlog_since
+        if stalled_seconds >= self._threshold_seconds:
+            return stalled_seconds
+        return None
 
 
 def formatting_entities_from_spans(
@@ -410,6 +444,7 @@ class TelegramAdapter:
         self._heartbeat_task: asyncio.Task | None = None
         self._self_user_id: int | None = None
         self._next_metrics_at = 0.0
+        self._update_stall_detector = UpdateStallDetector(UPDATE_LOOP_STALL_SECONDS)
         self._restriction_actions = RestrictionActions(
             store,
             service,
@@ -494,9 +529,32 @@ class TelegramAdapter:
             await self._dashboard_rpc.stop()
             await self.client.disconnect()
 
+    def _queued_update_count(self) -> int:
+        queue = getattr(self.client, "_updates_queue", None)
+        qsize = getattr(queue, "qsize", None)
+        if not callable(qsize):
+            return -1
+        try:
+            return int(qsize())
+        except (TypeError, ValueError):
+            return -1
+
+    def _check_update_loop(self, now: float) -> None:
+        queued_updates = self._queued_update_count()
+        stalled_seconds = self._update_stall_detector.observe(queued_updates, now)
+        if stalled_seconds is None:
+            return
+        LOG.critical(
+            "update_loop_stalled:queued_updates=%d:stalled_seconds=%d",
+            queued_updates,
+            int(stalled_seconds),
+        )
+        raise UpdateLoopStalledError("telegram update loop stalled")
+
     async def _heartbeat_loop(self) -> None:
         next_prune = 0
         while True:
+            self._check_update_loop(time.monotonic())
             now = int(time.time())
             self.store.heartbeat(now)
             write_runtime_heartbeat(HEARTBEAT_PATH, now)
@@ -551,11 +609,13 @@ class TelegramAdapter:
         telethon_count = len(telethon_cache) if telethon_cache is not None else -1
         LOG.info(
             "runtime_metrics:rss_kib=%d:session_entities=%d:session_evictions=%d:"
-            "telethon_entities=%d:timeout_tasks=%d:maintenance_tasks=%d",
+            "telethon_entities=%d:updates_queue=%d:timeout_tasks=%d:"
+            "maintenance_tasks=%d",
             rss_kib,
             self.session.entity_count,
             self.session.entity_evictions,
             telethon_count,
+            self._queued_update_count(),
             len(self._timeout_tasks),
             len(self._maintenance_tasks),
         )

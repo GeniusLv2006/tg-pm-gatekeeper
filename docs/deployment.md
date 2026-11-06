@@ -119,7 +119,7 @@ Continue when:
 - `heartbeat` is a recent Unix timestamp and is not more than five seconds in the future; and
 - `action_failures` is `0`.
 
-For memory regression checks, inspect the redacted `runtime_metrics` events in the container log. They report only current RSS, bounded Session entity count and evictions, Telethon update-cache count, and task counts. The Session cache is capped at 256 user entities and the Telethon update cache at 128; neither limit contains identity names or message content.
+For memory regression checks, inspect the redacted `runtime_metrics` events in the container log. They report only current RSS, bounded Session entity count and evictions, Telethon update-cache count, the number of received Telegram updates waiting to be processed, and task counts. `updates_queue` should normally be `0`; a value that stays above zero means update processing is blocked. The Session cache is capped at 256 user entities and the Telethon update cache at 128; neither limit contains identity names or message content.
 
 If the container is not healthy, run:
 
@@ -452,6 +452,7 @@ This account runs the real arithmetic and cleanup flow even in `monitor`, bypass
 | `startup_private_file_failed` | Confirm the six private files exist, are regular files, and have the documented ownership and permissions; the API hash file must contain exactly one 32-character hexadecimal value. |
 | `startup_database_migration_failed` | Keep the database and any pre-migration backup intact; verify the current schema and follow the schema-update procedure. |
 | `startup_telegram_session_failed` | Confirm the Telegram session is still authorized from an official client and reprovision it if revoked. |
+| `update_loop_stalled` | Received Telegram updates waited unprocessed for five minutes, usually because a Telegram request never returned on a still-open connection. The process exits on purpose and the restart policy reconnects it; updates that arrived during the stall are not replayed, so review private messages from that window in Telegram. Repeated events point to a Telegram-side or Telethon issue. |
 | `startup_runtime_failed` | Inspect the immediately preceding privacy-safe events and container state; a supervised heartbeat or pruning failure intentionally exits for restart. |
 | Dashboard token or socket is missing | Run the tunnel helper, then inspect the `dashboard` service logs and `/run/tg-pm-gatekeeper/dashboard.sock`. |
 | Local port `8765` is already in use | Run the tunnel with another port, for example `scripts/dashboard-tunnel.sh -p 18765 "$DEPLOY_HOST"`. |
