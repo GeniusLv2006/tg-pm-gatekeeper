@@ -481,7 +481,6 @@ class TelegramAdapter:
         self._self_user_id = int(me.id)
         self.operator_controls.self_user_id = self._self_user_id
         if self.settings.telegram_operator_controls_enabled:
-            await self.operator_controls.initialize_sync_cursor()
             await self.operator_controls.reconcile_artifacts()
         await self._recover_challenges()
         await self._recover_test_sender_cleanup()
@@ -494,7 +493,6 @@ class TelegramAdapter:
             self.client.add_event_handler(
                 self.operator_controls.handle_message, events.NewMessage(outgoing=True)
             )
-            self._track_maintenance_task(self.operator_controls.sync_loop())
             self._track_maintenance_task(self.operator_controls.artifact_cleanup_loop())
         disconnect_task: asyncio.Task | None = None
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())

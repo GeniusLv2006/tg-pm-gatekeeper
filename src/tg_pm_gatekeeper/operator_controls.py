@@ -24,8 +24,6 @@ LOG = logging.getLogger("gatekeeper.telegram")
 OPERATOR_CASE_LIMIT = 5
 OPERATOR_CONTROL_TTL_SECONDS = 15 * 60
 OPERATOR_IDENTITY_TIMEOUT_SECONDS = 5
-OPERATOR_SYNC_INTERVAL_SECONDS = 60
-OPERATOR_SYNC_BATCH_LIMIT = 100
 OPERATOR_CLEANUP_BATCH_LIMIT = 100
 OPERATOR_CLEANUP_RETRY_BASE_SECONDS = 30
 OPERATOR_CLEANUP_RETRY_MAX_SECONDS = 60 * 60
@@ -61,7 +59,6 @@ class OperatorControls:
         self.self_user_id: int | None = None
         self._case_controls: dict[int, OperatorCaseControl] = {}
         self._command_lock = asyncio.Lock()
-        self._sync_cursor: int | None = None
         self._handled_message_ids: dict[int, float] = {}
         self._cleanup_wakeup = asyncio.Event()
 
@@ -73,7 +70,7 @@ class OperatorControls:
             if control.sender_key != sender_key
         }
 
-    async def handle_message(self, event, source: str = "event") -> None:
+    async def handle_message(self, event) -> None:
         if (
             not self.enabled
             or self.self_user_id is None
@@ -100,7 +97,7 @@ class OperatorControls:
                     isinstance(message_id, int)
                     and message_id in self._handled_message_ids
                 ):
-                    LOG.info(f"operator_command_duplicate:{source}")
+                    LOG.info("operator_command_duplicate")
                     return
                 if isinstance(message_id, int):
                     self._handled_message_ids[message_id] = (
@@ -134,7 +131,7 @@ class OperatorControls:
                         "Unknown Gatekeeper command. Send /gatekeeper help.",
                         artifact_ids,
                     )
-                LOG.info(f"operator_command_handled:{command_name}:{source}")
+                LOG.info(f"operator_command_handled:{command_name}")
         except Exception:
             LOG.error("operator_command_failed")
             try:
@@ -156,51 +153,6 @@ class OperatorControls:
         if isinstance(message_id, int):
             artifact_ids.append(message_id)
         return message
-
-    async def initialize_sync_cursor(self) -> None:
-        try:
-            messages = await self.client.get_messages("me", limit=1)
-        except Exception:
-            self._sync_cursor = None
-            LOG.warning("operator_sync_initialization_failed")
-            return
-        self._sync_cursor = max(
-            (int(message.id) for message in messages),
-            default=0,
-        )
-
-    async def sync_loop(self) -> None:
-        while True:
-            await asyncio.sleep(OPERATOR_SYNC_INTERVAL_SECONDS)
-            try:
-                await self.sync_messages()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOG.warning("operator_sync_failed")
-
-    async def sync_messages(self) -> None:
-        if self._sync_cursor is None:
-            await self.initialize_sync_cursor()
-            return
-        while True:
-            messages = await self.client.get_messages(
-                "me",
-                limit=OPERATOR_SYNC_BATCH_LIMIT,
-                min_id=self._sync_cursor,
-                reverse=True,
-                search="/gatekeeper",
-            )
-            if not messages:
-                return
-            for message in messages:
-                message_id = int(message.id)
-                if message_id <= self._sync_cursor:
-                    continue
-                self._sync_cursor = message_id
-                await self.handle_message(message, source="poll")
-            if len(messages) < OPERATOR_SYNC_BATCH_LIMIT:
-                return
 
     async def reconcile_artifacts(self) -> None:
         now = int(time.time())
