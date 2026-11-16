@@ -11,12 +11,21 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from tg_pm_gatekeeper.crypto import IdentifierProtector
 from tg_pm_gatekeeper.store import (
     CAMPAIGN_WINDOW_SECONDS,
     SENDER_LINKED_TABLES,
     DialogSnapshot,
     StateStore,
     StoreMigrationError,
+)
+
+from .legacy_references import (
+    LEGACY_KEY,
+    LEGACY_RESTRICTION_REFERENCE,
+    LEGACY_RESTRICTION_VALUES,
+    LEGACY_REVIEW_REFERENCE,
+    LEGACY_REVIEW_VALUES,
 )
 
 
@@ -802,7 +811,7 @@ class StoreMigrationTests(unittest.TestCase):
             ).fetchone()
             self.assertIsNotNone(table)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 9
             )
             self.assertEqual(reopened.due_operator_artifacts(100), [])
         finally:
@@ -827,7 +836,7 @@ class StoreMigrationTests(unittest.TestCase):
             self.assertIn("archived_at", columns)
             self.assertIsNone(reopened.active_restriction("sender").archived_at)
             self.assertEqual(
-                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 8
+                reopened._connection.execute("PRAGMA user_version").fetchone()[0], 9
             )
         finally:
             reopened.close()
@@ -855,7 +864,7 @@ class StoreMigrationTests(unittest.TestCase):
             connection.close()
 
     def test_unsupported_schema_is_refused_without_mutation(self) -> None:
-        for version in (5, 9):
+        for version in (5, 10):
             with self.subTest(version=version):
                 self.path.unlink(missing_ok=True)
                 store = StateStore(self.path)
@@ -878,6 +887,217 @@ class StoreMigrationTests(unittest.TestCase):
                     )
                 finally:
                     connection.close()
+
+
+class ReferenceMigrationTests(unittest.TestCase):
+    """Schema version 9 re-seals every version 1 reference as AES-GCM."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "legacy.sqlite3"
+        self.protector = IdentifierProtector(LEGACY_KEY)
+        tampered = bytearray(LEGACY_REVIEW_REFERENCE)
+        tampered[20] ^= 1
+        self.tampered = bytes(tampered)
+        self.current = self.protector.seal_review_reference(7, 8, 9)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _write_v8_database(self) -> None:
+        store = StateStore(self.path)
+        legacy_review = LEGACY_REVIEW_REFERENCE
+        connection = store._connection
+        connection.executemany(
+            "INSERT INTO sender_state(sender_key,status,updated_at,"
+            "challenge_action_reference,restriction_reference) "
+            "VALUES (?,'suppressed',1,?,?)",
+            (
+                ("restricted", legacy_review, LEGACY_RESTRICTION_REFERENCE),
+                ("damaged", None, self.tampered),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO review_queue(sender_key,reference,classification,signals,"
+            "features,created_at,updated_at,expires_at) "
+            "VALUES (?,?,'c','[]','{}',1,1,9)",
+            (
+                ("restricted", legacy_review),
+                ("current", self.current),
+                ("cleared", None),
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO pending_actions(sender_key,action,reason,reference,"
+            "execute_at,expected_revision,created_at) "
+            "VALUES (?,'delete_dialog','r',?,1,1,1)",
+            (
+                ("restricted", legacy_review),
+                ("damaged", self.tampered),
+                ("finished", b""),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO enforcement_reviews(sender_key,reference,envelope,reason,"
+            "created_at,updated_at,expires_at) "
+            "VALUES ('restricted',?,x'00','r',1,1,9)",
+            (legacy_review,),
+        )
+        connection.execute("PRAGMA user_version=8")
+        connection.commit()
+        store.close()
+
+    def _value(self, sql: str) -> object:
+        connection = sqlite3.connect(self.path)
+        try:
+            return connection.execute(sql).fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_v8_references_are_resealed_and_unusable_ones_erased(self) -> None:
+        self._write_v8_database()
+
+        with self.assertLogs("gatekeeper.store", "INFO") as logs:
+            store = StateStore(
+                self.path, reseal_legacy_reference=self.protector.reseal_legacy_reference
+            )
+        store.close()
+
+        self.assertEqual(self._value("PRAGMA user_version"), 9)
+        self.assertEqual(
+            logs.output,
+            [
+                "INFO:gatekeeper.store:reference_migration_completed "
+                "resealed=5 discarded=2"
+            ],
+        )
+        self.assertEqual(
+            self._value(
+                "SELECT COUNT(*) FROM ("
+                "SELECT reference AS r FROM review_queue "
+                "UNION ALL SELECT reference FROM pending_actions "
+                "UNION ALL SELECT reference FROM enforcement_reviews "
+                "UNION ALL SELECT challenge_action_reference FROM sender_state "
+                "UNION ALL SELECT restriction_reference FROM sender_state"
+                ") WHERE substr(r, 1, 1) = x'01'"
+            ),
+            0,
+        )
+        review_columns = (
+            "SELECT reference FROM review_queue WHERE sender_key='restricted'",
+            "SELECT reference FROM pending_actions WHERE sender_key='restricted'",
+            "SELECT reference FROM enforcement_reviews WHERE sender_key='restricted'",
+            "SELECT challenge_action_reference FROM sender_state "
+            "WHERE sender_key='restricted'",
+        )
+        for sql in review_columns:
+            with self.subTest(sql=sql):
+                envelope = self._value(sql)
+                assert isinstance(envelope, bytes)
+                self.assertEqual(
+                    self.protector.open_review_reference(envelope),
+                    LEGACY_REVIEW_VALUES,
+                )
+        restriction = self._value(
+            "SELECT restriction_reference FROM sender_state "
+            "WHERE sender_key='restricted'"
+        )
+        assert isinstance(restriction, bytes)
+        self.assertEqual(
+            self.protector.open_restriction_reference(restriction),
+            LEGACY_RESTRICTION_VALUES,
+        )
+        self.assertIsNone(
+            self._value(
+                "SELECT restriction_reference FROM sender_state "
+                "WHERE sender_key='damaged'"
+            )
+        )
+        self.assertEqual(
+            self._value(
+                "SELECT reference FROM pending_actions WHERE sender_key='damaged'"
+            ),
+            b"",
+        )
+        self.assertEqual(
+            self._value("SELECT reference FROM review_queue WHERE sender_key='current'"),
+            self.current,
+        )
+        self.assertIsNone(
+            self._value("SELECT reference FROM review_queue WHERE sender_key='cleared'")
+        )
+        self.assertEqual(
+            self._value(
+                "SELECT reference FROM pending_actions WHERE sender_key='finished'"
+            ),
+            b"",
+        )
+
+    def test_v8_references_without_key_are_refused_without_mutation(self) -> None:
+        self._write_v8_database()
+
+        with self.assertRaisesRegex(StoreMigrationError, "requires the HMAC key"):
+            StateStore(self.path)
+
+        self.assertEqual(self._value("PRAGMA user_version"), 8)
+        self.assertEqual(
+            self._value(
+                "SELECT restriction_reference FROM sender_state "
+                "WHERE sender_key='restricted'"
+            ),
+            LEGACY_RESTRICTION_REFERENCE,
+        )
+
+    def test_v8_migration_rolls_back_when_resealing_fails(self) -> None:
+        self._write_v8_database()
+        calls: list[bytes] = []
+
+        def failing_resealer(envelope: bytes) -> bytes | None:
+            calls.append(envelope)
+            if len(calls) == 3:
+                raise OSError("key unavailable")
+            return self.protector.reseal_legacy_reference(envelope)
+
+        with self.assertRaises(OSError):
+            StateStore(self.path, reseal_legacy_reference=failing_resealer)
+
+        self.assertEqual(self._value("PRAGMA user_version"), 8)
+        self.assertEqual(
+            self._value("SELECT reference FROM review_queue WHERE sender_key='restricted'"),
+            LEGACY_REVIEW_REFERENCE,
+        )
+
+    def test_v8_without_legacy_references_migrates_without_key(self) -> None:
+        store = StateStore(self.path)
+        store._connection.execute(
+            "INSERT INTO review_queue(sender_key,reference,classification,signals,"
+            "features,created_at,updated_at,expires_at) "
+            "VALUES ('current',?,'c','[]','{}',1,1,9)",
+            (self.current,),
+        )
+        store._connection.execute("PRAGMA user_version=8")
+        store._connection.commit()
+        store.close()
+
+        StateStore(self.path).close()
+
+        self.assertEqual(self._value("PRAGMA user_version"), 9)
+        self.assertEqual(
+            self._value("SELECT reference FROM review_queue"), self.current
+        )
+
+    def test_migrated_database_reopens_without_calling_resealer(self) -> None:
+        self._write_v8_database()
+        StateStore(
+            self.path, reseal_legacy_reference=self.protector.reseal_legacy_reference
+        ).close()
+
+        def unexpected(envelope: bytes) -> bytes | None:
+            raise AssertionError("resealer called on a version 9 database")
+
+        StateStore(self.path, reseal_legacy_reference=unexpected).close()
+        self.assertEqual(self._value("PRAGMA user_version"), 9)
+
 
 if __name__ == "__main__":
     unittest.main()

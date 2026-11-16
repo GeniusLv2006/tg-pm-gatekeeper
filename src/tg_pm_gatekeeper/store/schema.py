@@ -5,11 +5,29 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+from collections.abc import Callable
 
 from ..states import SenderStatus
 
-SCHEMA_VERSION = 8
+LOG = logging.getLogger("gatekeeper.store")
+
+SCHEMA_VERSION = 9
+
+# Re-seals one version 1 encrypted reference, or returns None when it cannot be
+# authenticated. Supplied by callers holding the HMAC key; the store never does.
+LegacyReferenceResealer = Callable[[bytes], "bytes | None"]
+
+# Every column holding an encrypted Telegram reference, with whether it is
+# nullable. Schema version 9 requires each to hold only version 2 envelopes.
+ENCRYPTED_REFERENCE_COLUMNS = (
+    ("review_queue", "reference", True),
+    ("pending_actions", "reference", False),
+    ("enforcement_reviews", "reference", True),
+    ("sender_state", "challenge_action_reference", True),
+    ("sender_state", "restriction_reference", True),
+)
 
 CAMPAIGN_WINDOW_SECONDS = 7 * 24 * 3600
 
@@ -205,7 +223,10 @@ class StoreMigrationError(RuntimeError):
     """Raised when an existing state database cannot be migrated safely."""
 
 
-def initialize_schema(connection: sqlite3.Connection) -> None:
+def initialize_schema(
+    connection: sqlite3.Connection,
+    reseal_legacy_reference: LegacyReferenceResealer | None = None,
+) -> None:
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     sender_table = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sender_state'"
@@ -220,9 +241,65 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     if version == 7:
         _migrate_v7_to_v8(connection)
         version = 8
+    if version == 8:
+        _migrate_v8_to_v9(connection, reseal_legacy_reference)
+        version = 9
     if version != SCHEMA_VERSION:
         raise StoreMigrationError(f"unsupported database schema version: {version}")
     connection.executescript(SCHEMA)
+
+
+def _migrate_v8_to_v9(
+    connection: sqlite3.Connection,
+    reseal_legacy_reference: LegacyReferenceResealer | None,
+) -> None:
+    """Re-seal every version 1 reference as an AES-GCM version 2 envelope.
+
+    A reference no key purpose authenticates is unusable either way, so it is
+    erased rather than kept: NULL in nullable columns, empty in pending_actions,
+    matching how a finished action already clears its reference.
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        # Another process may have finished the migration while this one waited.
+        if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 8:
+            connection.execute("COMMIT")
+            return
+        resealed = discarded = 0
+        for table, column, nullable in ENCRYPTED_REFERENCE_COLUMNS:
+            rows = connection.execute(
+                f"SELECT rowid, {column} FROM {table} "  # noqa: S608 -- constant names
+                f"WHERE substr({column}, 1, 1) = x'01'"
+            ).fetchall()
+            if not rows:
+                continue
+            if reseal_legacy_reference is None:
+                raise StoreMigrationError(
+                    "schema version 8 holds encrypted references; "
+                    "migrating them requires the HMAC key"
+                )
+            for rowid, envelope in rows:
+                replacement = reseal_legacy_reference(bytes(envelope))
+                if replacement is None:
+                    discarded += 1
+                    replacement_value: bytes | None = None if nullable else b""
+                else:
+                    resealed += 1
+                    replacement_value = replacement
+                connection.execute(
+                    f"UPDATE {table} SET {column}=? WHERE rowid=?",  # noqa: S608 -- constant names
+                    (replacement_value, rowid),
+                )
+        connection.execute("PRAGMA user_version=9")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    else:
+        connection.execute("COMMIT")
+    LOG.info(
+        "reference_migration_completed resealed=%d discarded=%d", resealed, discarded
+    )
 
 
 def _migrate_v7_to_v8(connection: sqlite3.Connection) -> None:
