@@ -1,0 +1,16 @@
+# Grype reads this file from the repository root in the CI image job and the
+# weekly audit. Every ignore rule must name the exact affected package version
+# and explain why the finding does not affect Gatekeeper (see docs/RELEASE.md).
+ignore:
+  # CVE-2026-119170 (GHSA-vq78-g94j-3ppp): a Python 3.14.10 hashlib regression
+  # in FIPS-algorithm enforcement that affects only OpenSSL running in FIPS
+  # mode. The base image does not enable FIPS, Gatekeeper uses only SHA-256 and
+  # HMAC-SHA-256, and it has no FIPS-compliance requirement. The advisory names
+  # 3.14.11 as the fix, which upstream has not yet released. The version match
+  # stops applying once the base image moves past 3.14.10; delete this rule in
+  # that pull request.
+  - vulnerability: CVE-2026-119170
+    package:
+      name: python
+      version: 3.14.10
+      type: binary
