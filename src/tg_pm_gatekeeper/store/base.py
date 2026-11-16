@@ -17,6 +17,7 @@ from .schema import (
     RELEASED_RESTRICTION_TABLES,
     SENDER_LINKED_TABLES,
     SENDER_STATUSES,
+    LegacyReferenceResealer,
     initialize_schema,
 )
 
@@ -28,7 +29,13 @@ def _inserted_id(cursor: sqlite3.Cursor) -> int:
 
 
 class StoreBase:
-    def __init__(self, path: Path, *, pending_review_retention_days: int = 7) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        pending_review_retention_days: int = 7,
+        reseal_legacy_reference: LegacyReferenceResealer | None = None,
+    ) -> None:
         if not 1 <= pending_review_retention_days <= 7:
             raise ValueError("pending review retention must be between 1 and 7 days")
         self.pending_review_retention_days = pending_review_retention_days
@@ -49,7 +56,7 @@ class StoreBase:
                 self._connection.execute("PRAGMA synchronous=FULL")
                 self._connection.execute("PRAGMA foreign_keys=ON")
                 self._connection.execute("PRAGMA cache_size=-512")
-                initialize_schema(self._connection)
+                initialize_schema(self._connection, reseal_legacy_reference)
                 self._connection.execute(
                     "INSERT OR IGNORE INTO settings(key, value) "
                     "VALUES ('mode', 'monitor')"

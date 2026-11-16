@@ -332,7 +332,7 @@ The commands stop without changing `config.env` if the file already exists or th
 
 ### Advanced: schema-changing updates
 
-Most updates do not require this procedure. Use it only when release notes explicitly identify a state-database migration. The commands and version numbers below describe the current migration to schema 8; adjust them to the release notes for any later migration.
+Most updates do not require this procedure. Use it only when release notes explicitly identify a state-database migration. The commands and version numbers below describe the current migration to schema 9; adjust them to the release notes for any later migration.
 
 1. Switch to `monitor`.
 2. Confirm `challenged`, `challenge_issuing`, and `challenge_archiving` are all zero.
@@ -361,7 +361,7 @@ source.close()
 PYTHON
 ```
 
-Next run the normal update commands above to fast-forward the checkout and rebuild/start the service. After rebuilding, verify the schema version, state counts, and logs. Keep the private pre-migration backup after these checks: it is the database needed for the documented pre-schema-8 code rollback. Successful startup validation alone does not authorize deleting it. Preserve the failed database for diagnosis if migration fails.
+Next run the normal update commands above to fast-forward the checkout and rebuild/start the service. After rebuilding, verify the schema version, state counts, and logs. Keep the private pre-migration backup after these checks: it is the database needed for the documented pre-schema-9 code rollback. Successful startup validation alone does not authorize deleting it. Preserve the failed database for diagnosis if migration fails.
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -372,13 +372,13 @@ docker compose logs --tail=100 gatekeeper
 '
 ```
 
-For this migration, the first command must print `8`.
+For this migration, the first command must print `9`, and the core logs must contain one `reference_migration_completed` line with the number of re-sealed and discarded references; `discarded` is normally `0`. The line is absent only if a manual CLI command ran the migration before the core started, in which case the schema version is authoritative.
 
-Schema 8 adds the nullable restriction archive timestamp and its query index. Existing restrictions remain unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table. Databases older than schema 6 are no longer migrated: startup fails with `startup_database_migration_failed` and leaves the database unchanged.
+Schema 9 re-seals every stored review reference and restriction control identity from AES-256-CTR with HMAC-SHA-256 to AES-256-GCM, as described in [architecture.md](architecture.md). It changes no table, and the core reads the HMAC key it already uses to perform it; the CLI reads that key only when an older database still needs migrating. A reference that no key authenticates was already unusable and is erased. Schema 8 added the nullable restriction archive timestamp and its query index, leaving existing restrictions unarchived. Schema 7 previously added the persistent Saved Messages operator-artifact cleanup queue, which stores only Telegram message IDs, deletion deadlines, and retry counts. Schema 6 added the recoverable challenge profile, evidence-signal decision columns, and the keyed-HMAC campaign-event table. Databases older than schema 6 are no longer migrated: startup fails with `startup_database_migration_failed` and leaves the database unchanged.
 
 This backup is a point-in-time copy. Restoring it discards every database change made after the backup, so the procedure is not a lossless rollback once writes resume. Before considering it, stop writers and make an explicit decision about that data loss. An old migration-source host, Docker image, or cutover snapshot is not a substitute for this installation's pre-migration backup. If that backup has already been removed, do not run the restore commands below; diagnose the current database and pursue a compatible fix-forward or a separately reviewed recovery plan.
 
-Schema 8 is not writable by pre-schema-8 code. A code rollback to an earlier commit therefore also requires the pre-migration database. Record the earlier commit before updating. If startup or live validation fails, keep the schema 8 database for diagnosis and restore both code and data together:
+Schema 9 is not readable by pre-schema-9 code, which refuses to start on it. A code rollback to an earlier commit therefore also requires the pre-migration database. Record the earlier commit before updating. If startup or live validation fails, keep the schema 9 database for diagnosis and restore both code and data together:
 
 ```shell
 ssh "$DEPLOY_HOST" '
@@ -387,11 +387,11 @@ cd /opt/tg-pm-gatekeeper
 previous_commit=REPLACE_WITH_RECORDED_COMMIT
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 docker compose down
-mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v8.$stamp.sqlite3"
+mv /var/lib/tg-pm-gatekeeper/state.sqlite3 "/var/lib/tg-pm-gatekeeper/state.failed-v9.$stamp.sqlite3"
 for suffix in -wal -shm; do
     path="/var/lib/tg-pm-gatekeeper/state.sqlite3$suffix"
     if [ -e "$path" ]; then
-        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v8.$stamp.sqlite3$suffix"
+        mv "$path" "/var/lib/tg-pm-gatekeeper/state.failed-v9.$stamp.sqlite3$suffix"
     fi
 done
 cp --preserve=mode,ownership,timestamps /var/lib/tg-pm-gatekeeper/state.pre-migration.sqlite3 /var/lib/tg-pm-gatekeeper/state.sqlite3
@@ -403,9 +403,9 @@ docker compose exec -T gatekeeper python -m tg_pm_gatekeeper.cli status
 '
 ```
 
-Do not substitute the schema 8 database into an older image or delete the failed database before diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt; do not merge the incompatible database files.
+Do not substitute the schema 9 database into an older image or delete the failed database before diagnosis. After a successful rollback, return to reviewed `main` only through a new update attempt; do not merge the incompatible database files.
 
-Once the operator explicitly closes the rollback window, confirm current health and an independent recovery backup, then make a separate decision to remove the private pre-migration backup. Record that pre-schema-8 rollback will no longer be available through this procedure. Do not treat successful deployment verification or an elapsed date as automatic cleanup approval.
+Once the operator explicitly closes the rollback window, confirm current health and an independent recovery backup, then make a separate decision to remove the private pre-migration backup. Record that pre-schema-9 rollback will no longer be available through this procedure. Do not treat successful deployment verification or an elapsed date as automatic cleanup approval.
 
 ## Configuration
 

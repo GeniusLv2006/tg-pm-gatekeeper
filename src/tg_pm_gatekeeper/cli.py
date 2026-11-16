@@ -33,9 +33,23 @@ def parser() -> argparse.ArgumentParser:
 def run(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     settings = Settings.from_environment(require_telegram=False)
+    protectors: list[IdentifierProtector] = []
+
+    def reseal_legacy_reference(envelope: bytes) -> bytes | None:
+        # Read the key only if an old database actually needs migrating, so
+        # routine commands such as healthcheck never touch it.
+        if not protectors:
+            protectors.append(
+                IdentifierProtector(
+                    read_private_file(settings.hmac_key_file, minimum_bytes=32)
+                )
+            )
+        return protectors[0].reseal_legacy_reference(envelope)
+
     store = StateStore(
         settings.database_path,
         pending_review_retention_days=settings.pending_review_retention_days,
+        reseal_legacy_reference=reseal_legacy_reference,
     )
     try:
         if args.command == "healthcheck":

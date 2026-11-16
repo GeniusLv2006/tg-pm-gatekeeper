@@ -27,6 +27,7 @@ async def async_main() -> None:
     store = StateStore(
         settings.database_path,
         pending_review_retention_days=settings.pending_review_retention_days,
+        reseal_legacy_reference=protector.reseal_legacy_reference,
     )
     try:
         review_protector = ActiveCaseProtector(
